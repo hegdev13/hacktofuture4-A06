@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import { ChevronDown } from "lucide-react";
 import { loadEndpoints } from "@/lib/frontend-mock";
@@ -16,34 +16,46 @@ const LS_KEY = "kubepulse.endpointId";
 export function EndpointPicker() {
   const router = useRouter();
 
-  const [endpoints, setEndpoints] = useState<Endpoint[]>([]);
-  const [loading, setLoading] = useState(false);
-
-  const selectedId = useMemo(() => {
-    return (typeof window !== "undefined" ? localStorage.getItem(LS_KEY) : null) || "";
-  }, []);
+  const [endpoints, setEndpoints] = useState<Endpoint[]>(() => {
+    if (typeof window === "undefined") return [];
+    return loadEndpoints();
+  });
+  const [selectedId, setSelectedId] = useState(() => {
+    if (typeof window === "undefined") return "";
+    return localStorage.getItem(LS_KEY) || "";
+  });
 
   useEffect(() => {
-    setLoading(true);
-    setEndpoints(loadEndpoints());
-    setLoading(false);
+    const syncFromStorage = () => {
+      const nextEndpoints = loadEndpoints();
+      const nextSelected = localStorage.getItem(LS_KEY) || "";
+      setEndpoints(nextEndpoints);
+      setSelectedId(nextSelected);
+    };
+
+    window.addEventListener("kubepulse-endpoint", syncFromStorage);
+    window.addEventListener("storage", syncFromStorage);
+    return () => {
+      window.removeEventListener("kubepulse-endpoint", syncFromStorage);
+      window.removeEventListener("storage", syncFromStorage);
+    };
   }, []);
 
   useEffect(() => {
     if (!endpoints.length) return;
     const ls = localStorage.getItem(LS_KEY);
-    if (ls && endpoints.some((e) => e.id === ls)) return;
-    localStorage.setItem(LS_KEY, endpoints[0].id);
+    if (ls && endpoints.some((e) => e.id === ls)) {
+      if (ls !== selectedId) {
+        queueMicrotask(() => setSelectedId(ls));
+      }
+      return;
+    }
+    const next = endpoints[0].id;
+    localStorage.setItem(LS_KEY, next);
+    queueMicrotask(() => setSelectedId(next));
+    window.dispatchEvent(new Event("kubepulse-endpoint"));
     router.refresh();
-  }, [endpoints, router]);
-
-  if (loading) {
-    return (
-      <div className="text-xs text-zinc-400 border border-white/10 bg-white/5 rounded-md px-3 py-2">
-        Loading endpoints…
-      </div>
-    );
-  }
+  }, [endpoints, router, selectedId]);
 
   if (!endpoints.length) {
     return (
@@ -63,6 +75,8 @@ export function EndpointPicker() {
         onChange={(e) => {
           const id = e.target.value;
           localStorage.setItem(LS_KEY, id);
+          setSelectedId(id);
+          window.dispatchEvent(new Event("kubepulse-endpoint"));
           router.refresh();
         }}
         className="appearance-none text-xs rounded-md border border-white/10 bg-white/5 px-3 py-2 pr-8 text-zinc-100 focus:outline-none focus:ring-2 focus:ring-indigo-500/60"

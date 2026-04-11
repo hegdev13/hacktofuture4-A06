@@ -5,7 +5,7 @@ import toast from "react-hot-toast";
 import { Card, CardBody, CardHeader } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
-import { loadEndpoints, saveEndpoint } from "@/lib/frontend-mock";
+import { deleteEndpoint, loadEndpoints, saveEndpoint } from "@/lib/frontend-mock";
 
 type Endpoint = {
   id: string;
@@ -18,6 +18,7 @@ export default function SetupPage() {
   const [name, setName] = useState("");
   const [ngrokUrl, setNgrokUrl] = useState("");
   const [saving, setSaving] = useState(false);
+  const [deletingId, setDeletingId] = useState<string | null>(null);
   const [endpoints, setEndpoints] = useState<Endpoint[]>([]);
 
   async function refresh() {
@@ -41,6 +42,20 @@ export default function SetupPage() {
       toast.error(e instanceof Error ? e.message : "Save failed");
     } finally {
       setSaving(false);
+    }
+  }
+
+  async function onDelete(endpointId: string) {
+    setDeletingId(endpointId);
+    try {
+      deleteEndpoint(endpointId);
+      window.dispatchEvent(new Event("kubepulse-endpoint"));
+      toast.success("Endpoint deleted");
+      await refresh();
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : "Delete failed");
+    } finally {
+      setDeletingId(null);
     }
   }
 
@@ -68,7 +83,7 @@ export default function SetupPage() {
               value={ngrokUrl}
               onChange={(e) => setNgrokUrl(e.target.value)}
               required
-              hint="We validate that this is an https ngrok URL."
+              hint="Paste tunnel base URL or full URL like /pods?include_logs=true&log_tail=20; app normalizes and uses it dynamically."
             />
             <Button type="submit" disabled={saving} className="w-full">
               {saving ? "Saving..." : "Save endpoint"}
@@ -102,10 +117,22 @@ export default function SetupPage() {
                     <a
                       className="text-xs text-indigo-300 hover:underline"
                       href={`/dashboard`}
-                      onClick={() => localStorage.setItem("kubepulse.endpointId", ep.id)}
+                      onClick={() => {
+                        localStorage.setItem("kubepulse.endpointId", ep.id);
+                        window.dispatchEvent(new Event("kubepulse-endpoint"));
+                      }}
                     >
                       Open
                     </a>
+                    <Button
+                      type="button"
+                      variant="danger"
+                      className="px-2 py-1 text-xs"
+                      disabled={deletingId === ep.id}
+                      onClick={() => onDelete(ep.id)}
+                    >
+                      {deletingId === ep.id ? "Deleting..." : "Delete"}
+                    </Button>
                   </div>
                 </div>
               ))}

@@ -59,6 +59,21 @@ export function saveEndpoint(name: string, ngrok_url: string) {
   }
 }
 
+export function deleteEndpoint(endpointId: string) {
+  if (typeof window === "undefined") return;
+  const next = loadEndpoints().filter((ep) => ep.id !== endpointId);
+  localStorage.setItem(ENDPOINTS_KEY, JSON.stringify(next));
+
+  const selectedId = localStorage.getItem("kubepulse.endpointId");
+  if (selectedId === endpointId) {
+    if (next.length) {
+      localStorage.setItem("kubepulse.endpointId", next[0].id);
+    } else {
+      localStorage.removeItem("kubepulse.endpointId");
+    }
+  }
+}
+
 const cache = new Map<string, SnapshotRow[]>();
 
 function randomStatus() {

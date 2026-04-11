@@ -5,15 +5,47 @@ import { NgrokUrlSchema } from "@/lib/validation";
 import { rateLimit } from "@/lib/security/rate-limit";
 
 const QuerySchema = z.object({
-  endpoint: z.string().uuid(),
+  endpoint: z.string().uuid().optional(),
+  ngrok_url: NgrokUrlSchema.optional(),
   pod: z.string().min(1),
   namespace: z.string().min(1).optional(),
+}).refine((v) => Boolean(v.endpoint || v.ngrok_url), {
+  message: "endpoint or ngrok_url is required",
 });
 
 function joinUrl(base: string, path: string) {
   const b = base.endsWith("/") ? base.slice(0, -1) : base;
   const p = path.startsWith("/") ? path : `/${path}`;
   return `${b}${p}`;
+}
+
+function normalizeNgrokBase(input: string) {
+  const u = new URL(input);
+  const path = u.pathname.replace(/\/+$/, "") || "/";
+  const stripIfExact = new Set([
+    "/pods",
+    "/api/pods",
+    "/metrics",
+    "/api/metrics",
+    "/kubepulse/metrics",
+    "/api/kubepulse/metrics",
+    "/kube/metrics",
+    "/api/kube/metrics",
+    "/logs",
+    "/api/logs",
+    "/kubepulse/logs",
+    "/api/kubepulse/logs",
+    "/kube/logs",
+    "/api/kube/logs",
+  ]);
+
+  if (stripIfExact.has(path)) {
+    u.pathname = "/";
+    u.search = "";
+    u.hash = "";
+  }
+
+  return u.toString().replace(/\/+$/, "");
 }
 
 const CANDIDATE_PATHS = [
@@ -37,7 +69,8 @@ export async function GET(request: Request) {
 
   const url = new URL(request.url);
   const parsed = QuerySchema.safeParse({
-    endpoint: url.searchParams.get("endpoint"),
+    endpoint: url.searchParams.get("endpoint") || undefined,
+    ngrok_url: url.searchParams.get("ngrok_url") || undefined,
     pod: url.searchParams.get("pod"),
     namespace: url.searchParams.get("namespace") || undefined,
   });
@@ -45,24 +78,31 @@ export async function GET(request: Request) {
     return NextResponse.json({ error: "invalid_request" }, { status: 400 });
   }
 
-  const supabase = await createSupabaseServerClient();
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
-  if (!user) return NextResponse.json({ error: "unauthorized" }, { status: 401 });
+  let upstreamBase = "";
 
-  const { data: endpoint, error } = await supabase
-    .from("endpoints")
-    .select("id,ngrok_url")
-    .eq("id", parsed.data.endpoint)
-    .single();
-  if (error || !endpoint) {
-    return NextResponse.json({ error: "not_found" }, { status: 404 });
-  }
+  if (parsed.data.ngrok_url) {
+    upstreamBase = normalizeNgrokBase(parsed.data.ngrok_url);
+  } else if (parsed.data.endpoint) {
+    const supabase = await createSupabaseServerClient();
+    const {
+      data: { user },
+    } = await supabase.auth.getUser();
+    if (!user) return NextResponse.json({ error: "unauthorized" }, { status: 401 });
 
-  const ngrokParsed = NgrokUrlSchema.safeParse(endpoint.ngrok_url);
-  if (!ngrokParsed.success) {
-    return NextResponse.json({ error: "invalid_upstream" }, { status: 500 });
+    const { data: endpoint, error } = await supabase
+      .from("endpoints")
+      .select("id,ngrok_url")
+      .eq("id", parsed.data.endpoint)
+      .single();
+    if (error || !endpoint) {
+      return NextResponse.json({ error: "not_found" }, { status: 404 });
+    }
+
+    const ngrokParsed = NgrokUrlSchema.safeParse(endpoint.ngrok_url);
+    if (!ngrokParsed.success) {
+      return NextResponse.json({ error: "invalid_upstream" }, { status: 500 });
+    }
+    upstreamBase = normalizeNgrokBase(ngrokParsed.data);
   }
 
   const ns = parsed.data.namespace ?? "default";
@@ -73,7 +113,7 @@ export async function GET(request: Request) {
   try {
     const errors: string[] = [];
     for (const path of CANDIDATE_PATHS) {
-      const upstream = joinUrl(ngrokParsed.data, path);
+      const upstream = joinUrl(upstreamBase, path);
       const upstreamUrl = `${upstream}?${qs.toString()}`;
       try {
         const res = await fetch(upstreamUrl, {

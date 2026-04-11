@@ -10,7 +10,12 @@ export const NgrokUrlSchema = z
         const url = new URL(u);
         if (url.protocol !== "https:") return false;
         const host = url.hostname.toLowerCase();
-        return host.endsWith(".ngrok-free.app") || host.endsWith(".ngrok.app") || host.endsWith(".ngrok.io");
+        return (
+          host.endsWith(".ngrok-free.app") ||
+          host.endsWith(".ngrok-free.dev") ||
+          host.endsWith(".ngrok.app") ||
+          host.endsWith(".ngrok.io")
+        );
       } catch {
         return false;
       }

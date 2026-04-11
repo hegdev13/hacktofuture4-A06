@@ -1,12 +1,11 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
-import { Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis, Legend } from "recharts";
 import { Card, CardBody, CardHeader } from "@/components/ui/card";
 import { cn } from "@/lib/utils";
 import { formatBytes, formatNumber } from "@/lib/format";
-import { useSelectedEndpointId } from "@/components/dashboard/use-endpoint";
-import { initialSnapshots, tickSnapshots, type SnapshotRow } from "@/lib/frontend-mock";
+import { loadEndpoints, type SnapshotRow } from "@/lib/frontend-mock";
 
 function statusColor(status: string) {
   const s = status.toLowerCase();
@@ -16,21 +15,152 @@ function statusColor(status: string) {
   return "text-zinc-300";
 }
 
+type UpstreamPod = {
+  pod_name: string;
+  namespace?: string;
+  status: string;
+  cpu_usage?: number | null;
+  memory_usage?: number | null;
+  restart_count?: number | null;
+};
+
+type PollHistoryPoint = {
+  tsLabel: string;
+  total: number;
+  running: number;
+  avgCpu: number | null;
+  avgMem: number | null;
+};
+
+function readSelectedEndpoint(): { id: string; ngrok_url: string } | null {
+  if (typeof window === "undefined") return null;
+  const id = localStorage.getItem("kubepulse.endpointId");
+  if (!id) return null;
+  const ep = loadEndpoints().find((e) => e.id === id);
+  if (!ep) return null;
+  return { id: ep.id, ngrok_url: ep.ngrok_url };
+}
+
+function podsToRows(endpointId: string, pods: UpstreamPod[], fetchedAt: string): SnapshotRow[] {
+  return pods.map((p) => ({
+    id: crypto.randomUUID(),
+    endpoint_id: endpointId,
+    pod_name: p.pod_name,
+    namespace: p.namespace ?? "default",
+    status: p.status,
+    cpu_usage: typeof p.cpu_usage === "number" ? p.cpu_usage : null,
+    memory_usage: typeof p.memory_usage === "number" ? p.memory_usage : null,
+    restart_count: p.restart_count ?? 0,
+    timestamp: fetchedAt,
+  }));
+}
+
+function summarizePods(pods: UpstreamPod[]) {
+  const total = pods.length;
+  let running = 0;
+  let cpuSum = 0;
+  let cpuCount = 0;
+  let memSum = 0;
+  let memCount = 0;
+  for (const p of pods) {
+    if (p.status.toLowerCase().includes("running")) running += 1;
+    if (typeof p.cpu_usage === "number") {
+      cpuSum += p.cpu_usage;
+      cpuCount += 1;
+    }
+    if (typeof p.memory_usage === "number") {
+      memSum += p.memory_usage;
+      memCount += 1;
+    }
+  }
+  return {
+    total,
+    running,
+    avgCpu: cpuCount ? cpuSum / cpuCount : null,
+    avgMem: memCount ? memSum / memCount : null,
+  };
+}
+
 export default function DashboardOverviewPage() {
-  const endpointId = useSelectedEndpointId();
   const [rows, setRows] = useState<SnapshotRow[]>([]);
+  const [history, setHistory] = useState<PollHistoryPoint[]>([]);
   const [loading, setLoading] = useState(false);
+  const [fetchError, setFetchError] = useState<string | null>(null);
+  const [uiReady, setUiReady] = useState(false);
+  const [selectedEp, setSelectedEp] = useState<{ id: string; ngrok_url: string } | null>(null);
+
+  const poll = useCallback(async () => {
+    const sel = readSelectedEndpoint();
+    setSelectedEp(sel);
+    if (!sel) {
+      setRows([]);
+      setFetchError(null);
+      return;
+    }
+    setLoading(true);
+    setFetchError(null);
+    try {
+      const u = new URL("/api/dashboard/pods", window.location.origin);
+      u.searchParams.set("ngrok_url", sel.ngrok_url);
+      const res = await fetch(u.toString());
+      const data = (await res.json()) as {
+        ok?: boolean;
+        error?: string;
+        pods?: UpstreamPod[];
+        fetched_at?: string;
+      };
+      if (!res.ok) {
+        throw new Error(data.error || `Request failed (${res.status})`);
+      }
+      if (!data.pods || !Array.isArray(data.pods)) {
+        throw new Error("Invalid response: missing pods");
+      }
+      const fetchedAt = data.fetched_at ?? new Date().toISOString();
+      const normalized: UpstreamPod[] = data.pods.map((p) => ({
+        pod_name: p.pod_name,
+        namespace: p.namespace,
+        status: p.status,
+        cpu_usage: p.cpu_usage ?? null,
+        memory_usage: p.memory_usage ?? null,
+        restart_count: p.restart_count ?? 0,
+      }));
+      setRows(podsToRows(sel.id, normalized, fetchedAt));
+      const s = summarizePods(normalized);
+      const tsLabel = new Date().toISOString().slice(11, 19);
+      setHistory((prev) => {
+        const next = [
+          ...prev.slice(-119),
+          {
+            tsLabel,
+            total: s.total,
+            running: s.running,
+            avgCpu: s.avgCpu,
+            avgMem: s.avgMem,
+          },
+        ];
+        return next;
+      });
+    } catch (e) {
+      setFetchError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setLoading(false);
+    }
+  }, []);
 
   useEffect(() => {
-    if (!endpointId) return;
-    setLoading(true);
-    setRows(initialSnapshots(endpointId).slice(0, 400));
-    setLoading(false);
-    const id = setInterval(() => {
-      setRows(tickSnapshots(endpointId).slice(0, 400));
-    }, 4000);
-    return () => clearInterval(id);
-  }, [endpointId]);
+    const onEp = () => {
+      setHistory([]);
+      poll();
+    };
+    poll();
+    setUiReady(true);
+    const id = setInterval(poll, 4000);
+    window.addEventListener("kubepulse-endpoint", onEp);
+    return () => {
+      clearInterval(id);
+      window.removeEventListener("kubepulse-endpoint", onEp);
+    };
+  }, [poll]);
 
   const latestByPod = useMemo(() => {
     const map = new Map<string, SnapshotRow>();
@@ -38,7 +168,7 @@ export default function DashboardOverviewPage() {
       const key = `${r.namespace}/${r.pod_name}`;
       if (!map.has(key)) map.set(key, r);
     }
-    return Array.from(map.values()).slice(0, 50);
+    return Array.from(map.values()).sort((a, b) => a.pod_name.localeCompare(b.pod_name));
   }, [rows]);
 
   const cluster = useMemo(() => {
@@ -74,27 +204,34 @@ export default function DashboardOverviewPage() {
     };
   }, [latestByPod]);
 
-  const timeseries = useMemo(() => {
-    const byTs = new Map<string, { ts: string; cpu: number; mem: number; pods: number }>();
-    for (const r of rows) {
-      const ts = new Date(r.timestamp).toISOString().slice(0, 19) + "Z";
-      const cur = byTs.get(ts) || { ts, cpu: 0, mem: 0, pods: 0 };
-      cur.pods += 1;
-      cur.cpu += typeof r.cpu_usage === "number" ? r.cpu_usage : 0;
-      cur.mem += typeof r.memory_usage === "number" ? r.memory_usage : 0;
-      byTs.set(ts, cur);
-    }
-    return Array.from(byTs.values())
-      .sort((a, b) => a.ts.localeCompare(b.ts))
-      .slice(-120)
-      .map((p) => ({
-        ts: p.ts.slice(11, 19),
-        cpu: p.pods ? p.cpu / p.pods : 0,
-        mem: p.pods ? p.mem / p.pods : 0,
-      }));
-  }, [rows]);
+  const hasResourceMetrics = useMemo(
+    () => history.some((h) => h.avgCpu != null || h.avgMem != null),
+    [history],
+  );
 
-  if (!endpointId) {
+  const podCountSeries = useMemo(() => history.map((h) => ({ ...h })), [history]);
+
+  const resourceSeries = useMemo(
+    () =>
+      history.map((h) => ({
+        tsLabel: h.tsLabel,
+        cpu: h.avgCpu ?? 0,
+        mem: h.avgMem ?? 0,
+      })),
+    [history],
+  );
+
+  if (!uiReady) {
+    return (
+      <Card>
+        <CardBody>
+          <div className="text-sm text-zinc-400">Loading dashboard…</div>
+        </CardBody>
+      </Card>
+    );
+  }
+
+  if (!selectedEp) {
     return (
       <Card>
         <CardHeader>
@@ -114,6 +251,18 @@ export default function DashboardOverviewPage() {
 
   return (
     <div className="space-y-6">
+      {fetchError ? (
+        <Card>
+          <CardBody>
+            <div className="text-sm text-rose-300">Could not load cluster: {fetchError}</div>
+            <div className="mt-1 text-xs text-zinc-500">
+              Check that the saved ngrok base URL matches your tunnel (HTTPS) and exposes{" "}
+              <code className="text-zinc-400">/pods</code> or a metrics path.
+            </div>
+          </CardBody>
+        </Card>
+      ) : null}
+
       <div className="grid gap-4 md:grid-cols-4">
         <Card>
           <CardBody>
@@ -154,14 +303,14 @@ export default function DashboardOverviewPage() {
       <div className="grid gap-4 lg:grid-cols-2">
         <Card>
           <CardHeader>
-            <div className="font-semibold">CPU usage (avg over pods)</div>
-            <div className="text-xs text-zinc-400">Frontend mock realtime stream</div>
+            <div className="font-semibold">Pod counts (poll history)</div>
+            <div className="text-xs text-zinc-400">Live data from your ngrok base URL</div>
           </CardHeader>
           <CardBody className="h-56">
             <ResponsiveContainer width="100%" height="100%">
-              <LineChart data={timeseries}>
-                <XAxis dataKey="ts" tick={{ fill: "#9CA3AF", fontSize: 12 }} />
-                <YAxis tick={{ fill: "#9CA3AF", fontSize: 12 }} />
+              <LineChart data={podCountSeries}>
+                <XAxis dataKey="tsLabel" tick={{ fill: "#9CA3AF", fontSize: 12 }} />
+                <YAxis tick={{ fill: "#9CA3AF", fontSize: 12 }} allowDecimals={false} />
                 <Tooltip
                   contentStyle={{
                     background: "#0B1220",
@@ -170,7 +319,9 @@ export default function DashboardOverviewPage() {
                     fontSize: 12,
                   }}
                 />
-                <Line type="monotone" dataKey="cpu" stroke="#6366F1" dot={false} strokeWidth={2} />
+                <Legend wrapperStyle={{ fontSize: 12 }} />
+                <Line type="monotone" dataKey="total" name="Total" stroke="#6366F1" dot={false} strokeWidth={2} />
+                <Line type="monotone" dataKey="running" name="Running" stroke="#22C55E" dot={false} strokeWidth={2} />
               </LineChart>
             </ResponsiveContainer>
           </CardBody>
@@ -178,25 +329,37 @@ export default function DashboardOverviewPage() {
 
         <Card>
           <CardHeader>
-            <div className="font-semibold">Memory usage (avg over pods)</div>
-            <div className="text-xs text-zinc-400">Bytes (or upstream units)</div>
+            <div className="font-semibold">CPU &amp; memory (avg over pods)</div>
+            <div className="text-xs text-zinc-400">
+              {hasResourceMetrics
+                ? "Values from upstream when pods include cpu_usage / memory_usage"
+                : "Your /pods payload has no per-pod CPU or memory; add those fields for this chart"}
+            </div>
           </CardHeader>
           <CardBody className="h-56">
-            <ResponsiveContainer width="100%" height="100%">
-              <LineChart data={timeseries}>
-                <XAxis dataKey="ts" tick={{ fill: "#9CA3AF", fontSize: 12 }} />
-                <YAxis tick={{ fill: "#9CA3AF", fontSize: 12 }} />
-                <Tooltip
-                  contentStyle={{
-                    background: "#0B1220",
-                    border: "1px solid rgba(255,255,255,0.1)",
-                    color: "#E5E7EB",
-                    fontSize: 12,
-                  }}
-                />
-                <Line type="monotone" dataKey="mem" stroke="#22C55E" dot={false} strokeWidth={2} />
-              </LineChart>
-            </ResponsiveContainer>
+            {hasResourceMetrics ? (
+              <ResponsiveContainer width="100%" height="100%">
+                <LineChart data={resourceSeries}>
+                  <XAxis dataKey="tsLabel" tick={{ fill: "#9CA3AF", fontSize: 12 }} />
+                  <YAxis tick={{ fill: "#9CA3AF", fontSize: 12 }} />
+                  <Tooltip
+                    contentStyle={{
+                      background: "#0B1220",
+                      border: "1px solid rgba(255,255,255,0.1)",
+                      color: "#E5E7EB",
+                      fontSize: 12,
+                    }}
+                  />
+                  <Legend wrapperStyle={{ fontSize: 12 }} />
+                  <Line type="monotone" dataKey="cpu" name="CPU (avg)" stroke="#6366F1" dot={false} strokeWidth={2} />
+                  <Line type="monotone" dataKey="mem" name="Mem (bytes)" stroke="#22C55E" dot={false} strokeWidth={2} />
+                </LineChart>
+              </ResponsiveContainer>
+            ) : (
+              <div className="flex h-full items-center justify-center text-sm text-zinc-500">
+                No resource samples yet — table and pod counts above are live.
+              </div>
+            )}
           </CardBody>
         </Card>
       </div>
@@ -205,7 +368,7 @@ export default function DashboardOverviewPage() {
         <CardHeader>
           <div className="font-semibold">Pod health</div>
           <div className="text-xs text-zinc-400">
-            Latest status per pod {loading ? "(loading…)" : ""}
+            Latest status per pod from upstream {loading ? "(refreshing…)" : ""}
           </div>
         </CardHeader>
         <CardBody>
@@ -224,16 +387,14 @@ export default function DashboardOverviewPage() {
                   <tr key={`${r.namespace}/${r.pod_name}`} className="border-b border-white/5">
                     <td className="py-2 font-medium">{r.pod_name}</td>
                     <td className="py-2 text-zinc-300">{r.namespace}</td>
-                    <td className={cn("py-2 font-medium", statusColor(r.status))}>
-                      {r.status}
-                    </td>
+                    <td className={cn("py-2 font-medium", statusColor(r.status))}>{r.status}</td>
                     <td className="py-2 text-zinc-300">{r.restart_count}</td>
                   </tr>
                 ))}
-                {!latestByPod.length ? (
+                {!latestByPod.length && !fetchError ? (
                   <tr>
                     <td className="py-4 text-zinc-400" colSpan={4}>
-                      No snapshots yet.
+                      Loading pod list…
                     </td>
                   </tr>
                 ) : null}
@@ -245,4 +406,3 @@ export default function DashboardOverviewPage() {
     </div>
   );
 }
-

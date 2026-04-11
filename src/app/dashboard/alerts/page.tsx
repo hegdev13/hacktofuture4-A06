@@ -4,7 +4,7 @@ import { useEffect, useState } from "react";
 import { useSelectedEndpointId } from "@/components/dashboard/use-endpoint";
 import { Card, CardBody, CardHeader } from "@/components/ui/card";
 import { cn } from "@/lib/utils";
-import { initialSnapshots, tickSnapshots } from "@/lib/frontend-mock";
+import { loadEndpoints } from "@/lib/frontend-mock";
 
 type AlertRow = {
   id: string;
@@ -22,6 +22,24 @@ type HealRow = {
   timestamp: string;
 };
 
+type UpstreamPod = {
+  pod_name: string;
+  namespace?: string;
+  status: string;
+  cpu_usage?: number | null;
+  memory_usage?: number | null;
+  restart_count?: number | null;
+};
+
+function readSelectedEndpoint() {
+  if (typeof window === "undefined") return null;
+  const id = localStorage.getItem("kubepulse.endpointId");
+  if (!id) return null;
+  const ep = loadEndpoints().find((e) => e.id === id);
+  if (!ep) return null;
+  return ep;
+}
+
 function sevClass(s: AlertRow["severity"]) {
   if (s === "high") return "text-rose-300";
   if (s === "medium") return "text-amber-300";
@@ -32,57 +50,64 @@ export default function AlertsPage() {
   const endpointId = useSelectedEndpointId();
   const [alerts, setAlerts] = useState<AlertRow[]>([]);
   const [heals, setHeals] = useState<HealRow[]>([]);
+  const [fetchError, setFetchError] = useState<string | null>(null);
 
   useEffect(() => {
-    if (!endpointId) return;
-    const base = initialSnapshots(endpointId).slice(0, 50);
-    setAlerts(
-      base
-        .filter((r) => r.status !== "Running" || r.restart_count > 2)
-        .slice(0, 12)
-        .map((r) => ({
-          id: r.id,
-          endpoint_id: endpointId,
-          message: `${r.namespace}/${r.pod_name} ${r.status} (restarts=${r.restart_count})`,
-          severity: r.status === "Running" ? "medium" : "high",
-          created_at: r.timestamp,
-        })),
-    );
-    setHeals([
-      {
-        id: crypto.randomUUID(),
-        endpoint_id: endpointId,
-        action_taken: "Restarted cartservice deployment",
-        status: "success",
-        timestamp: new Date().toISOString(),
-      },
-    ]);
-    const id = setInterval(() => {
-      const fresh = tickSnapshots(endpointId).slice(0, 8);
-      const nextAlerts = fresh
-        .filter((r) => r.status !== "Running" || r.restart_count > 2)
-        .map((r) => ({
-          id: crypto.randomUUID(),
-          endpoint_id: endpointId,
-          message: `${r.namespace}/${r.pod_name} ${r.status} (restarts=${r.restart_count})`,
-          severity: r.status === "Running" ? "medium" : "high",
-          created_at: r.timestamp,
-        })) as AlertRow[];
-      if (nextAlerts.length) {
-        setAlerts((prev) => [...nextAlerts, ...prev].slice(0, 100));
+    if (!endpointId) {
+      setAlerts([]);
+      setFetchError(null);
+      return;
+    }
+
+    let cancelled = false;
+    const poll = async () => {
+      const selected = readSelectedEndpoint();
+      if (!selected) return;
+
+      try {
+        const u = new URL("/api/dashboard/pods", window.location.origin);
+        u.searchParams.set("ngrok_url", selected.ngrok_url);
+        const res = await fetch(u.toString(), { cache: "no-store" });
+        const data = (await res.json()) as {
+          error?: string;
+          pods?: UpstreamPod[];
+          fetched_at?: string;
+        };
+        if (!res.ok) throw new Error(data.error || `Request failed (${res.status})`);
+        if (!Array.isArray(data.pods)) throw new Error("Invalid response: missing pods");
+
+        const createdAt = data.fetched_at ?? new Date().toISOString();
+        const nextAlerts = data.pods
+          .filter((p) => !p.status.toLowerCase().includes("running") || (p.restart_count ?? 0) > 2)
+          .slice(0, 24)
+          .map((p) => ({
+            id: crypto.randomUUID(),
+            endpoint_id: selected.id,
+            message: `${p.namespace ?? "default"}/${p.pod_name} ${p.status} (restarts=${p.restart_count ?? 0})`,
+            severity: p.status.toLowerCase().includes("running") ? "medium" : "high",
+            created_at: createdAt,
+          })) as AlertRow[];
+
+        if (!cancelled) {
+          setAlerts(nextAlerts);
+          setFetchError(null);
+          setHeals([]);
+        }
+      } catch (e) {
+        if (!cancelled) {
+          setFetchError(e instanceof Error ? e.message : String(e));
+        }
       }
-      setHeals((prev) => [
-        {
-          id: crypto.randomUUID(),
-          endpoint_id: endpointId,
-          action_taken: "Suggested fix: restart failing pod and scale deployment x2",
-          status: Math.random() > 0.2 ? "success" : "failure",
-          timestamp: new Date().toISOString(),
-        },
-        ...prev,
-      ].slice(0, 100));
+    };
+
+    void poll();
+    const id = setInterval(() => {
+      void poll();
     }, 6000);
-    return () => clearInterval(id);
+    return () => {
+      cancelled = true;
+      clearInterval(id);
+    };
   }, [endpointId]);
 
   if (!endpointId) {
@@ -106,6 +131,9 @@ export default function AlertsPage() {
           </div>
         </CardHeader>
         <CardBody>
+          {fetchError ? (
+            <div className="mb-2 text-sm text-rose-300">Could not load alerts: {fetchError}</div>
+          ) : null}
           <div className="space-y-2">
             {alerts.map((a) => (
               <div key={a.id} className="rounded-lg border border-white/10 bg-black/10 p-3">
@@ -131,7 +159,7 @@ export default function AlertsPage() {
         <CardHeader>
           <div className="text-lg font-semibold">Self-healing insights</div>
           <div className="text-sm text-zinc-400">
-            Timeline of mocked self-healing actions.
+            No fake events are shown. Wire your healing agent to /api/healing-actions to see real actions.
           </div>
         </CardHeader>
         <CardBody>
