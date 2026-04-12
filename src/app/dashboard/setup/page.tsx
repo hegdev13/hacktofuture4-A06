@@ -5,14 +5,11 @@ import toast from "react-hot-toast";
 import { Card, CardBody, CardHeader } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
-import { deleteEndpoint, loadEndpoints, saveEndpoint } from "@/lib/frontend-mock";
-
-type Endpoint = {
-  id: string;
-  name: string;
-  ngrok_url: string;
-  created_at: string;
-};
+import {
+  fetchEndpointsFromApi,
+  setSelectedEndpointId,
+  type Endpoint,
+} from "@/lib/endpoints-client";
 
 export default function SetupPage() {
   const [name, setName] = useState("");
@@ -22,7 +19,8 @@ export default function SetupPage() {
   const [endpoints, setEndpoints] = useState<Endpoint[]>([]);
 
   async function refresh() {
-    setEndpoints(loadEndpoints() as Endpoint[]);
+    const data = await fetchEndpointsFromApi();
+    setEndpoints(data);
   }
 
   useEffect(() => {
@@ -33,7 +31,13 @@ export default function SetupPage() {
     e.preventDefault();
     setSaving(true);
     try {
-      saveEndpoint(name, ngrokUrl);
+      const res = await fetch("/api/endpoints", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ name, ngrok_url: ngrokUrl }),
+      });
+      const data = (await res.json()) as { error?: string };
+      if (!res.ok) throw new Error(data.error || "Save failed");
       toast.success("Endpoint saved");
       setName("");
       setNgrokUrl("");
@@ -48,7 +52,11 @@ export default function SetupPage() {
   async function onDelete(endpointId: string) {
     setDeletingId(endpointId);
     try {
-      deleteEndpoint(endpointId);
+      const u = new URL("/api/endpoints", window.location.origin);
+      u.searchParams.set("id", endpointId);
+      const res = await fetch(u.toString(), { method: "DELETE" });
+      const data = (await res.json()) as { error?: string };
+      if (!res.ok) throw new Error(data.error || "Delete failed");
       window.dispatchEvent(new Event("kubepulse-endpoint"));
       toast.success("Endpoint deleted");
       await refresh();
@@ -63,8 +71,8 @@ export default function SetupPage() {
     <div className="grid gap-6 lg:grid-cols-2">
       <Card>
         <CardHeader>
-          <div className="text-lg font-semibold">Dashboard setup</div>
-          <div className="text-sm text-zinc-400">
+          <div className="text-2xl font-bold tracking-tight text-[#1f2b33]">Dashboard setup</div>
+          <div className="text-sm text-muted">
             Add one or more ngrok endpoints exposing your Kubernetes metrics API.
           </div>
         </CardHeader>
@@ -94,32 +102,31 @@ export default function SetupPage() {
 
       <Card>
         <CardHeader>
-          <div className="text-lg font-semibold">Your endpoints</div>
-          <div className="text-sm text-zinc-400">
+          <div className="text-2xl font-bold tracking-tight text-[#1f2b33]">Your endpoints</div>
+          <div className="text-sm text-muted">
             Select one from the top bar to view metrics.
           </div>
         </CardHeader>
         <CardBody>
           {endpoints.length ? (
-            <div className="space-y-2">
+            <div className="space-y-3">
               {endpoints.map((ep) => (
                 <div
                   key={ep.id}
-                  className="rounded-lg border border-white/10 bg-black/10 p-3"
+                  className="rounded-2xl bg-[#fffdf8] p-4 shadow-[0_10px_22px_rgba(70,86,94,0.09)]"
                 >
                   <div className="flex items-center justify-between gap-3">
                     <div className="min-w-0">
-                      <div className="truncate font-medium">{ep.name}</div>
-                      <div className="truncate text-xs text-zinc-400">
+                      <div className="truncate text-sm font-semibold text-[#24323c]">{ep.name}</div>
+                      <div className="truncate text-xs text-muted">
                         {ep.ngrok_url}
                       </div>
                     </div>
                     <a
-                      className="text-xs text-indigo-300 hover:underline"
+                      className="rounded-full border border-primary/30 px-3 py-1 text-xs font-semibold text-primary-strong transition hover:bg-primary/10"
                       href={`/dashboard`}
                       onClick={() => {
-                        localStorage.setItem("kubepulse.endpointId", ep.id);
-                        window.dispatchEvent(new Event("kubepulse-endpoint"));
+                        setSelectedEndpointId(ep.id);
                       }}
                     >
                       Open
@@ -138,7 +145,7 @@ export default function SetupPage() {
               ))}
             </div>
           ) : (
-            <div className="text-sm text-zinc-400">
+            <div className="text-sm text-muted">
               No endpoints yet. Add one on the left.
             </div>
           )}

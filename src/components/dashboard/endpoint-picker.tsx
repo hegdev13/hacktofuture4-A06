@@ -3,66 +3,71 @@
 import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import { ChevronDown } from "lucide-react";
-import { loadEndpoints } from "@/lib/frontend-mock";
-
-type Endpoint = {
-  id: string;
-  name: string;
-  ngrok_url: string;
-};
-
-const LS_KEY = "kubepulse.endpointId";
+import {
+  fetchEndpointsFromApi,
+  getSelectedEndpointId,
+  setSelectedEndpointId,
+  type Endpoint,
+} from "@/lib/endpoints-client";
 
 export function EndpointPicker() {
   const router = useRouter();
 
-  // Start with uninitialized state to allow hydration to match
-  const [endpoints, setEndpoints] = useState<Endpoint[] | null>(null);
-  const [selectedId, setSelectedId] = useState<string>("");
+  const [endpoints, setEndpoints] = useState<Endpoint[]>([]);
+  const [selectedId, setSelectedId] = useState("");
 
-  // Hydrate from localStorage after mounting
   useEffect(() => {
-    const nextEndpoints = loadEndpoints();
-    const nextSelected = localStorage.getItem(LS_KEY) || "";
-    setEndpoints(nextEndpoints);
-    setSelectedId(nextSelected);
+    const init = async () => {
+      try {
+        const nextEndpoints = await fetchEndpointsFromApi();
+        setEndpoints(nextEndpoints);
+        setSelectedId(getSelectedEndpointId());
+      } catch {
+        setEndpoints([]);
+      }
+    };
+    void init();
+  }, []);
 
-    const syncFromStorage = () => {
-      const updated = loadEndpoints();
-      const selected = localStorage.getItem(LS_KEY) || "";
-      setEndpoints(updated);
-      setSelectedId(selected);
+  useEffect(() => {
+    const syncFromStorage = async () => {
+      try {
+        const nextEndpoints = await fetchEndpointsFromApi();
+        const nextSelected = getSelectedEndpointId();
+        setEndpoints(nextEndpoints);
+        setSelectedId(nextSelected);
+      } catch {
+        setEndpoints([]);
+      }
     };
 
     window.addEventListener("kubepulse-endpoint", syncFromStorage);
     window.addEventListener("storage", syncFromStorage);
-
     return () => {
       window.removeEventListener("kubepulse-endpoint", syncFromStorage);
       window.removeEventListener("storage", syncFromStorage);
     };
   }, []);
 
-  // Auto-select first endpoint if none selected
   useEffect(() => {
-    if (!endpoints?.length || selectedId) return;
-
-    const firstId = endpoints[0].id;
-    localStorage.setItem(LS_KEY, firstId);
-    setSelectedId(firstId);
-    window.dispatchEvent(new Event("kubepulse-endpoint"));
+    if (!endpoints.length) return;
+    const ls = getSelectedEndpointId();
+    if (ls && endpoints.some((e) => e.id === ls)) {
+      if (ls !== selectedId) {
+        queueMicrotask(() => setSelectedId(ls));
+      }
+      return;
+    }
+    const next = endpoints[0].id;
+    setSelectedEndpointId(next);
+    queueMicrotask(() => setSelectedId(next));
     router.refresh();
-  }, [endpoints, selectedId, router]);
-
-  // Show loading state during hydration
-  if (endpoints === null) {
-    return <div className="text-xs text-zinc-400">Loading...</div>;
-  }
+  }, [endpoints, router, selectedId]);
 
   if (!endpoints.length) {
     return (
       <a
-        className="text-xs text-indigo-300 hover:underline"
+        className="text-xs font-semibold text-primary-strong hover:text-primary"
         href="/dashboard/setup"
       >
         Add an endpoint
@@ -76,12 +81,11 @@ export function EndpointPicker() {
         value={selectedId}
         onChange={(e) => {
           const id = e.target.value;
-          localStorage.setItem(LS_KEY, id);
+          setSelectedEndpointId(id);
           setSelectedId(id);
-          window.dispatchEvent(new Event("kubepulse-endpoint"));
           router.refresh();
         }}
-        className="appearance-none text-xs rounded-md border border-white/10 bg-white/5 px-3 py-2 pr-8 text-zinc-100 focus:outline-none focus:ring-2 focus:ring-indigo-500/60"
+        className="appearance-none rounded-full border border-[#e0d6c6] bg-[#fffaf2] px-4 py-2 pr-9 text-xs font-medium text-[#34424d] shadow-[0_8px_16px_rgba(70,86,94,0.08)] focus:outline-none focus:ring-2 focus:ring-primary/35"
       >
         {endpoints.map((ep) => (
           <option key={ep.id} value={ep.id}>
@@ -89,7 +93,7 @@ export function EndpointPicker() {
           </option>
         ))}
       </select>
-      <ChevronDown className="pointer-events-none absolute right-2 top-1/2 h-4 w-4 -translate-y-1/2 text-zinc-400" />
+      <ChevronDown className="pointer-events-none absolute right-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted" />
     </div>
   );
 }

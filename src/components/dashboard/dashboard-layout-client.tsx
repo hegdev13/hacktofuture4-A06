@@ -18,7 +18,7 @@ export function DashboardLayoutClient({
       <Sidebar activePath={pathname} userEmail={userEmail} />
       <div className="flex flex-1 flex-col min-w-0">
         <Topbar />
-        <main className="flex-1 p-4 md:p-6">{children}</main>
+        <main className="flex-1 px-5 py-6 md:px-8 md:py-8">{children}</main>
       </div>
     </div>
   );

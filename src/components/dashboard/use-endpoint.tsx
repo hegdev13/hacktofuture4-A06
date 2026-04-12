@@ -1,27 +1,26 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useSyncExternalStore } from "react";
 
 const LS_KEY = "kubepulse.endpointId";
 
 export function useSelectedEndpointId() {
-  const [endpointId, setEndpointId] = useState<string | null>(null);
-
-  useEffect(() => {
-    // Load from localStorage on mount (after hydration)
-    setEndpointId(localStorage.getItem(LS_KEY));
-
-    // Listen for changes
-    const sync = () => setEndpointId(localStorage.getItem(LS_KEY));
-    window.addEventListener("kubepulse-endpoint", sync);
-    window.addEventListener("storage", sync);
-
-    return () => {
-      window.removeEventListener("kubepulse-endpoint", sync);
-      window.removeEventListener("storage", sync);
-    };
-  }, []);
-
-  return endpointId;
+  return useSyncExternalStore(
+    (onStoreChange) => {
+      if (typeof window === "undefined") return () => {};
+      const sync = () => onStoreChange();
+      window.addEventListener("kubepulse-endpoint", sync);
+      window.addEventListener("storage", sync);
+      return () => {
+        window.removeEventListener("kubepulse-endpoint", sync);
+        window.removeEventListener("storage", sync);
+      };
+    },
+    () => {
+      if (typeof window === "undefined") return null;
+      return localStorage.getItem(LS_KEY);
+    },
+    () => null,
+  );
 }
 

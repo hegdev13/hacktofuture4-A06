@@ -1,15 +1,14 @@
 import type { Metadata } from "next";
-import { Geist, Geist_Mono } from "next/font/google";
+import { Inter, JetBrains_Mono } from "next/font/google";
 import "./globals.css";
 import { Toaster } from "react-hot-toast";
-import { RootLayoutClient } from "@/components/RootLayoutClient";
 
-const geistSans = Geist({
+const geistSans = Inter({
   variable: "--font-geist-sans",
   subsets: ["latin"],
 });
 
-const geistMono = Geist_Mono({
+const geistMono = JetBrains_Mono({
   variable: "--font-geist-mono",
   subsets: ["latin"],
 });
@@ -29,20 +28,20 @@ export default function RootLayout({
       lang="en"
       className={`${geistSans.variable} ${geistMono.variable} h-full antialiased`}
     >
-      <body className="min-h-full flex flex-col bg-[#0B0F17] text-zinc-100">
-        <RootLayoutClient>
-          {children}
-          <Toaster
-            position="top-right"
-            toastOptions={{
-              style: {
-                background: "#111827",
-                color: "#E5E7EB",
-                border: "1px solid rgba(255,255,255,0.08)",
-              },
-            }}
-          />
-        </RootLayoutClient>
+      <body className="min-h-full flex flex-col text-foreground">
+        {children}
+        <Toaster
+          position="top-right"
+          toastOptions={{
+            style: {
+              background: "#fff9f0",
+              color: "#2f3a42",
+              border: "1px solid #e7ddcd",
+              borderRadius: "14px",
+              boxShadow: "0 14px 30px rgba(63, 74, 83, 0.12)",
+            },
+          }}
+        />
       </body>
     </html>
   );

@@ -19,15 +19,15 @@ export function Sidebar({
   userEmail?: string | null;
 }) {
   return (
-    <aside className="flex h-full w-64 flex-col border-r border-white/10 bg-black/20">
-      <div className="p-4 border-b border-white/10">
-        <div className="text-lg font-semibold tracking-tight">KubePulse</div>
-        <div className="mt-1 text-xs text-zinc-400">
+    <aside className="flex h-full w-72 flex-col border-r border-[#e6dccb] bg-[#f9f3e9]/70 backdrop-blur-sm">
+      <div className="border-b border-[#e8dece] p-6">
+        <div className="text-2xl font-extrabold tracking-tight text-[#1f2b33]">KubePulse</div>
+        <div className="mt-1 text-xs text-muted">
           {userEmail ? userEmail : "Signed in"}
         </div>
       </div>
 
-      <nav className="flex-1 p-2 space-y-1">
+      <nav className="flex-1 space-y-2 p-4">
         {nav.map((item) => {
           const isActive =
             activePath === item.href ||
@@ -38,8 +38,10 @@ export function Sidebar({
               key={item.href}
               href={item.href}
               className={cn(
-                "flex items-center gap-2 rounded-md px-3 py-2 text-sm text-zinc-200 hover:bg-white/5",
-                isActive ? "bg-white/10 text-white" : null,
+                "flex items-center gap-2 rounded-xl px-4 py-2.5 text-sm font-medium text-[#51606b] transition-colors duration-200 hover:bg-white/70",
+                isActive
+                  ? "bg-white text-primary-strong shadow-[0_10px_20px_rgba(65,84,94,0.12)]"
+                  : null,
               )}
             >
               <Icon className="h-4 w-4" />
@@ -49,7 +51,7 @@ export function Sidebar({
         })}
       </nav>
 
-      <div className="p-2 border-t border-white/10">
+      <div className="border-t border-[#e8dece] p-4">
         <LogoutButton />
       </div>
     </aside>

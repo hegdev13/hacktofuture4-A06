@@ -11,11 +11,15 @@ export function LogoutButton() {
     <Button
       variant="ghost"
       className="w-full justify-start"
-      onClick={() => {
+      onClick={async () => {
         try {
-          localStorage.removeItem("kubepulse.mockAuth");
-          localStorage.removeItem("kubepulse.userEmail");
+          const res = await fetch("/logout", { method: "POST" });
+          if (!res.ok) {
+            const data = (await res.json().catch(() => null)) as { error?: string } | null;
+            throw new Error(data?.error || "Logout failed");
+          }
           router.replace("/auth/login");
+          router.refresh();
         } catch (e) {
           toast.error(e instanceof Error ? e.message : "Logout failed");
         }
