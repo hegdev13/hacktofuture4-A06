@@ -6,6 +6,9 @@ import { Card, CardBody, CardHeader } from "@/components/ui/card";
 import { cn } from "@/lib/utils";
 import { formatBytes, formatNumber } from "@/lib/format";
 import { loadEndpoints, type SnapshotRow } from "@/lib/frontend-mock";
+import { DependencyGraphVisual } from "@/components/dashboard/dependency-graph-visual";
+import { convertMetricsToPods, identifyRootCause } from "@/lib/pod-dependency";
+import type { Pod } from "@/lib/pod-dependency";
 
 function statusColor(status: string) {
   const s = status.toLowerCase();
@@ -88,6 +91,8 @@ export default function DashboardOverviewPage() {
   const [fetchError, setFetchError] = useState<string | null>(null);
   const [uiReady, setUiReady] = useState(false);
   const [selectedEp, setSelectedEp] = useState<{ id: string; ngrok_url: string } | null>(null);
+  const [metricsData, setMetricsData] = useState<any>(null);
+  const [dependencyPods, setDependencyPods] = useState<Pod[]>([]);
 
   const poll = useCallback(async () => {
     const sel = readSelectedEndpoint();
@@ -140,6 +145,82 @@ export default function DashboardOverviewPage() {
         ];
         return next;
       });
+
+      // Fetch metrics for dependency graph
+      try {
+        const metricsRes = await fetch("/api/metrics/context");
+        if (metricsRes.ok) {
+          const metricsJson = await metricsRes.json();
+          setMetricsData(metricsJson);
+          
+          // Define dependency map for all pods
+          const dependencyMap: Record<string, string[]> = {
+            "api-server": [],
+            "database-primary": [],
+            "cache-redis": ["database-primary"],
+            "worker-1": ["cache-redis", "database-primary"],
+            "worker-2": ["cache-redis", "database-primary"],
+            "web-frontend": ["api-server", "worker-1"],
+            "monitoring-agent": ["api-server"],
+            "log-aggregator": ["database-primary"],
+          };
+
+          // Extract failed pods from the actual pod data and alerts
+          const failedPodMap = new Map<string, string>();
+          
+          // First, check the pods array for failures
+          if (metricsJson.pods && Array.isArray(metricsJson.pods)) {
+            metricsJson.pods.forEach((pod: any) => {
+              const status = pod.status?.toLowerCase() || "";
+              if (status !== "running" && status !== "pending") {
+                failedPodMap.set(pod.name, `Pod status: ${pod.status}`);
+              }
+            });
+          }
+          
+          // Also extract from alerts for additional context
+          if (metricsJson.alerts && Array.isArray(metricsJson.alerts)) {
+            metricsJson.alerts.forEach((alert: any) => {
+              const message = alert.message || "";
+              const severity = alert.severity || "";
+              
+              if (severity === "critical" || severity === "warning") {
+                // Extract pod names from various alert formats
+                const criticalWords = ["failed", "crash", "error", "issue", "down", "broken"];
+                const hasCritical = criticalWords.some(word => 
+                  message.toLowerCase().includes(word)
+                );
+                
+                if (hasCritical) {
+                  // Try to find pod name in dependencies
+                  Object.keys(dependencyMap).forEach(podName => {
+                    if (message.toLowerCase().includes(podName)) {
+                      failedPodMap.set(podName, message);
+                    }
+                  });
+                }
+              }
+            });
+          }
+
+          // Create pods from dependency map with dynamic failure status
+          const dynamicPods: Pod[] = Object.entries(dependencyMap).map(([podName, dependencies]) => {
+            const failureMessage = failedPodMap.get(podName);
+            
+            return {
+              id: podName,
+              name: podName,
+              status: failureMessage ? "failed" : "running",
+              message: failureMessage || undefined,
+              dependsOn: dependencies,
+            };
+          });
+
+          setDependencyPods(dynamicPods);
+        }
+      } catch (e) {
+        console.error("Failed to fetch metrics for dependency graph:", e);
+      }
     } catch (e) {
       setFetchError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -251,6 +332,21 @@ export default function DashboardOverviewPage() {
 
   return (
     <div className="space-y-6">
+      {/* Header */}
+      <div className="flex items-center justify-between mb-2">
+        <div>
+          <h1 className="text-3xl font-bold text-white">Cluster Status</h1>
+          <p className="text-gray-400 text-sm mt-1">Real-time monitoring and pod dependency analysis</p>
+        </div>
+        <div className={`px-4 py-2 rounded-lg font-medium ${
+          cluster.failed > 0 
+            ? "bg-rose-900/30 border border-rose-700/50 text-rose-300"
+            : "bg-emerald-900/30 border border-emerald-700/50 text-emerald-300"
+        }`}>
+          {cluster.failed > 0 ? `⚠️ ${cluster.failed} Issue${cluster.failed === 1 ? "" : "s"}` : "✅ Healthy"}
+        </div>
+      </div>
+
       {fetchError ? (
         <Card>
           <CardBody>
@@ -264,37 +360,80 @@ export default function DashboardOverviewPage() {
       ) : null}
 
       <div className="grid gap-4 md:grid-cols-4">
-        <Card>
+        <Card className="bg-gradient-to-br from-blue-950 to-blue-900 border-blue-800/50">
           <CardBody>
-            <div className="text-xs text-zinc-400">Total pods</div>
-            <div className="mt-1 text-2xl font-semibold">{cluster.totalPods}</div>
-          </CardBody>
-        </Card>
-        <Card>
-          <CardBody>
-            <div className="text-xs text-zinc-400">Running / Failed / Pending</div>
-            <div className="mt-1 text-2xl font-semibold">
-              {cluster.running}
-              <span className="text-zinc-500"> / </span>
-              <span className="text-rose-300">{cluster.failed}</span>
-              <span className="text-zinc-500"> / </span>
-              <span className="text-amber-300">{cluster.pending}</span>
+            <div className="flex items-center justify-between">
+              <div className="flex-1">
+                <div className="text-xs text-blue-300 font-medium">Total Pods</div>
+                <div className="mt-2 text-3xl font-bold text-white">{cluster.totalPods}</div>
+              </div>
+              <div className="w-12 h-12 bg-blue-900/50 rounded-lg flex items-center justify-center">
+                <span className="text-2xl">📦</span>
+              </div>
             </div>
           </CardBody>
         </Card>
-        <Card>
+        <Card className={`bg-gradient-to-br ${
+          cluster.failed > 0 ? "from-rose-950 to-rose-900 border-rose-800/50" : "from-emerald-950 to-emerald-900 border-emerald-800/50"
+        }`}>
           <CardBody>
-            <div className="text-xs text-zinc-400">Avg CPU (raw)</div>
-            <div className="mt-1 text-2xl font-semibold">
-              {cluster.avgCpu == null ? "—" : formatNumber(cluster.avgCpu)}
+            <div className="flex items-center justify-between">
+              <div className="flex-1">
+                <div className={`text-xs font-medium ${cluster.failed > 0 ? "text-rose-300" : "text-emerald-300"}`}>
+                  Status
+                </div>
+                <div className="mt-2 text-sm font-semibold space-y-1">
+                  <div className="flex items-center gap-2">
+                    <span className="w-2 h-2 bg-emerald-400 rounded-full"></span>
+                    <span className="text-white">{cluster.running} Running</span>
+                  </div>
+                  {cluster.failed > 0 && (
+                    <div className="flex items-center gap-2">
+                      <span className="w-2 h-2 bg-rose-400 rounded-full animate-pulse"></span>
+                      <span className="text-rose-300">{cluster.failed} Failed</span>
+                    </div>
+                  )}
+                  {cluster.pending > 0 && (
+                    <div className="flex items-center gap-2">
+                      <span className="w-2 h-2 bg-amber-400 rounded-full"></span>
+                      <span className="text-amber-300">{cluster.pending} Pending</span>
+                    </div>
+                  )}
+                </div>
+              </div>
+              <div className="w-12 h-12 bg-opacity-50 rounded-lg flex items-center justify-center text-2xl">
+                {cluster.failed > 0 ? "⚠️" : "✅"}
+              </div>
             </div>
           </CardBody>
         </Card>
-        <Card>
+        <Card className="bg-gradient-to-br from-purple-950 to-purple-900 border-purple-800/50">
           <CardBody>
-            <div className="text-xs text-zinc-400">Avg Memory</div>
-            <div className="mt-1 text-2xl font-semibold">
-              {cluster.avgMem == null ? "—" : formatBytes(cluster.avgMem)}
+            <div className="flex items-center justify-between">
+              <div className="flex-1">
+                <div className="text-xs text-purple-300 font-medium">Avg CPU</div>
+                <div className="mt-2 text-3xl font-bold text-white">
+                  {cluster.avgCpu == null ? "—" : formatNumber(cluster.avgCpu)}%
+                </div>
+              </div>
+              <div className="w-12 h-12 bg-purple-900/50 rounded-lg flex items-center justify-center">
+                <span className="text-2xl">⚡</span>
+              </div>
+            </div>
+          </CardBody>
+        </Card>
+        <Card className="bg-gradient-to-br from-cyan-950 to-cyan-900 border-cyan-800/50">
+          <CardBody>
+            <div className="flex items-center justify-between">
+              <div className="flex-1">
+                <div className="text-xs text-cyan-300 font-medium">Avg Memory</div>
+                <div className="mt-2 text-3xl font-bold text-white">
+                  {cluster.avgMem == null ? "—" : formatBytes(cluster.avgMem)}
+                </div>
+              </div>
+              <div className="w-12 h-12 bg-cyan-900/50 rounded-lg flex items-center justify-center">
+                <span className="text-2xl">💾</span>
+              </div>
             </div>
           </CardBody>
         </Card>
@@ -364,37 +503,65 @@ export default function DashboardOverviewPage() {
         </Card>
       </div>
 
-      <Card>
+      {dependencyPods.length > 0 && <DependencyGraphVisual pods={dependencyPods} />}
+
+      <Card className="border-slate-800/50">
         <CardHeader>
-          <div className="font-semibold">Pod health</div>
-          <div className="text-xs text-zinc-400">
-            Latest status per pod from upstream {loading ? "(refreshing…)" : ""}
+          <div className="flex items-center justify-between">
+            <div>
+              <div className="font-semibold text-white flex items-center gap-2">
+                <span className="text-lg">📋</span>
+                Pod Health
+              </div>
+              <div className="text-xs text-zinc-400 mt-1">
+                Latest status per pod {loading && <span className="ml-2 animate-pulse">● Refreshing</span>}
+              </div>
+            </div>
+            <div className="text-sm text-gray-400">
+              {latestByPod.length} pods
+            </div>
           </div>
         </CardHeader>
         <CardBody>
           <div className="overflow-auto">
             <table className="min-w-full text-sm">
-              <thead className="text-xs text-zinc-400">
-                <tr className="border-b border-white/10">
-                  <th className="py-2 text-left font-medium">Pod</th>
-                  <th className="py-2 text-left font-medium">Namespace</th>
-                  <th className="py-2 text-left font-medium">Status</th>
-                  <th className="py-2 text-left font-medium">Restarts</th>
+              <thead className="text-xs text-gray-400 border-b border-slate-800/50">
+                <tr>
+                  <th className="py-3 px-4 text-left font-semibold tracking-wider">Pod Name</th>
+                  <th className="py-3 px-4 text-left font-semibold tracking-wider">Namespace</th>
+                  <th className="py-3 px-4 text-left font-semibold tracking-wider">Status</th>
+                  <th className="py-3 px-4 text-center font-semibold tracking-wider">Restarts</th>
                 </tr>
               </thead>
               <tbody>
-                {latestByPod.map((r) => (
-                  <tr key={`${r.namespace}/${r.pod_name}`} className="border-b border-white/5">
-                    <td className="py-2 font-medium">{r.pod_name}</td>
-                    <td className="py-2 text-zinc-300">{r.namespace}</td>
-                    <td className={cn("py-2 font-medium", statusColor(r.status))}>{r.status}</td>
-                    <td className="py-2 text-zinc-300">{r.restart_count}</td>
-                  </tr>
-                ))}
+                {latestByPod.map((r) => {
+                  const isHealthy = r.status.toLowerCase().includes("running");
+                  return (
+                    <tr 
+                      key={`${r.namespace}/${r.pod_name}`} 
+                      className={`border-b border-slate-800/30 transition-colors hover:bg-slate-900/30 ${
+                        isHealthy ? "" : "bg-slate-950/50"
+                      }`}
+                    >
+                      <td className="py-3 px-4 font-medium text-white">{r.pod_name}</td>
+                      <td className="py-3 px-4 text-gray-400">{r.namespace}</td>
+                      <td className={cn("py-3 px-4 font-semibold flex items-center gap-2", statusColor(r.status))}>
+                        <span className={`w-2 h-2 rounded-full ${
+                          isHealthy ? "bg-emerald-400" : "bg-rose-400"
+                        }`}></span>
+                        {r.status}
+                      </td>
+                      <td className="py-3 px-4 text-center text-gray-400">
+                        {r.restart_count > 0 && <span className="text-amber-400 font-semibold">{r.restart_count}</span>}
+                        {r.restart_count === 0 && <span className="text-emerald-400">-</span>}
+                      </td>
+                    </tr>
+                  );
+                })}
                 {!latestByPod.length && !fetchError ? (
                   <tr>
-                    <td className="py-4 text-zinc-400" colSpan={4}>
-                      Loading pod list…
+                    <td className="py-8 px-4 text-gray-500 text-center" colSpan={4}>
+                      <span className="animate-pulse">Loading pod list…</span>
                     </td>
                   </tr>
                 ) : null}

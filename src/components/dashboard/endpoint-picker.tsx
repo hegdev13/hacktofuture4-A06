@@ -16,46 +16,48 @@ const LS_KEY = "kubepulse.endpointId";
 export function EndpointPicker() {
   const router = useRouter();
 
-  const [endpoints, setEndpoints] = useState<Endpoint[]>(() => {
-    if (typeof window === "undefined") return [];
-    return loadEndpoints();
-  });
-  const [selectedId, setSelectedId] = useState(() => {
-    if (typeof window === "undefined") return "";
-    return localStorage.getItem(LS_KEY) || "";
-  });
+  // Start with uninitialized state to allow hydration to match
+  const [endpoints, setEndpoints] = useState<Endpoint[] | null>(null);
+  const [selectedId, setSelectedId] = useState<string>("");
 
+  // Hydrate from localStorage after mounting
   useEffect(() => {
+    const nextEndpoints = loadEndpoints();
+    const nextSelected = localStorage.getItem(LS_KEY) || "";
+    setEndpoints(nextEndpoints);
+    setSelectedId(nextSelected);
+
     const syncFromStorage = () => {
-      const nextEndpoints = loadEndpoints();
-      const nextSelected = localStorage.getItem(LS_KEY) || "";
-      setEndpoints(nextEndpoints);
-      setSelectedId(nextSelected);
+      const updated = loadEndpoints();
+      const selected = localStorage.getItem(LS_KEY) || "";
+      setEndpoints(updated);
+      setSelectedId(selected);
     };
 
     window.addEventListener("kubepulse-endpoint", syncFromStorage);
     window.addEventListener("storage", syncFromStorage);
+
     return () => {
       window.removeEventListener("kubepulse-endpoint", syncFromStorage);
       window.removeEventListener("storage", syncFromStorage);
     };
   }, []);
 
+  // Auto-select first endpoint if none selected
   useEffect(() => {
-    if (!endpoints.length) return;
-    const ls = localStorage.getItem(LS_KEY);
-    if (ls && endpoints.some((e) => e.id === ls)) {
-      if (ls !== selectedId) {
-        queueMicrotask(() => setSelectedId(ls));
-      }
-      return;
-    }
-    const next = endpoints[0].id;
-    localStorage.setItem(LS_KEY, next);
-    queueMicrotask(() => setSelectedId(next));
+    if (!endpoints?.length || selectedId) return;
+
+    const firstId = endpoints[0].id;
+    localStorage.setItem(LS_KEY, firstId);
+    setSelectedId(firstId);
     window.dispatchEvent(new Event("kubepulse-endpoint"));
     router.refresh();
-  }, [endpoints, router, selectedId]);
+  }, [endpoints, selectedId, router]);
+
+  // Show loading state during hydration
+  if (endpoints === null) {
+    return <div className="text-xs text-zinc-400">Loading...</div>;
+  }
 
   if (!endpoints.length) {
     return (
