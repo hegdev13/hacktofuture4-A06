@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { triggerSelfHeal } from "@/ai-agents/agentController";
-import type { HealingScenario, HealingTargetKind } from "@/lib/healing/types";
+import type { HealingScenario } from "@/lib/healing/types";
 
 export const runtime = "nodejs";
 
@@ -10,9 +10,6 @@ export async function POST(request: Request) {
     dryRun?: boolean;
     metricsUrl?: string;
     strictLive?: boolean;
-    targetName?: string;
-    targetNamespace?: string;
-    targetKind?: HealingTargetKind;
   };
 
   const result = await triggerSelfHeal(body);

@@ -23,6 +23,10 @@ type StartOptions = {
   scenario?: HealingScenario;
   dryRun?: boolean;
   metricsUrl?: string;
+  strictLive?: boolean;
+  targetName?: string;
+  targetNamespace?: string;
+  targetKind?: "pod" | "deployment";
 };
 
 class HealingAgentRunnerService {
@@ -52,30 +56,42 @@ class HealingAgentRunnerService {
       scenario,
       totalLogs: 0,
       activeAgent: "Orchestrator",
-      activeAction: "starting self-healing run",
+      activeAction: options.targetName
+        ? `starting self-healing run for ${options.targetNamespace || "default"}/${options.targetName}`
+        : "starting self-healing run",
       activeIssueId: issueId,
+      targetName: options.targetName,
+      targetNamespace: options.targetNamespace,
+      targetKind: options.targetKind,
     };
     this.emit({ type: "status", payload: this.status });
 
     this.appendLog({
-      agent_name: "ObserverAgent",
-      event_type: "DETECTED",
+      agent_name: "Orchestrator",
+      event_type: "ANALYZING",
       issue_id: issueId,
-      description: this.scenarioDescription(scenario),
-      action_taken: "Issue injected into monitoring cycle",
-      status: "OPEN",
+      description: options.targetName
+        ? `Self-healing cycle started (scenario=${scenario}, target=${options.targetNamespace || "default"}/${options.targetName})`
+        : `Self-healing cycle started (scenario=${scenario})`,
+      action_taken: options.targetName ? "Prioritizing explicit workload target" : "Fetching live cluster metrics",
+      status: "IN_PROGRESS",
     });
 
     this.runPromise = (async () => {
       try {
         await this.runHealingProcess(issueId, options);
+        const outcome = this.getRunOutcome();
 
         this.status = {
           ...this.status,
           state: "completed",
           finishedAt: new Date().toISOString(),
           activeAgent: "Orchestrator",
-          activeAction: "run completed",
+          activeAction: outcome === "fixed" ? "remediation verified" : "run completed without remediation",
+          outcome,
+          targetName: options.targetName,
+          targetNamespace: options.targetNamespace,
+          targetKind: options.targetKind,
           totalLogs: this.logs.length,
         };
         this.emit({ type: "status", payload: this.status });
@@ -87,6 +103,10 @@ class HealingAgentRunnerService {
           finishedAt: new Date().toISOString(),
           activeAgent: "Orchestrator",
           activeAction: "execution halted",
+          outcome: "failed",
+          targetName: options.targetName,
+          targetNamespace: options.targetNamespace,
+          targetKind: options.targetKind,
           lastError: message,
           totalLogs: this.logs.length,
         };
@@ -111,6 +131,30 @@ class HealingAgentRunnerService {
 
   getAgentStatus() {
     return this.status;
+  }
+
+  appendExternalLog(input: {
+    issue_id: string;
+    agent_name?: string;
+    event_type?: HealingEventType;
+    description: string;
+    action_taken?: string;
+    status?: HealingLogStatus;
+    confidence?: number;
+    reasoning?: string;
+    raw?: Record<string, unknown>;
+  }) {
+    this.appendLog({
+      agent_name: input.agent_name || "Orchestrator",
+      event_type: input.event_type || "ANALYZING",
+      issue_id: input.issue_id,
+      description: input.description,
+      action_taken: input.action_taken || "Processing",
+      status: input.status || "IN_PROGRESS",
+      confidence: input.confidence,
+      reasoning: input.reasoning,
+      raw: input.raw,
+    });
   }
 
   getExecutionLogs(filters?: {
@@ -286,23 +330,11 @@ class HealingAgentRunnerService {
     this.issueLifecycle.set(log.issue_id, next);
   }
 
-  private scenarioDescription(scenario: HealingScenario) {
-    switch (scenario) {
-      case "pod-crash":
-        return "Simulated CrashLoopBackOff detected";
-      case "high-cpu":
-        return "High CPU saturation detected";
-      case "service-unavailable":
-        return "Upstream service unavailable";
-      default:
-        return "Issue detected";
-    }
-  }
-
   private runHealingProcess(issueId: string, options: StartOptions) {
     const scriptPath = path.resolve(process.cwd(), "src", "ai-agents", "self-healing-system", "main.js");
     const metricsUrl = options.metricsUrl?.trim() || process.env.METRICS_URL || "";
     const dryRun = typeof options.dryRun === "boolean" ? options.dryRun : false;
+    const strictLive = typeof options.strictLive === "boolean" ? options.strictLive : true;
 
     return new Promise<void>((resolve, reject) => {
       const child = spawn(process.execPath, [scriptPath], {
@@ -311,6 +343,10 @@ class HealingAgentRunnerService {
           ...process.env,
           METRICS_URL: metricsUrl,
           DRY_RUN: dryRun ? "true" : "false",
+          STRICT_LIVE: strictLive ? "true" : "false",
+          MANUAL_TARGET_NAME: options.targetName || "",
+          MANUAL_TARGET_NAMESPACE: options.targetNamespace || "default",
+          MANUAL_TARGET_KIND: options.targetKind || "pod",
           LOG_LEVEL: process.env.LOG_LEVEL || "info",
         },
         stdio: ["ignore", "pipe", "pipe"],
@@ -440,6 +476,12 @@ class HealingAgentRunnerService {
 
   private stripAnsi(text: string) {
     return text.replace(/\x1B\[[0-?]*[ -/]*[@-~]/g, "");
+  }
+
+  private getRunOutcome(): "fixed" | "no-op" {
+    const lifecycle = this.getIssueLifecycle();
+    const hasAppliedFix = lifecycle.some((item) => Boolean(item.fix_applied_at));
+    return hasAppliedFix ? "fixed" : "no-op";
   }
 }
 

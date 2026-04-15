@@ -23,6 +23,7 @@ class SelfHealingSystem {
     this.iteration = 0;
     this.agentCallbacks = {};
     this.metricsUrl = process.env.METRICS_URL || '';
+    this.strictLive = process.env.STRICT_LIVE === 'true';
   }
 
   /**
@@ -92,7 +93,12 @@ class SelfHealingSystem {
     logger.banner();
     logger.info('Initializing self-healing system...');
     logger.info(`Mode: ${this.metricsUrl ? 'REAL-TIME' : 'MOCK/DEMO'}`);
+    logger.info(`Strict live mode: ${this.strictLive ? 'ENABLED' : 'DISABLED'}`);
     logger.info(`Configuration: maxRetries=${this.maxRetries}, dryRun=${config.execution.dryRun}`);
+
+    if (this.strictLive && !this.metricsUrl) {
+      throw new Error('Strict live mode requires METRICS_URL. Provide an ngrok /pods URL.');
+    }
 
     this.isRunning = true;
 
@@ -123,6 +129,8 @@ class SelfHealingSystem {
     let currentState = initialState;
     let attempts = 0;
     let finalResult = null;
+    const manualTarget = this.getManualTarget(options);
+    let detection = null;
 
     logger.info('Starting validation loop...');
 
@@ -146,7 +154,7 @@ class SelfHealingSystem {
         options.onAnalysis(analysis);
       }
 
-      if (analysis.healthy) {
+      if (analysis.healthy && !manualTarget) {
         logger.timelineEvent('success', 'System is healthy');
         finalResult = {
           success: true,
@@ -157,6 +165,110 @@ class SelfHealingSystem {
           timeline: logger.getTimeline(),
         };
         break;
+      }
+
+      if (manualTarget) {
+        const manualPod = this.resolveManualTargetPod(currentState, manualTarget);
+        if (!manualPod) {
+          logger.warn(`Selected target not found: ${manualTarget.namespace}/${manualTarget.name}`);
+          finalResult = {
+            success: false,
+            attempts,
+            finalHealth: 'unhealthy',
+            issuesFound: analysis.issues.length,
+            fixesApplied: 0,
+            error: `Selected target ${manualTarget.namespace}/${manualTarget.name} was not found in live cluster state`,
+            timeline: logger.getTimeline(),
+          };
+          break;
+        }
+
+        const targetedIssue = this.buildManualTargetIssue(manualPod, manualTarget);
+        if (!targetedIssue) {
+          logger.timelineEvent('success', `Selected target ${manualTarget.namespace}/${manualTarget.name} is already healthy`);
+          finalResult = {
+            success: true,
+            attempts: attempts - 1,
+            finalHealth: 'healthy',
+            issuesFound: analysis.issues.length,
+            fixesApplied: 0,
+            target: manualTarget,
+            timeline: logger.getTimeline(),
+          };
+          break;
+        }
+
+        logger.timelineEvent('issue', `Prioritizing selected workload ${manualTarget.namespace}/${manualTarget.name}`);
+        this.setAgentStatus('detector', 'issues-confirmed', {
+          step: 'manual-target',
+          confirmed: 1,
+          confidence: targetedIssue.confidence,
+        });
+
+        if (manualTarget.kind === 'deployment') {
+          logger.timelineEvent('fix', `Executing explicit deployment restart for ${manualTarget.namespace}/${manualTarget.name}`);
+          this.setAgentStatus('executor', 'running', {
+            step: 'executing',
+            fixType: 'restart_deployment',
+            target: manualTarget.name,
+            status: 'running',
+          });
+
+          const fixResult = executor.restartDeployment(manualTarget.name, manualTarget.namespace);
+          let verification = null;
+
+          if (fixResult.status === 'success' && !this.getExecutionMode().dryRun && executor.verifyFixes !== false) {
+            verification = await executor.verifyFix(fixResult.action, currentState);
+          }
+
+          this.setAgentStatus('executor', fixResult.status, {
+            step: 'complete',
+            fixType: fixResult.fixType,
+            target: fixResult.target,
+            status: fixResult.status,
+          });
+
+          if (verification) {
+            fixResult.verification = verification;
+            if (!verification.verified) {
+              fixResult.status = 'partial';
+              fixResult.message = `${fixResult.message} (Verification failed: ${verification.reason})`;
+            } else {
+              fixResult.message = `${fixResult.message} (Verified: ${verification.reason})`;
+            }
+          }
+
+          const freshState = await this.getClusterState();
+          currentState = freshState;
+
+          finalResult = {
+            success: fixResult.status === 'success' || fixResult.status === 'simulated',
+            attempts,
+            finalHealth: fixResult.status === 'success' || fixResult.status === 'simulated' ? 'healthy' : 'unhealthy',
+            issuesFound: analysis.issues.length,
+            fixesApplied: fixResult.status === 'success' || fixResult.status === 'simulated' ? 1 : 0,
+            target: manualTarget,
+            verification,
+            timeline: logger.getTimeline(),
+          };
+          break;
+        }
+
+        const detection = {
+          hasIssues: true,
+          confirmedIssues: [targetedIssue],
+          categorizedIssues: {
+            bySeverity: { high: targetedIssue.severity === 'high' ? [targetedIssue] : [], medium: targetedIssue.severity === 'medium' ? [targetedIssue] : [], low: targetedIssue.severity === 'low' ? [targetedIssue] : [] },
+            byType: { [targetedIssue.type]: [targetedIssue] },
+            byResource: { [targetedIssue.target]: [targetedIssue] },
+            byNamespace: { [targetedIssue.namespace || 'default']: [targetedIssue] },
+          },
+          failureGroups: [],
+          patterns: [],
+          confidence: targetedIssue.confidence,
+          summary: `Manual target selected: ${manualTarget.namespace}/${manualTarget.name}`,
+          timestamp: new Date().toISOString(),
+        };
       }
 
       // Check if we should continue
@@ -175,13 +287,15 @@ class SelfHealingSystem {
       }
 
       // Step 2: Detector - Confirm and Categorize
-      this.setAgentStatus('detector', 'running', { step: 'confirming' });
-      const detection = await detector.detectIssues(analysis, currentState);
-      this.setAgentStatus('detector', detection.hasIssues ? 'issues-confirmed' : 'success', {
-        step: 'complete',
-        confirmed: detection.confirmedIssues?.length || 0,
-        confidence: detection.confidence,
-      });
+      if (!detection) {
+        this.setAgentStatus('detector', 'running', { step: 'confirming' });
+        detection = await detector.detectIssues(analysis, currentState);
+        this.setAgentStatus('detector', detection.hasIssues ? 'issues-confirmed' : 'success', {
+          step: 'complete',
+          confirmed: detection.confirmedIssues?.length || 0,
+          confidence: detection.confidence,
+        });
+      }
 
       if (options.onDetection) {
         options.onDetection(detection);
@@ -222,6 +336,10 @@ class SelfHealingSystem {
       };
 
       const rcaOutput = rca.performRCA(stateForRCA, detectedIssues);
+      if (manualTarget?.kind === 'deployment') {
+        rcaOutput.rootCauseType = 'deployment';
+        rcaOutput.manualTargetKind = 'deployment';
+      }
       this.setAgentStatus('rca', 'success', {
         step: 'complete',
         rootCause: rcaOutput.rootCause,
@@ -301,8 +419,15 @@ class SelfHealingSystem {
         return adapter.normalize(metrics);
       } catch (error) {
         logger.warn('Failed to fetch real metrics:', error.message);
+        if (this.strictLive) {
+          throw new Error(`Live metrics fetch failed in strict mode: ${error.message}`);
+        }
         logger.warn('Falling back to mock data...');
       }
+    }
+
+    if (this.strictLive) {
+      throw new Error('Strict live mode requires real metrics, but no metrics URL is configured.');
     }
 
     // Fallback to mock data
@@ -733,6 +858,160 @@ class SelfHealingSystem {
    */
   sleep(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
+  }
+
+  /**
+   * Read the explicit workload target from run options or environment.
+   */
+  getManualTarget(options = {}) {
+    const name = this.normalizeWorkloadName(String(options.targetName || process.env.MANUAL_TARGET_NAME || '').trim());
+    if (!name) {
+      return null;
+    }
+
+    const namespace = String(options.targetNamespace || process.env.MANUAL_TARGET_NAMESPACE || 'default').trim() || 'default';
+    const kind = String(options.targetKind || process.env.MANUAL_TARGET_KIND || 'pod').trim().toLowerCase() === 'deployment'
+      ? 'deployment'
+      : 'pod';
+
+    return { name, namespace, kind };
+  }
+
+  /**
+   * Resolve the selected target to a live pod record.
+   */
+  resolveManualTargetPod(clusterState, manualTarget) {
+    const pods = clusterState.pods || [];
+    if (manualTarget.kind === 'deployment') {
+      const match = pods.find((pod) => this.getDeploymentNameFromPodName(pod.name) === manualTarget.name && (pod.namespace || 'default') === manualTarget.namespace);
+      return match || null;
+    }
+
+    return pods.find(
+      (pod) => this.normalizeWorkloadName(pod.name) === manualTarget.name && (pod.namespace || 'default') === manualTarget.namespace,
+    ) || null;
+  }
+
+  /**
+   * Build a focused issue for the selected pod based on live state.
+   */
+  buildManualTargetIssue(pod, manualTarget) {
+    const status = String(pod.status || pod.phase || '').toLowerCase();
+    const cpu = Number(pod.cpu || 0);
+    const memory = Number(pod.memory || 0);
+    const restarts = Number(pod.restarts || 0);
+    const ready = pod.ready !== false;
+
+    let issue = null;
+
+    if (status.includes('crash') || status.includes('backoff') || status === 'failed') {
+      issue = {
+        pod: pod.name,
+        namespace: pod.namespace || manualTarget.namespace,
+        target: manualTarget.kind === 'deployment' ? this.getDeploymentNameFromPodName(pod.name) : pod.name,
+        type: 'crash_loop',
+        problem: `Targeted workload is in ${pod.status || pod.phase} state`,
+        severity: 'high',
+        metric: 'status',
+        details: { phase: pod.status || pod.phase, targetKind: manualTarget.kind },
+      };
+    } else if (status === 'pending') {
+      issue = {
+        pod: pod.name,
+        namespace: pod.namespace || manualTarget.namespace,
+        target: manualTarget.kind === 'deployment' ? this.getDeploymentNameFromPodName(pod.name) : pod.name,
+        type: 'pod_pending',
+        problem: 'Targeted workload is pending',
+        severity: 'medium',
+        metric: 'status',
+        details: { phase: pod.status || pod.phase, targetKind: manualTarget.kind },
+      };
+    } else if (restarts >= config.severity.thresholds.restarts.critical) {
+      issue = {
+        pod: pod.name,
+        namespace: pod.namespace || manualTarget.namespace,
+        target: manualTarget.kind === 'deployment' ? this.getDeploymentNameFromPodName(pod.name) : pod.name,
+        type: 'excessive_restarts',
+        problem: `Targeted workload has ${restarts} restarts`,
+        severity: 'high',
+        metric: 'restarts',
+        value: restarts,
+        details: { restarts, targetKind: manualTarget.kind },
+      };
+    } else if (cpu >= config.severity.thresholds.cpu.high) {
+      issue = {
+        pod: pod.name,
+        namespace: pod.namespace || manualTarget.namespace,
+        target: manualTarget.kind === 'deployment' ? this.getDeploymentNameFromPodName(pod.name) : pod.name,
+        type: 'high_cpu',
+        problem: `Targeted workload is using ${cpu}% CPU`,
+        severity: 'high',
+        metric: 'cpu',
+        value: cpu,
+        details: { cpu, targetKind: manualTarget.kind },
+      };
+    } else if (memory >= config.severity.thresholds.memory.high) {
+      issue = {
+        pod: pod.name,
+        namespace: pod.namespace || manualTarget.namespace,
+        target: manualTarget.kind === 'deployment' ? this.getDeploymentNameFromPodName(pod.name) : pod.name,
+        type: 'high_memory',
+        problem: `Targeted workload is using ${memory}% memory`,
+        severity: 'high',
+        metric: 'memory',
+        value: memory,
+        details: { memory, targetKind: manualTarget.kind },
+      };
+    } else if (!ready) {
+      issue = {
+        pod: pod.name,
+        namespace: pod.namespace || manualTarget.namespace,
+        target: manualTarget.kind === 'deployment' ? this.getDeploymentNameFromPodName(pod.name) : pod.name,
+        type: 'not_ready',
+        problem: 'Targeted workload is not ready',
+        severity: 'medium',
+        metric: 'readiness',
+        details: { ready, targetKind: manualTarget.kind },
+      };
+    }
+
+    if (!issue) {
+      return null;
+    }
+
+    return {
+      ...issue,
+      confidence: 95,
+      detectionId: `${issue.target}-${Date.now()}-manual`,
+      isFlapping: false,
+      flappingCount: 0,
+      confirmed: true,
+      confirmationTime: new Date().toISOString(),
+    };
+  }
+
+  /**
+   * Infer a deployment name from a pod name.
+   */
+  getDeploymentNameFromPodName(podName) {
+    const baseName = this.normalizeWorkloadName(String(podName || '').trim());
+    const parts = baseName.split('-');
+    if (parts.length >= 3) {
+      return parts.slice(0, -2).join('-');
+    }
+    if (parts.length >= 2) {
+      return parts.slice(0, -1).join('-');
+    }
+    return baseName;
+  }
+
+  /**
+   * Strip display-only suffixes from workload names.
+   */
+  normalizeWorkloadName(name) {
+    return String(name || '')
+      .replace(/\s*\(deployment\)\s*$/i, '')
+      .trim();
   }
 
   /**

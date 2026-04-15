@@ -12,6 +12,13 @@ class DetectorAgent {
     this.issueHistory = new Map();
     this.confidenceThreshold = 70;
     this.duplicateWindowMs = 300000; // 5 minutes
+    this.ignoredNamespaces = new Set([
+      'kube-system',
+      'kube-public',
+      'kube-node-lease',
+      'local-path-storage',
+      'ingress-nginx',
+    ]);
   }
 
   /**
@@ -72,6 +79,10 @@ class DetectorAgent {
     const confirmed = [];
 
     for (const issue of rawIssues) {
+      if (this.isIgnoredIssue(issue)) {
+        continue;
+      }
+
       // Skip duplicates
       if (this.isDuplicate(issue)) {
         logger.debug(`Skipping duplicate issue: ${issue.target}`);
@@ -105,6 +116,23 @@ class DetectorAgent {
     }
 
     return confirmed;
+  }
+
+  /**
+   * Ignore system namespace resources and non-workload targets.
+   */
+  isIgnoredIssue(issue) {
+    const namespace = String(issue.namespace || '').toLowerCase();
+    if (namespace && this.ignoredNamespaces.has(namespace)) {
+      return true;
+    }
+
+    const target = String(issue.target || issue.pod || issue.node || '').toLowerCase();
+    if (!target) {
+      return true;
+    }
+
+    return this.ignoredNamespaces.has(target);
   }
 
   /**

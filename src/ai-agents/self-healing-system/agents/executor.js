@@ -15,6 +15,13 @@ class ExecutionerAgent {
     this.timeoutMs = config.execution.timeoutMs || 120000;
     this.verifyFixes = config.execution.verifyFixes !== false; // default true
     this.verifyTimeoutMs = config.execution.verifyTimeoutMs || 120000;
+    this.protectedNamespaces = new Set([
+      'kube-system',
+      'kube-public',
+      'kube-node-lease',
+      'local-path-storage',
+      'ingress-nginx',
+    ]);
   }
 
   /**
@@ -100,6 +107,7 @@ class ExecutionerAgent {
   determineStrategy(rcaOutput, recommendation, clusterState) {
     const rootCause = rcaOutput.rootCause;
     const rootCauseType = rcaOutput.rootCauseType;
+    const manualTargetKind = rcaOutput.manualTargetKind;
     const failureChain = rcaOutput.failureChain;
 
     // First issue in chain gives context
@@ -108,11 +116,20 @@ class ExecutionerAgent {
 
     // Strategy selection logic
     let strategy = {
-      type: 'restart_pod',
+      type: manualTargetKind === 'deployment' || rootCauseType === 'deployment' ? 'restart_deployment' : 'restart_pod',
       target: rootCause,
-      namespace: 'default',
+      namespace: this.getNamespace(rootCause, clusterState),
       priority: 1,
     };
+
+    if (manualTargetKind === 'deployment' || rootCauseType === 'deployment') {
+      strategy = {
+        type: 'restart_deployment',
+        target: rootCause,
+        namespace: this.getNamespace(rootCause, clusterState),
+        priority: 1,
+      };
+    }
 
     // High restart count → restart
     if (primaryReason.includes('restart') || primaryIssue.includes('restart')) {
@@ -201,7 +218,9 @@ class ExecutionerAgent {
     }
 
     // Apply recommendation if confidence is high enough
-    if (recommendation && recommendation.confidence >= config.memory.minConfidenceForLearning) {
+    const explicitDeploymentTarget = manualTargetKind === 'deployment' || rootCauseType === 'deployment';
+
+    if (!explicitDeploymentTarget && recommendation && recommendation.confidence >= config.memory.minConfidenceForLearning) {
       logger.info(`Using recommended fix: ${recommendation.fixType} (confidence: ${recommendation.confidence}%)`);
       strategy.type = recommendation.fixType;
     }
@@ -312,16 +331,56 @@ class ExecutionerAgent {
    * Restart a deployment (rollout restart)
    */
   restartDeployment(deploymentName, namespace) {
+    const ns = namespace || 'default';
+
+    // If deployment is intentionally or accidentally at 0 replicas, restore one replica first so healing is visible.
+    const replicaCheck = this.getDeploymentReplicaStatus(deploymentName, ns);
+    if (replicaCheck.ok && replicaCheck.specReplicas === 0) {
+      logger.info(`Deployment ${ns}/${deploymentName} is at 0 replicas; scaling to 1 before restart`);
+      const scaleAction = {
+        type: 'SCALE',
+        resource: 'deployment',
+        name: deploymentName,
+        namespace: ns,
+        replicas: 1,
+        message: `Scaling deployment ${ns}/${deploymentName} to 1 replica before restart`,
+      };
+      const scaleResult = this.executeK8sAction(scaleAction);
+      if (scaleResult.status !== 'success' && scaleResult.status !== 'simulated') {
+        return {
+          status: 'failed',
+          message: `Failed to scale deployment ${ns}/${deploymentName} before restart: ${scaleResult.message}`,
+          action: scaleAction,
+          metadata: { scaledFromZero: true },
+        };
+      }
+    }
+
     const action = {
       type: 'RESTART',
       resource: 'deployment',
       name: deploymentName,
-      namespace,
-      message: `Rolling out restart for deployment ${namespace}/${deploymentName}`,
+      namespace: ns,
+      message: `Rolling out restart for deployment ${ns}/${deploymentName}`,
     };
 
     const result = this.executeK8sAction(action);
     return { ...result, action };
+  }
+
+  getDeploymentReplicaStatus(deploymentName, namespace) {
+    try {
+      const output = this.runKubectl(['get', 'deployment', deploymentName, '-n', namespace, '-o', 'json'], 15000);
+      const dep = JSON.parse(output);
+      return {
+        ok: true,
+        specReplicas: Number(dep?.spec?.replicas ?? 1),
+        availableReplicas: Number(dep?.status?.availableReplicas ?? 0),
+      };
+    } catch (error) {
+      logger.warn(`Could not read deployment replica status for ${namespace}/${deploymentName}: ${error.message}`);
+      return { ok: false, specReplicas: null, availableReplicas: null };
+    }
   }
 
   /**
@@ -484,7 +543,7 @@ class ExecutionerAgent {
     switch (type) {
       case 'DELETE':
         // Delete a pod (triggers restart via ReplicaSet/Deployment)
-        args = ['delete', resource, name, ...ns, '--grace-period=30', '--force=false'];
+        args = ['delete', resource, name, ...ns, '--grace-period=30'];
         break;
 
       case 'SCALE':
@@ -577,6 +636,12 @@ class ExecutionerAgent {
       } catch (error) {
         // Resource might not exist yet (being created)
         if (error.stderr?.includes('NotFound')) {
+          if (resource === 'pod' && type === 'DELETE') {
+            const replacement = this.findReplacementPod(name, namespace);
+            if (replacement.verified) {
+              return replacement;
+            }
+          }
           await this.sleep(checkInterval);
           continue;
         }
@@ -595,12 +660,69 @@ class ExecutionerAgent {
   }
 
   /**
+   * For pod delete actions, verify that a new replacement pod with matching workload prefix becomes ready.
+   */
+  findReplacementPod(originalPodName, namespace) {
+    const prefix = this.getPodWorkloadPrefix(originalPodName);
+    if (!prefix) {
+      return { verified: false, reason: 'Replacement pod prefix could not be inferred' };
+    }
+
+    const args = [
+      'get',
+      'pods',
+      '-n',
+      namespace || 'default',
+      '-o',
+      'jsonpath={range .items[*]}{.metadata.name}{"|"}{.status.phase}{"|"}{range .status.conditions[*]}{.type}{"="}{.status}{","}{end}{"\\n"}{end}',
+    ];
+
+    const output = this.runKubectl(args, 15000);
+    const lines = (output || '').split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+
+    for (const line of lines) {
+      const [name, phase, conds = ''] = line.split('|');
+      if (!name || name === originalPodName || !name.startsWith(prefix)) {
+        continue;
+      }
+      const isRunning = (phase || '').toLowerCase() === 'running';
+      const isReady = conds.includes('Ready=True');
+      if (isRunning && isReady) {
+        return {
+          verified: true,
+          reason: `Replacement pod ready: ${name}`,
+        };
+      }
+    }
+
+    return {
+      verified: false,
+      reason: `No ready replacement pod found for prefix ${prefix}`,
+    };
+  }
+
+  getPodWorkloadPrefix(podName) {
+    const parts = (podName || '').split('-');
+    if (parts.length >= 3 && /^[a-z0-9]+$/i.test(parts[parts.length - 1])) {
+      return parts.slice(0, -2).join('-');
+    }
+    if (parts.length >= 2) {
+      return parts.slice(0, -1).join('-');
+    }
+    return podName || '';
+  }
+
+  /**
    * Validate strategy
    */
   validateStrategy(strategy) {
     if (!strategy || !strategy.type) return false;
     if (!this.strategies.includes(strategy.type)) return false;
     if (!strategy.target) return false;
+    if (strategy.namespace && this.protectedNamespaces.has(String(strategy.namespace).toLowerCase())) {
+      logger.warn(`Blocked unsafe fix in protected namespace: ${strategy.namespace}`);
+      return false;
+    }
     return true;
   }
 
@@ -609,7 +731,8 @@ class ExecutionerAgent {
    */
   getNamespace(resourceName, clusterState) {
     const pods = clusterState.pods || [];
-    const pod = pods.find(p => p.name === resourceName);
+    const normalizedName = this.normalizeResourceName(resourceName);
+    const pod = pods.find(p => this.normalizeResourceName(p.name) === normalizedName);
     return pod?.namespace || 'default';
   }
 
@@ -619,13 +742,21 @@ class ExecutionerAgent {
   getDeploymentName(podName, clusterState) {
     // Try to extract deployment from pod name
     // e.g., "api-server-7d9f4b8c5-x2z9a" → "api-server"
-    const match = podName.match(/^(.+)-[a-z0-9]+-[a-z0-9]{5}$/);
+    const normalizedName = this.normalizeResourceName(podName);
+    const match = normalizedName.match(/^(.+)-[a-z0-9]+-[a-z0-9]{5}$/);
     if (match) return match[1];
 
     // Fallback: use labels
     const pods = clusterState.pods || [];
-    const pod = pods.find(p => p.name === podName);
+    const pod = pods.find(p => this.normalizeResourceName(p.name) === normalizedName);
     return pod?.labels?.app || pod?.labels?.['app.kubernetes.io/name'] || podName;
+  }
+
+  /**
+   * Normalize workload names from display labels.
+   */
+  normalizeResourceName(name) {
+    return String(name || '').replace(/\s*\(deployment\)\s*$/i, '').trim();
   }
 
   /**
