@@ -3,10 +3,22 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Activity, BrainCircuit, PlayCircle, RefreshCw, ShieldAlert, Wrench } from "lucide-react";
 import { Card, CardBody, CardHeader } from "@/components/ui/card";
+import { readSelectedEndpoint as readSelectedEndpointFromApi } from "@/lib/endpoints-client";
 
 type HealingEventType = "DETECTED" | "ANALYZING" | "FIXING" | "RESOLVED" | "FAILED";
 type HealingLogStatus = "OPEN" | "IN_PROGRESS" | "SUCCESS" | "FAILED";
 type HealingScenario = "pod-crash" | "high-cpu" | "service-unavailable";
+type HealingTargetKind = "pod" | "deployment";
+
+type HealingTarget = {
+  pod_name: string;
+  namespace: string;
+  status: string;
+  cpu_usage: number | null;
+  memory_usage: number | null;
+  restart_count: number;
+  kind: HealingTargetKind;
+};
 
 type StructuredHealingLog = {
   id: string;
@@ -34,12 +46,16 @@ type IssueLifecycle = {
 
 type AgentRunnerStatus = {
   state: "idle" | "running" | "completed" | "failed";
+  outcome?: "fixed" | "no-op" | "failed";
   startedAt?: string;
   finishedAt?: string;
   activeAgent?: string;
   activeAction?: string;
   activeIssueId?: string;
   scenario?: HealingScenario;
+  targetName?: string;
+  targetNamespace?: string;
+  targetKind?: HealingTargetKind;
   totalLogs: number;
   lastError?: string;
 };
@@ -69,12 +85,30 @@ function statusBadge(status: HealingLogStatus | AgentRunnerStatus["state"]) {
   return "bg-slate-100 text-slate-700";
 }
 
+function outcomeBadge(outcome?: AgentRunnerStatus["outcome"]) {
+  if (outcome === "fixed") return "bg-emerald-100 text-emerald-700";
+  if (outcome === "no-op") return "bg-slate-100 text-slate-700";
+  if (outcome === "failed") return "bg-red-100 text-red-700";
+  return "bg-slate-100 text-slate-700";
+}
+
 function eventBadge(eventType: HealingEventType) {
   if (eventType === "DETECTED") return "bg-red-100 text-red-700";
   if (eventType === "ANALYZING") return "bg-blue-100 text-blue-700";
   if (eventType === "FIXING") return "bg-amber-100 text-amber-700";
   if (eventType === "RESOLVED") return "bg-emerald-100 text-emerald-700";
   return "bg-slate-100 text-slate-700";
+}
+
+function deploymentNameFromPodName(podName: string) {
+  const parts = podName.split("-");
+  if (parts.length >= 3) {
+    return parts.slice(0, -2).join("-");
+  }
+  if (parts.length >= 2) {
+    return parts.slice(0, -1).join("-");
+  }
+  return podName;
 }
 
 export default function HealingDashboardPage() {
@@ -90,7 +124,20 @@ export default function HealingDashboardPage() {
   const [timeFilterMinutes, setTimeFilterMinutes] = useState<string>("all");
   const [metricsUrl, setMetricsUrl] = useState<string>("");
   const [dryRun, setDryRun] = useState<boolean>(false);
+  const [startError, setStartError] = useState<string>("");
+  const [targets, setTargets] = useState<HealingTarget[]>([]);
+  const [selectedTargetId, setSelectedTargetId] = useState<string>("");
+  const [targetKind, setTargetKind] = useState<HealingTargetKind>("pod");
+  const [targetLoading, setTargetLoading] = useState(false);
+  const [targetError, setTargetError] = useState<string>("");
   const eventSourceRef = useRef<EventSource | null>(null);
+
+  useEffect(() => {
+    const envUrl = process.env.NEXT_PUBLIC_METRICS_URL || "";
+    if (envUrl) {
+      setMetricsUrl(envUrl);
+    }
+  }, []);
 
   const fetchSummary = useCallback(async () => {
     setLoadingSummary(true);
@@ -104,6 +151,66 @@ export default function HealingDashboardPage() {
       setLoadingSummary(false);
     }
   }, []);
+
+  const fetchTargets = useCallback(async () => {
+    const sourceUrl = metricsUrl.trim() || (await readSelectedEndpointFromApi().then((ep) => ep?.ngrok_url || "").catch(() => ""));
+    if (!sourceUrl) {
+      setTargets([]);
+      setSelectedTargetId("");
+      setTargetError("");
+      return;
+    }
+
+    setTargetLoading(true);
+    setTargetError("");
+    try {
+      const url = new URL("/api/dashboard/pods", window.location.origin);
+      url.searchParams.set("ngrok_url", sourceUrl);
+
+      const res = await fetch(url.toString(), { cache: "no-store" });
+      const data = (await res.json()) as { ok?: boolean; error?: string; pods?: HealingTarget[] };
+      if (!res.ok) {
+        throw new Error(data.error || `Failed to load live pods (${res.status})`);
+      }
+
+      const normalized = Array.isArray(data.pods)
+        ? data.pods
+            .map((pod) => {
+              const rawName = String(pod.pod_name || "").trim();
+              const deploymentMatch = rawName.match(/^(.*)\s+\(deployment\)$/i);
+              const isDeployment = Boolean(deploymentMatch);
+              return {
+                pod_name: (deploymentMatch?.[1] || rawName).trim(),
+                namespace: pod.namespace || "default",
+                status: pod.status,
+                cpu_usage: typeof pod.cpu_usage === "number" ? pod.cpu_usage : null,
+                memory_usage: typeof pod.memory_usage === "number" ? pod.memory_usage : null,
+                restart_count: typeof pod.restart_count === "number" ? pod.restart_count : 0,
+                kind: isDeployment ? "deployment" : "pod",
+              };
+            })
+            .sort((a, b) => {
+              const aRisk = /crash|fail|pending|error/i.test(a.status) ? 0 : 1;
+              const bRisk = /crash|fail|pending|error/i.test(b.status) ? 0 : 1;
+              return aRisk - bRisk || a.namespace.localeCompare(b.namespace) || a.pod_name.localeCompare(b.pod_name);
+            })
+        : [];
+
+      setTargets(normalized);
+      setSelectedTargetId((prev) => {
+        if (prev && normalized.some((item) => `${item.namespace}/${item.kind}/${item.pod_name}` === prev)) {
+          return prev;
+        }
+        return normalized.length > 0 ? `${normalized[0].namespace}/${normalized[0].kind}/${normalized[0].pod_name}` : "";
+      });
+    } catch (error) {
+      setTargetError(error instanceof Error ? error.message : String(error));
+      setTargets([]);
+      setSelectedTargetId("");
+    } finally {
+      setTargetLoading(false);
+    }
+  }, [metricsUrl]);
 
   const fetchInitial = useCallback(async () => {
     const [statusRes, logsRes] = await Promise.all([
@@ -133,6 +240,7 @@ export default function HealingDashboardPage() {
   useEffect(() => {
     void fetchInitial();
     void fetchSummary();
+    void fetchTargets();
 
     const es = new EventSource("/api/ai-agents/healing/stream");
     eventSourceRef.current = es;
@@ -167,7 +275,16 @@ export default function HealingDashboardPage() {
       es.close();
       eventSourceRef.current = null;
     };
-  }, [fetchInitial, fetchSummary]);
+  }, [fetchInitial, fetchSummary, fetchTargets]);
+
+  useEffect(() => {
+    const onEndpointChange = () => {
+      void fetchTargets();
+    };
+
+    window.addEventListener("kubepulse-endpoint", onEndpointChange);
+    return () => window.removeEventListener("kubepulse-endpoint", onEndpointChange);
+  }, [fetchTargets]);
 
   useEffect(() => {
     if (status.state === "completed" || status.state === "failed") {
@@ -176,17 +293,49 @@ export default function HealingDashboardPage() {
   }, [status.state, fetchSummary]);
 
   const startHealing = async () => {
+    setStartError("");
+
+    const metricsSourceUrl =
+      metricsUrl.trim() || (await readSelectedEndpointFromApi().then((ep) => ep?.ngrok_url || "").catch(() => ""));
+
+    if (!metricsSourceUrl) {
+      setStartError("Add a metrics URL or select an endpoint first so the live /pods list can load.");
+      return;
+    }
+
+    if (!selectedTargetId) {
+      setStartError("Select a pod from the live /pods list before starting healing.");
+      return;
+    }
+
+    const selectedTarget = targets.find((t) => `${t.namespace}/${t.kind}/${t.pod_name}` === selectedTargetId);
+    if (!selectedTarget) {
+      setStartError("Selected target is no longer available. Refresh the live pod list.");
+      return;
+    }
+
+    const targetName = targetKind === "deployment" ? deploymentNameFromPodName(selectedTarget.pod_name) : selectedTarget.pod_name;
+
     setLoadingStart(true);
     try {
-      await fetch("/api/ai-agents/healing/start", {
+      const res = await fetch("/api/ai-agents/healing/start", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           scenario,
           dryRun,
-          metricsUrl: metricsUrl.trim() || undefined,
+          metricsUrl: metricsSourceUrl,
+          strictLive: true,
+          targetName,
+          targetNamespace: selectedTarget.namespace,
+          targetKind,
         }),
       });
+
+      if (!res.ok) {
+        const data = (await res.json().catch(() => ({}))) as { error?: string; details?: string };
+        setStartError(data.details || data.error || `Failed to start healing (HTTP ${res.status})`);
+      }
     } finally {
       setLoadingStart(false);
     }
@@ -220,6 +369,10 @@ export default function HealingDashboardPage() {
     return [...logs].reverse().find((l) => l.reasoning || typeof l.confidence === "number");
   }, [logs]);
 
+  const selectedTarget = useMemo(() => {
+    return targets.find((t) => `${t.namespace}/${t.kind}/${t.pod_name}` === selectedTargetId) || null;
+  }, [targets, selectedTargetId]);
+
   return (
     <div className="space-y-4">
       <Card>
@@ -229,6 +382,8 @@ export default function HealingDashboardPage() {
             <div className="text-sm text-muted">
               Live stream of detection, analysis, remediation, and outcome with Gemini-powered summaries.
             </div>
+            {startError ? <div className="mt-2 text-sm font-medium text-red-600">{startError}</div> : null}
+            {targetError ? <div className="mt-2 text-sm font-medium text-red-600">{targetError}</div> : null}
           </div>
           <div className="flex flex-wrap items-center gap-2">
             <input
@@ -237,6 +392,33 @@ export default function HealingDashboardPage() {
               placeholder="Ngrok metrics URL (optional)"
               className="min-w-[280px] rounded-lg border border-[#dfd4c2] bg-white px-3 py-2 text-sm"
             />
+            <select
+              value={selectedTargetId}
+              onChange={(e) => {
+                const next = targets.find((target) => `${target.namespace}/${target.kind}/${target.pod_name}` === e.target.value);
+                setSelectedTargetId(e.target.value);
+                if (next) {
+                  setTargetKind(next.kind);
+                }
+              }}
+              className="min-w-[280px] rounded-lg border border-[#dfd4c2] bg-white px-3 py-2 text-sm"
+              disabled={targetLoading || targets.length === 0}
+            >
+              <option value="">{targetLoading ? "Loading live /pods list..." : "Select a pod from live /pods list"}</option>
+              {targets.map((target) => (
+                <option key={`${target.namespace}/${target.kind}/${target.pod_name}`} value={`${target.namespace}/${target.kind}/${target.pod_name}`}>
+                  {target.namespace}/{target.pod_name} · {target.kind} · {target.status}
+                </option>
+              ))}
+            </select>
+            <select
+              value={targetKind}
+              onChange={(e) => setTargetKind(e.target.value as HealingTargetKind)}
+              className="rounded-lg border border-[#dfd4c2] bg-white px-3 py-2 text-sm"
+            >
+              <option value="pod">Pod</option>
+              <option value="deployment">Deployment</option>
+            </select>
             <select
               value={scenario}
               onChange={(e) => setScenario(e.target.value as HealingScenario)}
@@ -282,6 +464,22 @@ export default function HealingDashboardPage() {
               {status.state.toUpperCase()}
             </div>
             <div className="mt-3 text-xs text-muted">Scenario: {status.scenario || scenario}</div>
+            <div className="mt-2 text-xs text-muted">
+              Target: {status.targetNamespace && status.targetName ? `${status.targetNamespace}/${status.targetName}` : selectedTarget ? `${selectedTarget.namespace}/${selectedTarget.pod_name}` : "-"}
+            </div>
+            <div className="mt-2 text-xs text-muted">Outcome: </div>
+            <div className={`mt-1 inline-flex rounded-full px-2 py-1 text-xs font-semibold ${outcomeBadge(status.outcome)}`}>
+              {(status.outcome || "-").toUpperCase()}
+            </div>
+            <div className="mt-3 text-xs text-muted">
+              {status.outcome === "fixed"
+                ? "A verified remediation was applied."
+                : status.outcome === "no-op"
+                  ? "The run completed without applying a fix."
+                  : status.outcome === "failed"
+                    ? "The run failed before remediation completed."
+                    : "Waiting for run outcome."}
+            </div>
           </CardBody>
         </Card>
 

@@ -89,7 +89,8 @@ class MetricsFetcher {
         method: 'GET',
         headers: {
           'Accept': 'application/json',
-          'User-Agent': 'Self-Healing-System/1.0'
+          'User-Agent': 'Self-Healing-System/1.0',
+          'ngrok-skip-browser-warning': '1'
         },
         timeout: 10000 // 10 second timeout
       };
@@ -269,7 +270,7 @@ class MetricsFetcher {
     }
 
     return {
-      name: pod.name || 'unknown',
+      name: this.normalizeWorkloadName(pod.name || 'unknown'),
       namespace: pod.namespace || 'default',
       status: status,
       phase: phase,
@@ -364,7 +365,7 @@ class MetricsFetcher {
     }
 
     return {
-      name: pod.name || pod.podName || pod.id || 'unknown',
+      name: this.normalizeWorkloadName(pod.name || pod.podName || pod.id || 'unknown'),
       namespace: pod.namespace || 'default',
       status: pod.status || pod.phase || pod.state || 'Unknown',
       phase: pod.phase || pod.status || 'Unknown',
@@ -420,7 +421,7 @@ class MetricsFetcher {
     }
 
     return {
-      name: metadata.name || 'unknown',
+      name: this.normalizeWorkloadName(metadata.name || 'unknown'),
       namespace: metadata.namespace || 'default',
       status: status.phase || 'Unknown',
       phase: status.phase || 'Unknown',
@@ -515,6 +516,13 @@ class MetricsFetcher {
     }
 
     return parseFloat(memStr) || 0;
+  }
+
+  /**
+   * Strip presentation suffixes from workload names.
+   */
+  normalizeWorkloadName(name) {
+    return String(name || '').replace(/\s*\(deployment\)\s*$/i, '').trim();
   }
 
   /**

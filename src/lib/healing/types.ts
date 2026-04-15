@@ -4,6 +4,8 @@ export type HealingLogStatus = "OPEN" | "IN_PROGRESS" | "SUCCESS" | "FAILED";
 
 export type HealingScenario = "pod-crash" | "high-cpu" | "service-unavailable";
 
+export type HealingTargetKind = "pod" | "deployment";
+
 export type StructuredHealingLog = {
   id: string;
   timestamp: string;
@@ -31,12 +33,16 @@ export type IssueLifecycle = {
 
 export type AgentRunnerStatus = {
   state: "idle" | "running" | "completed" | "failed";
+  outcome?: "fixed" | "no-op" | "failed";
   startedAt?: string;
   finishedAt?: string;
   activeAgent?: string;
   activeAction?: string;
   activeIssueId?: string;
   scenario?: HealingScenario;
+  targetName?: string;
+  targetNamespace?: string;
+  targetKind?: HealingTargetKind;
   totalLogs: number;
   lastError?: string;
 };

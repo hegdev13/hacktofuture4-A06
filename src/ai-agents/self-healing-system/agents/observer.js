@@ -11,6 +11,13 @@ class ObserverAgent {
   constructor() {
     this.thresholds = config.severity.thresholds;
     this.anomalyHistory = new Map();
+    this.ignoredNamespaces = new Set([
+      'kube-system',
+      'kube-public',
+      'kube-node-lease',
+      'local-path-storage',
+      'ingress-nginx',
+    ]);
   }
 
   /**
@@ -21,7 +28,9 @@ class ObserverAgent {
     logger.timelineEvent('analysis', 'Starting cluster health analysis');
 
     const issues = [];
-    const pods = clusterState.pods || [];
+    const pods = (clusterState.pods || []).filter(
+      (pod) => !this.ignoredNamespaces.has((pod.namespace || '').toLowerCase())
+    );
     const nodes = clusterState.nodes || [];
     const metrics = clusterState.metrics || {};
 
