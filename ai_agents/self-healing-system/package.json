@@ -1,0 +1,38 @@
+{
+  "name": "agentic-k8s-self-healing",
+  "version": "1.0.0",
+  "description": "Production-ready Agentic Kubernetes Self-Healing System with Observer, RCA, and Executioner agents",
+  "main": "main.js",
+  "scripts": {
+    "start": "node main.js",
+    "test": "node tests/run-tests.js",
+    "demo": "node demo/run-demo.js",
+    "dry-run": "DRY_RUN=true node main.js",
+    "real": "DRY_RUN=false KUBECONFIG=true node main.js"
+  },
+  "keywords": [
+    "kubernetes",
+    "self-healing",
+    "automation",
+    "observability",
+    "root-cause-analysis",
+    "ai-agents",
+    "devops",
+    "sre"
+  ],
+  "author": "Your Name",
+  "license": "MIT",
+  "engines": {
+    "node": ">=14.0.0"
+  },
+  "dependencies": {},
+  "devDependencies": {},
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/yourusername/self-healing-system.git"
+  },
+  "bugs": {
+    "url": "https://github.com/yourusername/self-healing-system/issues"
+  },
+  "homepage": "https://github.com/yourusername/self-healing-system#readme"
+}
