@@ -83,21 +83,22 @@ export function AgentWithOverrides() {
       agentId: "agent_7901kp0j3ecqfxy8wmj8dwskkejr",
       connectionType: "webrtc",
       overrides: {
-        // Custom system prompt
-        prompt: `You are a Kubernetes diagnostics expert. 
+        agent: {
+          // Custom system prompt
+          prompt: {
+            prompt: `You are a Kubernetes diagnostics expert. 
                  You help analyze cluster issues and recommend fixes.
                  Be concise and actionable.
                  Always prioritize user safety.`,
+          },
 
-        // Custom first message
-        firstMessage:
-          "Hi! I'm your Kubernetes assistant. What can I help you diagnose today?",
+          // Custom first message
+          firstMessage:
+            "Hi! I'm your Kubernetes assistant. What can I help you diagnose today?",
 
-        // Force specific language
-        language: "en",
-
-        // Use specific voice (optional)
-        voiceId: undefined,
+          // Force specific language
+          language: "en",
+        },
       },
     });
   };
@@ -185,22 +186,20 @@ export function AdvancedAgentComponent() {
     onMessage: (message) => {
       console.log("Raw message:", message);
 
-      // Handle different message types
-      if (message.type === "user_transcript") {
+      if (message.role === "user") {
         setMessages((prev) => [
           ...prev,
           {
             type: "user",
-            content: message.user_transcript,
-            confidence: message.confidence,
+            content: message.message,
           },
         ]);
-      } else if (message.type === "agent_response") {
+      } else if (message.role === "agent") {
         setMessages((prev) => [
           ...prev,
           {
             type: "agent",
-            content: message.agent_response,
+            content: message.message,
           },
         ]);
       }
@@ -208,12 +207,12 @@ export function AdvancedAgentComponent() {
 
     onError: (error) => {
       console.error("Agent error:", error);
-      alert(`Error: ${error.message}`);
+      alert(`Error: ${String(error)}`);
     },
 
     onModeChange: (mode) => {
       console.log("Agent mode changed to:", mode);
-      setIsSpeaking(mode === "speaking");
+      setIsSpeaking(mode.mode === "speaking");
     },
   });
 
@@ -226,12 +225,16 @@ export function AdvancedAgentComponent() {
         connectionType: "webrtc",
         clientTools,
         overrides: {
-          prompt: `You are a Kubernetes expert. Help diagnose cluster issues.
+          agent: {
+            prompt: {
+              prompt: `You are a Kubernetes expert. Help diagnose cluster issues.
                    Use available tools to analyze pods and metrics.
                    Always explain your reasoning.`,
-          firstMessage:
-            "Hello! I'm ready to help diagnose your Kubernetes cluster.",
-          language: "en",
+            },
+            firstMessage:
+              "Hello! I'm ready to help diagnose your Kubernetes cluster.",
+            language: "en",
+          },
         },
       });
 

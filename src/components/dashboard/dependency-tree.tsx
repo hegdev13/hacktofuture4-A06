@@ -7,6 +7,7 @@ interface Pod {
   id: string;
   name: string;
   status: "running" | "failed" | "pending";
+  failureType?: "healthy" | "root-cause" | "cascading";
   message?: string;
   dependsOn?: string[];
 }
@@ -46,7 +47,13 @@ export function DependencyTree({ pods }: DependencyTreeProps) {
     setExpandedPods(newExpanded);
   };
 
-  const getStatusIcon = (status: string) => {
+  const getStatusIcon = (status: string, failureType?: Pod["failureType"]) => {
+    if (failureType === "root-cause") {
+      return <AlertCircle className="w-4 h-4 text-rose-400" />;
+    }
+    if (failureType === "cascading") {
+      return <Zap className="w-4 h-4 text-amber-400" />;
+    }
     switch (status) {
       case "running":
         return <CheckCircle className="w-4 h-4 text-emerald-400" />;
@@ -59,9 +66,12 @@ export function DependencyTree({ pods }: DependencyTreeProps) {
     }
   };
 
-  const getStatusBgColor = (status: string, isRootCause: boolean = false) => {
-    if (isRootCause) {
+  const getStatusBgColor = (status: string, failureType?: Pod["failureType"], isRootCause: boolean = false) => {
+    if (isRootCause || failureType === "root-cause") {
       return "bg-red-900/40 border border-red-700/60 hover:bg-red-900/60";
+    }
+    if (failureType === "cascading") {
+      return "bg-amber-900/25 border border-amber-700/60 hover:bg-amber-900/35";
     }
     switch (status) {
       case "running":
@@ -75,9 +85,12 @@ export function DependencyTree({ pods }: DependencyTreeProps) {
     }
   };
 
-  const getTextColor = (status: string, isRootCause: boolean = false) => {
-    if (isRootCause) {
+  const getTextColor = (status: string, failureType?: Pod["failureType"], isRootCause: boolean = false) => {
+    if (isRootCause || failureType === "root-cause") {
       return "text-red-300";
+    }
+    if (failureType === "cascading") {
+      return "text-amber-300";
     }
     switch (status) {
       case "running":
@@ -92,6 +105,11 @@ export function DependencyTree({ pods }: DependencyTreeProps) {
   };
 
   const findRootCausePods = () => {
+    const flaggedRoots = pods.filter((p) => p.failureType === "root-cause").map((p) => p.id);
+    if (flaggedRoots.length) {
+      return new Set(flaggedRoots);
+    }
+
     const failedPods = pods.filter((p) => p.status === "failed");
     const rootCauses = new Set<string>();
 
@@ -122,7 +140,7 @@ export function DependencyTree({ pods }: DependencyTreeProps) {
         <div
           className={`
             flex items-center gap-2 px-3 py-2 rounded-lg border transition-all cursor-pointer
-            ${getStatusBgColor(pod.status, isRootCause)}
+            ${getStatusBgColor(pod.status, pod.failureType, isRootCause)}
           `}
           style={{ marginLeft: `${level * 24}px` }}
           onClick={() => isDependencyNode && toggleExpand(pod.id)}
@@ -141,12 +159,12 @@ export function DependencyTree({ pods }: DependencyTreeProps) {
           </div>
 
           {/* Status icon */}
-          <div className="flex-shrink-0">{getStatusIcon(pod.status)}</div>
+          <div className="flex-shrink-0">{getStatusIcon(pod.status, pod.failureType)}</div>
 
           {/* Pod name and info */}
           <div className="flex-1 min-w-0">
             <div className="flex items-center gap-2 flex-wrap">
-              <span className={`font-medium text-sm ${getTextColor(pod.status, isRootCause)}`}>
+              <span className={`font-medium text-sm ${getTextColor(pod.status, pod.failureType, isRootCause)}`}>
                 {pod.name}
               </span>
               {isRootCause && (
@@ -154,12 +172,13 @@ export function DependencyTree({ pods }: DependencyTreeProps) {
                   ROOT CAUSE
                 </span>
               )}
-              {pod.status === "failed" && (
+              {pod.failureType === "cascading" ? (
+                <span className="text-xs font-medium text-amber-400">Cascading</span>
+              ) : pod.status === "failed" ? (
                 <span className="text-xs font-medium text-rose-400">Failed</span>
-              )}
-              {pod.status === "pending" && (
+              ) : pod.status === "pending" ? (
                 <span className="text-xs font-medium text-amber-400">Pending</span>
-              )}
+              ) : null}
             </div>
             {pod.message && (
               <p className="text-xs text-gray-400 mt-0.5 truncate">{pod.message}</p>

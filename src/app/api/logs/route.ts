@@ -3,12 +3,19 @@ import { z } from "zod";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
 import { NgrokUrlSchema } from "@/lib/validation";
 import { rateLimit } from "@/lib/security/rate-limit";
+import { ingestLogs, queryLogs } from "@/lib/observability/logs";
+import { publishObservabilityEvent } from "@/lib/observability/events";
 
 const QuerySchema = z.object({
   endpoint: z.string().uuid().optional(),
   ngrok_url: NgrokUrlSchema.optional(),
-  pod: z.string().min(1),
+  pod: z.string().min(1).optional(),
   namespace: z.string().min(1).optional(),
+  container: z.string().min(1).optional(),
+  search: z.string().min(1).optional(),
+  from: z.string().datetime().optional(),
+  to: z.string().datetime().optional(),
+  limit: z.coerce.number().int().min(1).max(2000).optional(),
 }).refine((v) => Boolean(v.endpoint || v.ngrok_url), {
   message: "endpoint or ngrok_url is required",
 });
@@ -71,8 +78,13 @@ export async function GET(request: Request) {
   const parsed = QuerySchema.safeParse({
     endpoint: url.searchParams.get("endpoint") || undefined,
     ngrok_url: url.searchParams.get("ngrok_url") || undefined,
-    pod: url.searchParams.get("pod"),
+    pod: url.searchParams.get("pod") || undefined,
     namespace: url.searchParams.get("namespace") || undefined,
+    container: url.searchParams.get("container") || undefined,
+    search: url.searchParams.get("search") || undefined,
+    from: url.searchParams.get("from") || undefined,
+    to: url.searchParams.get("to") || undefined,
+    limit: url.searchParams.get("limit") || undefined,
   });
   if (!parsed.success) {
     return NextResponse.json({ error: "invalid_request" }, { status: 400 });
@@ -106,7 +118,42 @@ export async function GET(request: Request) {
   }
 
   const ns = parsed.data.namespace ?? "default";
-  const qs = new URLSearchParams({ pod: parsed.data.pod, namespace: ns });
+
+  if (parsed.data.endpoint) {
+    const queried = await queryLogs({
+      endpoint_id: parsed.data.endpoint,
+      namespace: parsed.data.namespace,
+      pod: parsed.data.pod,
+      container: parsed.data.container,
+      search: parsed.data.search,
+      from: parsed.data.from,
+      to: parsed.data.to,
+      limit: parsed.data.limit,
+    });
+
+    // Query mode returns structured logs while preserving existing UI behavior.
+    if (parsed.data.search || parsed.data.from || parsed.data.to || parsed.data.container) {
+      return NextResponse.json({ ok: true, ...queried });
+    }
+
+    if (queried.logs.length) {
+      const stitched = queried.logs
+        .map((row) => `[${row.timestamp}] ${row.message}`)
+        .join("\n");
+      if (stitched.trim().length) {
+        return NextResponse.json({ ok: true, logs: stitched });
+      }
+    }
+  }
+
+  const qs = new URLSearchParams({
+    pod: parsed.data.pod ?? "",
+    namespace: ns,
+  });
+
+  if (!parsed.data.pod) {
+    return NextResponse.json({ error: "invalid_request", details: "pod is required" }, { status: 400 });
+  }
 
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 8000);
@@ -127,6 +174,35 @@ export async function GET(request: Request) {
         const text = contentType.includes("application/json")
           ? JSON.stringify(await res.json(), null, 2)
           : await res.text();
+
+        if (parsed.data.endpoint) {
+          const lines = text.split(/\r?\n/).map((line) => line.trim()).filter(Boolean).slice(-200);
+          if (lines.length) {
+            await ingestLogs(
+              lines.map((line) => ({
+                endpoint_id: parsed.data.endpoint,
+                labels: {
+                  namespace: ns,
+                  pod: parsed.data.pod ?? "unknown",
+                  container: parsed.data.container ?? "",
+                },
+                message: line,
+                source: "pod",
+                level: /error|fatal|panic/i.test(line) ? "error" : /warn/i.test(line) ? "warn" : "info",
+              })),
+            );
+
+            await publishObservabilityEvent({
+              endpoint_id: parsed.data.endpoint,
+              event_type: "log",
+              related_resource: parsed.data.pod,
+              related_kind: "pod",
+              severity: "info",
+              title: `Fetched logs for ${parsed.data.pod ?? "pod"}`,
+              details: { namespace: ns, lines: lines.length },
+            });
+          }
+        }
 
         return NextResponse.json({ ok: true, logs: text });
       } catch (e) {

@@ -26,22 +26,21 @@ export const ElevenLabsAgent: React.FC = () => {
     onMessage: (message) => {
       console.log("Message received:", message);
       
-      // Handle different message types
-      if (message.type === "user_transcript") {
+      if (message.role === "user") {
         setMessages((prev) => [
           ...prev,
           {
             type: "user",
-            content: message.user_transcript,
+            content: message.message,
             timestamp: new Date(),
           },
         ]);
-      } else if (message.type === "agent_response") {
+      } else if (message.role === "agent") {
         setMessages((prev) => [
           ...prev,
           {
             type: "agent",
-            content: message.agent_response,
+            content: message.message,
             timestamp: new Date(),
           },
         ]);

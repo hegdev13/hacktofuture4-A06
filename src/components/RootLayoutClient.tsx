@@ -4,11 +4,6 @@ import React, { useEffect, useState } from "react";
 import { MetricsProvider } from "@/lib/metricsContext";
 
 declare global {
-  namespace JSX {
-    interface IntrinsicElements {
-      "elevenlabs-convai": any;
-    }
-  }
   interface Window {
     clusterMetrics?: any;
     elevenlabsMetricsContext?: any;

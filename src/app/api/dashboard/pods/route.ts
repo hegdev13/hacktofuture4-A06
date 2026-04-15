@@ -4,6 +4,8 @@ import { fetchClusterSnapshot } from "@/lib/kube/fetch-metrics";
 import { NgrokUrlSchema } from "@/lib/validation";
 import { rateLimit } from "@/lib/security/rate-limit";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
+import { ingestSnapshotMetrics } from "@/lib/observability/metrics";
+import { evaluateAlertRules } from "@/lib/observability/alerts";
 
 const QuerySchema = z
   .object({
@@ -69,6 +71,12 @@ export async function GET(request: Request) {
 
   try {
     const snapshot = await fetchClusterSnapshot(ngrokUrl);
+
+    if (parsed.data.endpoint) {
+      await ingestSnapshotMetrics(parsed.data.endpoint, snapshot);
+      await evaluateAlertRules(parsed.data.endpoint);
+    }
+
     return NextResponse.json({ ok: true, ...snapshot });
   } catch (e) {
     return NextResponse.json(

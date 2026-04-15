@@ -33,10 +33,18 @@ export async function GET() {
 /**
  * Perform RCA analysis on metrics
  */
-function performRCA(metricsData) {
+function performRCA(metricsData: {
+  pods?: Array<{
+    name: string;
+    namespace?: string;
+    status: string;
+    cpu?: number;
+    memory?: number;
+  }>;
+}) {
   const pods = metricsData.pods || [];
   
-  const POD_DEPENDENCIES = {
+  const POD_DEPENDENCIES: Record<string, string[]> = {
     'api-server': ['cache-redis', 'database-primary'],
     'database-primary': [],
     'cache-redis': ['database-primary'],
@@ -103,7 +111,13 @@ function performRCA(metricsData) {
   });
 
   // Generate remediations
-  const remediations = [];
+  const remediations: Array<{
+    priority: string;
+    title: string;
+    description: string;
+    command: string;
+    impact?: string;
+  }> = [];
   rootCausePods.forEach(pod => {
     if (pod.name.includes('database')) {
       remediations.push({

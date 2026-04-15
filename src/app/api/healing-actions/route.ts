@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { z } from "zod";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { rateLimit } from "@/lib/security/rate-limit";
+import { publishObservabilityEvent } from "@/lib/observability/events";
 
 const BodySchema = z.object({
   endpoint_id: z.string().uuid(),
@@ -37,6 +38,16 @@ export async function POST(request: Request) {
   });
 
   if (error) return NextResponse.json({ error: error.message }, { status: 500 });
+
+  await publishObservabilityEvent({
+    endpoint_id: parsed.data.endpoint_id,
+    event_type: parsed.data.status === "success" ? "resolution" : "ai_action",
+    severity: parsed.data.status === "success" ? "info" : "warning",
+    title: parsed.data.action_taken,
+    details: { status: parsed.data.status },
+    timestamp: parsed.data.timestamp,
+  });
+
   return NextResponse.json({ ok: true });
 }
 

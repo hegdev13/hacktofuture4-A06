@@ -22,6 +22,23 @@ type HealRow = {
   timestamp: string;
 };
 
+type AlertStateRow = {
+  rule_key: string;
+  state: "pending" | "firing" | "resolved";
+  state_since: string;
+  last_value: number | null;
+  updated_at: string;
+};
+
+type AlertHistoryRow = {
+  id: string;
+  rule_key: string;
+  state: "pending" | "firing" | "resolved";
+  value: number | null;
+  message: string;
+  timestamp: string;
+};
+
 function sevClass(s: AlertRow["severity"]) {
   if (s === "high") return "text-danger";
   if (s === "medium") return "text-accent";
@@ -32,6 +49,8 @@ export default function AlertsPage() {
   const endpointId = useSelectedEndpointId();
   const [alerts, setAlerts] = useState<AlertRow[]>([]);
   const [heals, setHeals] = useState<HealRow[]>([]);
+  const [alertStates, setAlertStates] = useState<AlertStateRow[]>([]);
+  const [alertHistory, setAlertHistory] = useState<AlertHistoryRow[]>([]);
   const [fetchError, setFetchError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -55,6 +74,8 @@ export default function AlertsPage() {
           error?: string;
           alerts?: AlertRow[];
           healing_actions?: HealRow[];
+          alert_states?: AlertStateRow[];
+          alert_history?: AlertHistoryRow[];
         };
         if (!res.ok) throw new Error(data.error || `Request failed (${res.status})`);
         if (!Array.isArray(data.alerts)) throw new Error("Invalid response: missing alerts");
@@ -65,6 +86,8 @@ export default function AlertsPage() {
         if (!cancelled) {
           setAlerts(data.alerts);
           setHeals(data.healing_actions);
+          setAlertStates(Array.isArray(data.alert_states) ? data.alert_states : []);
+          setAlertHistory(Array.isArray(data.alert_history) ? data.alert_history.slice(0, 12) : []);
           setFetchError(null);
         }
       } catch (e) {
@@ -109,6 +132,22 @@ export default function AlertsPage() {
             <div className="mb-2 text-sm text-danger">Could not load alerts: {fetchError}</div>
           ) : null}
           <div className="space-y-3">
+            {alertStates.length ? (
+              <div className="rounded-2xl border border-[#eadfce] bg-[#fffcf6] p-3 text-xs text-[#50606c]">
+                <div className="mb-2 font-semibold text-[#2f3c46]">Current rule states</div>
+                <div className="grid gap-2 md:grid-cols-2">
+                  {alertStates.slice(0, 6).map((s) => (
+                    <div key={`${s.rule_key}-${s.updated_at}`} className="rounded-xl bg-[#fff9ef] px-3 py-2">
+                      <div className="font-medium text-[#2f3c46]">{s.rule_key}</div>
+                      <div className={cn("uppercase tracking-[0.1em]", s.state === "firing" ? "text-danger" : s.state === "pending" ? "text-accent" : "text-ok")}>
+                        {s.state}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            ) : null}
+
             {alerts.map((a) => (
               <div key={a.id} className="rounded-2xl bg-[#fffdf8] p-4 shadow-[0_10px_22px_rgba(70,86,94,0.09)]">
                 <div className="flex items-center justify-between gap-2">
@@ -138,6 +177,22 @@ export default function AlertsPage() {
         </CardHeader>
         <CardBody>
           <div className="space-y-3">
+            {alertHistory.length ? (
+              <div className="rounded-2xl border border-[#eadfce] bg-[#fffcf6] p-3">
+                <div className="mb-2 text-xs font-semibold uppercase tracking-[0.12em] text-[#5a6873]">
+                  Alert transitions
+                </div>
+                <div className="space-y-2">
+                  {alertHistory.slice(0, 5).map((h) => (
+                    <div key={h.id} className="rounded-xl bg-[#fff9ef] px-3 py-2">
+                      <div className="text-xs font-semibold text-[#30404a]">{h.rule_key}</div>
+                      <div className="text-xs text-[#5d6a74]">{h.message}</div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            ) : null}
+
             {heals.map((h) => (
               <div key={h.id} className="rounded-2xl bg-[#fffdf8] p-4 shadow-[0_10px_22px_rgba(70,86,94,0.09)]">
                 <div className="flex items-center justify-between gap-2">

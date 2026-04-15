@@ -46,14 +46,18 @@ function AgentWidgetContent({ isOpen, setIsOpen }: AgentWidgetProps) {
         agentId: AGENT_ID,
         connectionType: "webrtc",
         overrides: {
-          prompt: contextMessage,
-          firstMessage: metricsUrl
-            ? `I have access to your cluster metrics. I can see you${
-                metrics
-                  ? ` have ${Object.keys(metrics).length} data points`
-                  : " connected your metrics"
-              }. What would you like to know about your cluster?`
-            : "Hi! I'm your Kubernetes AI assistant. How can I help?",
+          agent: {
+            prompt: {
+              prompt: contextMessage,
+            },
+            firstMessage: metricsUrl
+              ? `I have access to your cluster metrics. I can see you${
+                  metrics
+                    ? ` have ${Object.keys(metrics).length} data points`
+                    : " connected your metrics"
+                }. What would you like to know about your cluster?`
+              : "Hi! I'm your Kubernetes AI assistant. How can I help?",
+          },
         },
       });
 

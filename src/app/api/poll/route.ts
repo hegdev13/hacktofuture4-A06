@@ -4,6 +4,9 @@ import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { fetchClusterSnapshot } from "@/lib/kube/fetch-metrics";
 import { NgrokUrlSchema } from "@/lib/validation";
 import { rateLimit } from "@/lib/security/rate-limit";
+import { ingestSnapshotMetrics } from "@/lib/observability/metrics";
+import { evaluateAlertRules } from "@/lib/observability/alerts";
+import { publishObservabilityEvent } from "@/lib/observability/events";
 
 const BodySchema = z.object({
   endpoint_id: z.string().uuid().optional(),
@@ -57,21 +60,18 @@ export async function POST(request: Request) {
     try {
       const snapshot = await fetchClusterSnapshot(ngrokParsed.data);
 
-      const rows = snapshot.pods.map((p) => ({
-        endpoint_id: ep.id,
-        pod_name: p.pod_name,
-        namespace: p.namespace ?? "default",
-        status: p.status,
-        cpu_usage: p.cpu_usage ?? null,
-        memory_usage: p.memory_usage ?? null,
-        restart_count: p.restart_count ?? 0,
-        timestamp: new Date().toISOString(),
-      }));
+      const ingest = await ingestSnapshotMetrics(ep.id, snapshot);
 
-      if (rows.length) {
-        const { error: insertErr } = await admin.from("metrics_snapshots").insert(rows);
-        if (insertErr) throw insertErr;
-      }
+      await publishObservabilityEvent({
+        endpoint_id: ep.id,
+        event_type: "system",
+        title: `Metrics scraped (${snapshot.pods.length} pods)` ,
+        details: {
+          endpoint_id: ep.id,
+          samples: ingest.samples,
+          snapshots: ingest.snapshots,
+        },
+      });
 
       const alerts: Array<{ endpoint_id: string; message: string; severity: "low" | "medium" | "high" }> = [];
       for (const p of snapshot.pods) {
@@ -96,9 +96,25 @@ export async function POST(request: Request) {
           alerts.map((a) => ({ ...a, created_at: new Date().toISOString() })),
         );
         if (alertErr) throw alertErr;
+
+        for (const a of alerts) {
+          await publishObservabilityEvent({
+            endpoint_id: ep.id,
+            event_type: "metric_anomaly",
+            severity: a.severity === "high" ? "critical" : "warning",
+            title: a.message,
+            details: { severity: a.severity },
+          });
+        }
       }
 
-      results.push({ endpoint_id: ep.id, ok: true });
+      const alertEval = await evaluateAlertRules(ep.id);
+
+      results.push({
+        endpoint_id: ep.id,
+        ok: true,
+        alerts_transitions: alertEval.transitions.length,
+      });
     } catch (e) {
       results.push({
         endpoint_id: ep.id,

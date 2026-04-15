@@ -1,5 +1,5 @@
 import Link from "next/link";
-import { Activity, Bell, LayoutDashboard, ScrollText, Settings2 } from "lucide-react";
+import { Activity, Bell, BrainCircuit, LayoutDashboard, Network, ScrollText, Settings2 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { LogoutButton } from "./logout-button";
 
@@ -8,6 +8,8 @@ const nav = [
   { href: "/dashboard/metrics", label: "Metrics", icon: Activity },
   { href: "/dashboard/logs", label: "Logs", icon: ScrollText },
   { href: "/dashboard/alerts", label: "Alerts", icon: Bell },
+  { href: "/dashboard/dependency", label: "Dependency Graph", icon: Network },
+  { href: "/dashboard/healing", label: "AI Healing", icon: BrainCircuit },
   { href: "/dashboard/setup", label: "Setup", icon: Settings2 },
 ];
 

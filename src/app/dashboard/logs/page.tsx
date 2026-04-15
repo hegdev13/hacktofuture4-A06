@@ -12,6 +12,15 @@ type UpstreamPod = {
   namespace?: string;
 };
 
+type QueriedLogRow = {
+  id: string;
+  timestamp: string;
+  message: string;
+  level: string;
+  source: string;
+  labels?: Record<string, string>;
+};
+
 export default function LogsPage() {
   const endpointId = useSelectedEndpointId();
   const [pods, setPods] = useState<Array<{ pod_name: string; namespace: string }>>(
@@ -91,15 +100,39 @@ export default function LogsPage() {
       const selected = await readSelectedEndpoint();
       if (!selected) throw new Error("Selected endpoint not found");
 
-      const u = new URL("/api/logs", window.location.origin);
-      u.searchParams.set("endpoint", selected.id);
-      u.searchParams.set("pod", pod);
-      u.searchParams.set("namespace", namespace);
+      const queryUrl = new URL("/api/logs/query", window.location.origin);
+      queryUrl.searchParams.set("endpoint", selected.id);
+      queryUrl.searchParams.set("pod", pod);
+      queryUrl.searchParams.set("namespace", namespace);
+      queryUrl.searchParams.set("limit", "500");
 
-      const res = await fetch(u.toString(), { cache: "no-store" });
-      const data = (await res.json()) as { error?: string; logs?: string };
-      if (!res.ok) throw new Error(data.error || `Request failed (${res.status})`);
-      setLogs(data.logs || "");
+      const queryRes = await fetch(queryUrl.toString(), { cache: "no-store" });
+      const queryData = (await queryRes.json()) as { error?: string; logs?: QueriedLogRow[] };
+
+      if (queryRes.ok && Array.isArray(queryData.logs)) {
+        const rendered = queryData.logs
+          .slice()
+          .reverse()
+          .map((row) => {
+            const ts = new Date(row.timestamp).toLocaleTimeString();
+            const ns = row.labels?.namespace ?? namespace;
+            const p = row.labels?.pod ?? pod;
+            return `[${ts}] [${row.level}] [${row.source}] [${ns}/${p}] ${row.message}`;
+          })
+          .join("\n");
+        setLogs(rendered);
+      } else {
+        const u = new URL("/api/logs", window.location.origin);
+        u.searchParams.set("endpoint", selected.id);
+        u.searchParams.set("pod", pod);
+        u.searchParams.set("namespace", namespace);
+
+        const res = await fetch(u.toString(), { cache: "no-store" });
+        const data = (await res.json()) as { error?: string; logs?: string };
+        if (!res.ok) throw new Error(data.error || `Request failed (${res.status})`);
+        setLogs(data.logs || "");
+      }
+
       setFetchError(null);
     } catch (e) {
       setFetchError(e instanceof Error ? e.message : String(e));

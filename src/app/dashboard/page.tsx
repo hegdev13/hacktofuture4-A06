@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis, Legend } from "recharts";
 import { Card, CardBody, CardHeader } from "@/components/ui/card";
+import AdvancedObservabilityPanels from "@/components/dashboard/advanced-observability-panels";
 import { cn } from "@/lib/utils";
 import { formatBytes, formatNumber } from "@/lib/format";
 import {
@@ -45,6 +46,47 @@ type PollHistoryPoint = {
   running: number;
   avgCpu: number | null;
   avgMem: number | null;
+};
+
+type MetricsSummaryPoint = {
+  bucket_start: string;
+  avg_cpu: number | null;
+  avg_memory: number | null;
+  pod_running: number;
+  pod_failed: number;
+  pod_pending: number;
+  restart_rate: number;
+  sample_count: number;
+};
+
+type MetricsSummaryResponse = {
+  ok?: boolean;
+  error?: string;
+  latest?: MetricsSummaryPoint | null;
+  points?: MetricsSummaryPoint[];
+};
+
+type AlertStateRow = {
+  rule_key: string;
+  state: "pending" | "firing" | "resolved";
+};
+
+type AlertsResponse = {
+  error?: string;
+  alert_states?: AlertStateRow[];
+};
+
+type TimelineEventRow = {
+  id: string;
+  title: string;
+  severity: "info" | "warning" | "critical";
+  timestamp: string;
+};
+
+type TimelineResponse = {
+  ok?: boolean;
+  error?: string;
+  events?: TimelineEventRow[];
 };
 
 function podsToRows(endpointId: string, pods: UpstreamPod[], fetchedAt: string): SnapshotRow[] {
@@ -90,6 +132,9 @@ function summarizePods(pods: UpstreamPod[]) {
 export default function DashboardOverviewPage() {
   const [rows, setRows] = useState<SnapshotRow[]>([]);
   const [history, setHistory] = useState<PollHistoryPoint[]>([]);
+  const [summaryLatest, setSummaryLatest] = useState<MetricsSummaryPoint | null>(null);
+  const [activeAlertCount, setActiveAlertCount] = useState(0);
+  const [recentEvents, setRecentEvents] = useState<TimelineEventRow[]>([]);
   const [loading, setLoading] = useState(false);
   const [fetchError, setFetchError] = useState<string | null>(null);
   const [uiReady, setUiReady] = useState(false);
@@ -133,11 +178,46 @@ export default function DashboardOverviewPage() {
         restart_count: p.restart_count ?? 0,
       }));
       setRows(podsToRows(sel.id, normalized, fetchedAt));
+
+      const [summaryRes, alertsRes, eventsRes] = await Promise.all([
+        fetch(`/api/metrics/summary?endpoint=${encodeURIComponent(sel.id)}`, { cache: "no-store" }),
+        fetch(`/api/alerts?endpoint=${encodeURIComponent(sel.id)}`, { cache: "no-store" }),
+        fetch(`/api/events/timeline?endpoint=${encodeURIComponent(sel.id)}&limit=6`, { cache: "no-store" }),
+      ]);
+
+      if (summaryRes.ok) {
+        const summaryData = (await summaryRes.json()) as MetricsSummaryResponse;
+        const points = Array.isArray(summaryData.points) ? summaryData.points : [];
+        setSummaryLatest(summaryData.latest ?? null);
+        if (points.length) {
+          setHistory(
+            points.slice(-120).map((p) => ({
+              tsLabel: new Date(p.bucket_start).toISOString().slice(11, 19),
+              total: p.pod_running + p.pod_failed + p.pod_pending,
+              running: p.pod_running,
+              avgCpu: p.avg_cpu,
+              avgMem: p.avg_memory,
+            })),
+          );
+        }
+      }
+
+      if (alertsRes.ok) {
+        const alertsData = (await alertsRes.json()) as AlertsResponse;
+        const states = Array.isArray(alertsData.alert_states) ? alertsData.alert_states : [];
+        setActiveAlertCount(states.filter((s) => s.state === "firing" || s.state === "pending").length);
+      }
+
+      if (eventsRes.ok) {
+        const eventsData = (await eventsRes.json()) as TimelineResponse;
+        setRecentEvents(Array.isArray(eventsData.events) ? eventsData.events : []);
+      }
+
       const s = summarizePods(normalized);
       const tsLabel = new Date().toISOString().slice(11, 19);
       setHistory((prev) => {
-        const next = [
-          ...prev.slice(-119),
+        if (prev.length) return prev;
+        return [
           {
             tsLabel,
             total: s.total,
@@ -146,7 +226,6 @@ export default function DashboardOverviewPage() {
             avgMem: s.avgMem,
           },
         ];
-        return next;
       });
     } catch (e) {
       setFetchError(e instanceof Error ? e.message : String(e));
@@ -182,6 +261,17 @@ export default function DashboardOverviewPage() {
   }, [rows]);
 
   const cluster = useMemo(() => {
+    if (summaryLatest) {
+      return {
+        totalPods: summaryLatest.pod_running + summaryLatest.pod_failed + summaryLatest.pod_pending,
+        running: summaryLatest.pod_running,
+        failed: summaryLatest.pod_failed,
+        pending: summaryLatest.pod_pending,
+        avgCpu: summaryLatest.avg_cpu,
+        avgMem: summaryLatest.avg_memory,
+      };
+    }
+
     const totalPods = latestByPod.length;
     let running = 0;
     let failed = 0;
@@ -294,7 +384,7 @@ export default function DashboardOverviewPage() {
         </Card>
         <Card>
           <CardBody>
-            <div className="text-xs text-muted">Avg CPU (raw)</div>
+            <div className="text-xs text-muted">Avg CPU (rollup aware)</div>
             <div className="mt-1 text-2xl font-semibold">
               {cluster.avgCpu == null ? "—" : formatNumber(cluster.avgCpu)}
             </div>
@@ -306,6 +396,7 @@ export default function DashboardOverviewPage() {
             <div className="mt-1 text-2xl font-semibold">
               {cluster.avgMem == null ? "—" : formatBytes(cluster.avgMem)}
             </div>
+            <div className="mt-2 text-xs text-muted">Active alert states: {activeAlertCount}</div>
           </CardBody>
         </Card>
       </div>
@@ -413,6 +504,29 @@ export default function DashboardOverviewPage() {
           </div>
         </CardBody>
       </Card>
+
+      <Card>
+        <CardHeader>
+          <div className="text-xl font-bold tracking-tight text-[#1f2b33]">Observability timeline</div>
+          <div className="text-xs text-muted">Recent backend events (alerts, AI analysis, actions)</div>
+        </CardHeader>
+        <CardBody>
+          <div className="space-y-2">
+            {recentEvents.map((ev) => (
+              <div key={ev.id} className="flex items-center justify-between gap-3 rounded-xl border border-[#e9decd] bg-[#fffdf8] px-3 py-2">
+                <div className="min-w-0">
+                  <div className="truncate text-sm font-semibold text-[#2c3942]">{ev.title}</div>
+                  <div className="text-xs text-muted">{ev.severity}</div>
+                </div>
+                <div className="shrink-0 text-xs text-[#7d8893]">{new Date(ev.timestamp).toLocaleTimeString()}</div>
+              </div>
+            ))}
+            {!recentEvents.length ? <div className="text-sm text-muted">No timeline events yet.</div> : null}
+          </div>
+        </CardBody>
+      </Card>
+
+      <AdvancedObservabilityPanels endpointId={selectedEp.id} />
     </div>
   );
 }
