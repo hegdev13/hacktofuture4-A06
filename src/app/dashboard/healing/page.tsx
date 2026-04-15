@@ -314,7 +314,15 @@ export default function HealingDashboardPage() {
       return;
     }
 
-    const targetName = targetKind === "deployment" ? deploymentNameFromPodName(selectedTarget.pod_name) : selectedTarget.pod_name;
+    // Always use the live item's kind to avoid pod/deployment mismatch failures.
+    const effectiveTargetKind: HealingTargetKind = selectedTarget.kind;
+    if (targetKind !== effectiveTargetKind) {
+      setTargetKind(effectiveTargetKind);
+    }
+    const targetName =
+      effectiveTargetKind === "deployment"
+        ? deploymentNameFromPodName(selectedTarget.pod_name)
+        : selectedTarget.pod_name;
 
     setLoadingStart(true);
     try {
@@ -328,7 +336,7 @@ export default function HealingDashboardPage() {
           strictLive: true,
           targetName,
           targetNamespace: selectedTarget.namespace,
-          targetKind,
+          targetKind: effectiveTargetKind,
         }),
       });
 
@@ -372,6 +380,12 @@ export default function HealingDashboardPage() {
   const selectedTarget = useMemo(() => {
     return targets.find((t) => `${t.namespace}/${t.kind}/${t.pod_name}` === selectedTargetId) || null;
   }, [targets, selectedTargetId]);
+
+  useEffect(() => {
+    if (selectedTarget && targetKind !== selectedTarget.kind) {
+      setTargetKind(selectedTarget.kind);
+    }
+  }, [selectedTarget, targetKind]);
 
   return (
     <div className="space-y-4">

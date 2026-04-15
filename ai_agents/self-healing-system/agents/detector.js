@@ -117,15 +117,47 @@ class DetectorAgent {
     const pods = clusterState.pods || [];
     const nodes = clusterState.nodes || [];
 
-    const pod = pods.find(p => p.name === target);
-    const node = nodes.find(n => n.name === target);
+     const issueType = issue.type || '';
 
-    const resource = pod || node;
+     // Handle deployment issues separately
+     if (issueType.includes('deployment')) {
+       const deployments = clusterState.deployments || [];
+       const deployment = deployments.find(d => d.name === target);
 
-    if (!resource) {
-      // Resource might have been deleted, consider issue resolved
-      return false;
-    }
+       if (!deployment) {
+         // Deployment not found, issue resolved
+         return false;
+       }
+
+       // Re-validate deployment issues
+       switch (issueType) {
+         case 'deployment_scaled_down':
+           const desired = deployment.desiredReplicas || deployment.replicas || 0;
+           const ready = deployment.readyReplicas || 0;
+           return desired === 0 && ready === 0;
+
+         case 'deployment_not_ready':
+           const desiredReps = deployment.desiredReplicas || deployment.replicas || 0;
+           const readyReps = deployment.readyReplicas || 0;
+           return desiredReps > readyReps;
+
+         case 'missing_deployment':
+           return true;
+
+         default:
+           return true;
+       }
+     }
+
+     const pod = pods.find(p => p.name === target);
+     const node = nodes.find(n => n.name === target);
+
+     const resource = pod || node;
+
+     if (!resource) {
+       // Resource might have been deleted, consider issue resolved
+       return false;
+     }
 
     // Re-validate specific issue types
     switch (issue.type) {

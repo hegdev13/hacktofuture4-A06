@@ -3,6 +3,7 @@
  * Executes fixes based on RCA output with abstraction layer for K8s operations
  */
 
+const { execSync } = require('child_process');
 const config = require('../config');
 const logger = require('../utils/logger');
 const memory = require('./memory');
@@ -85,6 +86,16 @@ class ExecutionerAgent {
       priority: 1,
     };
 
+     // Deployment scaled down → scale up to 1 replica
+     if (primaryReason.includes('deployment_scaled_down') || primaryIssue === 'deployment_scaled_down') {
+       strategy = {
+         type: 'scale_up',
+         target: rootCause,
+         namespace: this.getNamespace(rootCause, clusterState),
+         replicas: 1,
+         priority: 0,  // Highest priority
+       };
+     }
     // High restart count → restart
     if (primaryReason.includes('restart') || primaryIssue.includes('restart')) {
       strategy = {
@@ -376,7 +387,7 @@ class ExecutionerAgent {
 
   /**
    * Execute K8s action (abstraction layer)
-   * This can be replaced with real kubectl or Kubernetes API calls
+   * Executes real kubectl commands to perform remediation
    */
   executeK8sAction(action) {
     // Log the action
@@ -393,25 +404,66 @@ class ExecutionerAgent {
       };
     }
 
-    // Real implementation would go here:
-    // - kubectl commands
-    // - Kubernetes API calls
-    // - SDK operations
-
-    // For now, return simulated response
+    // Execute real kubectl commands
     try {
-      // Simulate API call
-      this.simulateAPICall(action);
+      let command = '';
+
+      switch (action.type) {
+        case 'DELETE':
+          // kubectl delete pod <name> -n <namespace>
+          command = `kubectl delete pod ${action.name} -n ${action.namespace}`;
+          break;
+
+        case 'SCALE':
+          // kubectl scale deployment <name> -n <namespace> --replicas=<count>
+          command = `kubectl scale deployment/${action.name} -n ${action.namespace} --replicas=${action.replicas}`;
+          break;
+
+        case 'ROLLBACK':
+          // kubectl rollout undo deployment/<name> -n <namespace>
+          command = `kubectl rollout undo deployment/${action.name} -n ${action.namespace}`;
+          break;
+
+        case 'CORDON':
+          // kubectl cordon <node>
+          command = `kubectl cordon ${action.name}`;
+          break;
+
+        case 'DRAIN':
+          // kubectl drain <node> --ignore-daemonsets --delete-emptydir-data
+          command = `kubectl drain ${action.name} --ignore-daemonsets --delete-emptydir-data`;
+          break;
+
+        default:
+          throw new Error(`Unknown action type: ${action.type}`);
+      }
+
+      logger.info(`Executing kubectl command: ${command}`);
+
+      // Execute the command
+      const output = execSync(command, { 
+        encoding: 'utf-8',
+        timeout: this.timeoutMs,
+      });
+
+      logger.info(`Command executed successfully`);
+      if (output) {
+        logger.debug(`Command output: ${output}`);
+      }
 
       return {
         status: 'success',
-        message: `Executed ${action.type} on ${action.resource} ${action.name}`,
-        metadata: { action },
+        message: `Successfully executed ${action.type} on ${action.resource} ${action.name}`,
+        metadata: { action, output },
       };
+
     } catch (error) {
+      const errorMsg = error.stderr ? error.stderr.toString() : error.message;
+      logger.error(`K8s action failed: ${errorMsg}`);
+      
       return {
         status: 'failed',
-        message: error.message,
+        message: `Failed to execute ${action.type}: ${errorMsg}`,
         error: error.stack,
       };
     }

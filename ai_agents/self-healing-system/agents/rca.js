@@ -292,7 +292,40 @@ class RCAAgent {
     const target = issue.target;
     const startNode = dependencyGraph.nodes.get(target);
 
-    if (!startNode) {
+     // Handle deployment issues that don't have pods in the graph
+     const issueType = issue.type || '';
+     if (issueType && issueType.includes('deployment') && !startNode) {
+       // This is a deployment issue (scaled down, not ready, or missing)
+       // We can't trace dependencies on pods that don't exist
+       // Instead, directly analyze the issue
+       const deployments = clusterState.deployments || [];
+       const deployment = deployments.find(d => d.name === target);
+
+       if (deployment) {
+         return {
+           rootCause: target,
+           rootCauseType: 'deployment',
+           failureChain: [issueType],
+           confidence: issueType === 'deployment_scaled_down' ? 95 : 85,
+           reasoning: `Deployment ${target} issue detected: ${issue.problem || issueType}`,
+           chainDetails: [{
+             name: target,
+             type: 'deployment',
+             depth: 0,
+             health: { healthy: false, reason: issue.problem || issueType },
+             description: `${target}: ${issue.problem || issueType}`,
+           }],
+           affectedResources: [{
+             name: target,
+             type: 'deployment',
+             namespace: deployment.namespace,
+             health: { healthy: false, reason: issue.problem || issueType }
+           }],
+         };
+       }
+     }
+
+     if (!startNode) {
       return {
         rootCause: target,
         failureChain: [issue.problem],
