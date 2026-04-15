@@ -1,0 +1,1772 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Self-Healing System Dashboard</title>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+
+    :root {
+      --bg-primary: #f8fafc;
+      --bg-secondary: #ffffff;
+      --bg-tertiary: #f1f5f9;
+      --bg-card: #ffffff;
+      --border-color: #e2e8f0;
+      --text-primary: #1e293b;
+      --text-secondary: #64748b;
+      --text-muted: #94a3b8;
+      --accent-blue: #3b82f6;
+      --accent-green: #10b981;
+      --accent-yellow: #f59e0b;
+      --accent-red: #ef4444;
+      --accent-purple: #8b5cf6;
+      --accent-cyan: #06b6d4;
+      --shadow-sm: 0 1px 2px 0 rgba(0, 0, 0, 0.05);
+      --shadow: 0 1px 3px 0 rgba(0, 0, 0, 0.1), 0 1px 2px 0 rgba(0, 0, 0, 0.06);
+      --shadow-lg: 0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 4px 6px -2px rgba(0, 0, 0, 0.05);
+    }
+
+    body {
+      font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+      background: var(--bg-primary);
+      color: var(--text-primary);
+      min-height: 100vh;
+      line-height: 1.5;
+    }
+
+    /* Navigation */
+    .navbar {
+      background: var(--bg-secondary);
+      border-bottom: 1px solid var(--border-color);
+      padding: 0 24px;
+      height: 64px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      position: sticky;
+      top: 0;
+      z-index: 100;
+      box-shadow: var(--shadow-sm);
+    }
+
+    .nav-brand {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+
+    .nav-logo {
+      width: 40px;
+      height: 40px;
+      background: linear-gradient(135deg, var(--accent-blue), var(--accent-purple));
+      border-radius: 10px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 20px;
+      box-shadow: var(--shadow);
+    }
+
+    .nav-title {
+      font-size: 18px;
+      font-weight: 700;
+      background: linear-gradient(90deg, var(--accent-blue), var(--accent-purple));
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+    }
+
+    .nav-links {
+      display: flex;
+      gap: 8px;
+    }
+
+    .nav-link {
+      padding: 8px 16px;
+      border-radius: 8px;
+      text-decoration: none;
+      color: var(--text-secondary);
+      font-size: 14px;
+      font-weight: 500;
+      transition: all 0.2s;
+      border: 1px solid transparent;
+    }
+
+    .nav-link:hover {
+      background: var(--bg-tertiary);
+      color: var(--text-primary);
+    }
+
+    .nav-link.active {
+      background: rgba(59, 130, 246, 0.1);
+      border-color: var(--accent-blue);
+      color: var(--accent-blue);
+    }
+
+    .nav-actions {
+      display: flex;
+      gap: 12px;
+      align-items: center;
+    }
+
+    .health-indicator {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 6px 14px;
+      border-radius: 20px;
+      font-size: 13px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      background: var(--bg-tertiary);
+    }
+
+    .health-indicator.healthy {
+      background: rgba(16, 185, 129, 0.1);
+      color: var(--accent-green);
+      border: 1px solid rgba(16, 185, 129, 0.3);
+    }
+
+    .health-indicator.unhealthy {
+      background: rgba(239, 68, 68, 0.1);
+      color: var(--accent-red);
+      border: 1px solid rgba(239, 68, 68, 0.3);
+    }
+
+    .health-indicator.degraded {
+      background: rgba(245, 158, 11, 0.1);
+      color: #d97706;
+      border: 1px solid rgba(245, 158, 11, 0.3);
+    }
+
+    .pulse-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      animation: pulse 2s infinite;
+    }
+
+    .health-indicator.healthy .pulse-dot {
+      background: var(--accent-green);
+    }
+
+    .health-indicator.unhealthy .pulse-dot {
+      background: var(--accent-red);
+    }
+
+    .health-indicator.degraded .pulse-dot {
+      background: var(--accent-yellow);
+    }
+
+    @keyframes pulse {
+      0%, 100% { opacity: 1; transform: scale(1); }
+      50% { opacity: 0.7; transform: scale(0.9); }
+    }
+
+    /* Main Content */
+    .main-content {
+      padding: 24px;
+      max-width: 1600px;
+      margin: 0 auto;
+    }
+
+    .page {
+      display: none;
+    }
+
+    .page.active {
+      display: block;
+    }
+
+    /* Page Header */
+    .page-header {
+      margin-bottom: 24px;
+    }
+
+    .page-title {
+      font-size: 28px;
+      font-weight: 700;
+      margin-bottom: 4px;
+      color: var(--text-primary);
+    }
+
+    .page-subtitle {
+      color: var(--text-secondary);
+      font-size: 14px;
+    }
+
+    /* Stats Grid */
+    .stats-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+      gap: 16px;
+      margin-bottom: 24px;
+    }
+
+    .stat-card {
+      background: var(--bg-card);
+      border: 1px solid var(--border-color);
+      border-radius: 12px;
+      padding: 20px;
+      transition: all 0.2s;
+      box-shadow: var(--shadow-sm);
+    }
+
+    .stat-card:hover {
+      transform: translateY(-2px);
+      box-shadow: var(--shadow-lg);
+      border-color: var(--accent-blue);
+    }
+
+    .stat-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 12px;
+    }
+
+    .stat-label {
+      font-size: 13px;
+      color: var(--text-secondary);
+      font-weight: 500;
+    }
+
+    .stat-icon {
+      width: 36px;
+      height: 36px;
+      border-radius: 8px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 18px;
+    }
+
+    .stat-icon.blue { background: rgba(59, 130, 246, 0.1); }
+    .stat-icon.green { background: rgba(16, 185, 129, 0.1); }
+    .stat-icon.yellow { background: rgba(245, 158, 11, 0.1); }
+    .stat-icon.red { background: rgba(239, 68, 68, 0.1); }
+    .stat-icon.purple { background: rgba(139, 92, 246, 0.1); }
+
+    .stat-value {
+      font-size: 32px;
+      font-weight: 700;
+      margin-bottom: 4px;
+      color: var(--text-primary);
+    }
+
+    .stat-change {
+      font-size: 12px;
+      font-weight: 500;
+    }
+
+    .stat-change.positive { color: var(--accent-green); }
+    .stat-change.negative { color: var(--accent-red); }
+
+    /* Cards */
+    .card {
+      background: var(--bg-card);
+      border: 1px solid var(--border-color);
+      border-radius: 12px;
+      overflow: hidden;
+      box-shadow: var(--shadow-sm);
+    }
+
+    .card-header {
+      padding: 16px 20px;
+      border-bottom: 1px solid var(--border-color);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      background: var(--bg-secondary);
+    }
+
+    .card-title {
+      font-size: 16px;
+      font-weight: 600;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      color: var(--text-primary);
+    }
+
+    .card-body {
+      padding: 20px;
+    }
+
+    /* Agent Status Cards */
+    .agents-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+      gap: 16px;
+      margin-bottom: 24px;
+    }
+
+    .agent-card {
+      background: var(--bg-card);
+      border: 1px solid var(--border-color);
+      border-radius: 12px;
+      padding: 20px;
+      transition: all 0.2s;
+      box-shadow: var(--shadow-sm);
+    }
+
+    .agent-card:hover {
+      border-color: var(--accent-blue);
+      box-shadow: var(--shadow);
+    }
+
+    .agent-card.running {
+      border-color: var(--accent-blue);
+      box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.1);
+    }
+
+    .agent-card.success {
+      border-color: var(--accent-green);
+    }
+
+    .agent-card.error {
+      border-color: var(--accent-red);
+    }
+
+    .agent-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 16px;
+    }
+
+    .agent-info {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+
+    .agent-avatar {
+      width: 44px;
+      height: 44px;
+      border-radius: 10px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 22px;
+      background: var(--bg-tertiary);
+      border: 1px solid var(--border-color);
+    }
+
+    .agent-card.running .agent-avatar {
+      background: rgba(59, 130, 246, 0.1);
+      border-color: var(--accent-blue);
+      animation: pulse-glow 2s infinite;
+    }
+
+    @keyframes pulse-glow {
+      0%, 100% { box-shadow: 0 0 0 0 rgba(59, 130, 246, 0.3); }
+      50% { box-shadow: 0 0 0 10px rgba(59, 130, 246, 0); }
+    }
+
+    .agent-name {
+      font-weight: 600;
+      font-size: 15px;
+      color: var(--text-primary);
+    }
+
+    .agent-role {
+      font-size: 12px;
+      color: var(--text-muted);
+    }
+
+    .agent-status-badge {
+      padding: 4px 12px;
+      border-radius: 20px;
+      font-size: 11px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+
+    .agent-status-badge.idle {
+      background: var(--bg-tertiary);
+      color: var(--text-secondary);
+      border: 1px solid var(--border-color);
+    }
+
+    .agent-status-badge.running {
+      background: rgba(59, 130, 246, 0.1);
+      color: var(--accent-blue);
+      border: 1px solid rgba(59, 130, 246, 0.3);
+    }
+
+    .agent-status-badge.analyzing {
+      background: rgba(6, 182, 212, 0.1);
+      color: var(--accent-cyan);
+      border: 1px solid rgba(6, 182, 212, 0.3);
+    }
+
+    .agent-status-badge.success {
+      background: rgba(16, 185, 129, 0.1);
+      color: var(--accent-green);
+      border: 1px solid rgba(16, 185, 129, 0.3);
+    }
+
+    .agent-status-badge.error {
+      background: rgba(239, 68, 68, 0.1);
+      color: var(--accent-red);
+      border: 1px solid rgba(239, 68, 68, 0.3);
+    }
+
+    .agent-status-badge.issues-found {
+      background: rgba(245, 158, 11, 0.1);
+      color: #d97706;
+      border: 1px solid rgba(245, 158, 11, 0.3);
+    }
+
+    .agent-progress {
+      margin-top: 12px;
+    }
+
+    .progress-bar {
+      height: 6px;
+      background: var(--bg-tertiary);
+      border-radius: 3px;
+      overflow: hidden;
+    }
+
+    .progress-fill {
+      height: 100%;
+      background: linear-gradient(90deg, var(--accent-blue), var(--accent-cyan));
+      border-radius: 3px;
+      transition: width 0.3s ease;
+    }
+
+    .agent-last-run {
+      margin-top: 8px;
+      font-size: 12px;
+      color: var(--text-muted);
+    }
+
+    /* Issues List */
+    .issues-list {
+      max-height: 400px;
+      overflow-y: auto;
+    }
+
+    .issue-item {
+      display: flex;
+      align-items: flex-start;
+      gap: 12px;
+      padding: 14px;
+      border-radius: 8px;
+      margin-bottom: 8px;
+      background: var(--bg-tertiary);
+      border: 1px solid transparent;
+      transition: all 0.2s;
+    }
+
+    .issue-item:hover {
+      border-color: var(--border-color);
+      box-shadow: var(--shadow-sm);
+    }
+
+    .issue-item:last-child {
+      margin-bottom: 0;
+    }
+
+    .issue-severity {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      margin-top: 4px;
+      flex-shrink: 0;
+    }
+
+    .issue-severity.high { background: var(--accent-red); }
+    .issue-severity.medium { background: var(--accent-yellow); }
+    .issue-severity.low { background: var(--text-muted); }
+
+    .issue-content {
+      flex: 1;
+    }
+
+    .issue-title {
+      font-weight: 600;
+      font-size: 14px;
+      margin-bottom: 2px;
+      color: var(--text-primary);
+    }
+
+    .issue-description {
+      font-size: 13px;
+      color: var(--text-secondary);
+    }
+
+    .issue-meta {
+      display: flex;
+      gap: 12px;
+      margin-top: 6px;
+      flex-wrap: wrap;
+    }
+
+    .issue-tag {
+      font-size: 11px;
+      padding: 2px 8px;
+      border-radius: 4px;
+      background: var(--bg-secondary);
+      color: var(--text-muted);
+      border: 1px solid var(--border-color);
+    }
+
+    /* Pods List */
+    .pods-list {
+      max-height: 600px;
+      overflow-y: auto;
+    }
+
+    .pod-item {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 14px;
+      border-radius: 8px;
+      margin-bottom: 8px;
+      background: var(--bg-tertiary);
+      border: 1px solid transparent;
+      transition: all 0.2s;
+    }
+
+    .pod-item:hover {
+      border-color: var(--border-color);
+      box-shadow: var(--shadow-sm);
+    }
+
+    .pod-item:last-child {
+      margin-bottom: 0;
+    }
+
+    .pod-info {
+      flex: 1;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+
+    .pod-icon {
+      width: 36px;
+      height: 36px;
+      border-radius: 8px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 16px;
+      background: rgba(59, 130, 246, 0.1);
+    }
+
+    .pod-details {
+      flex: 1;
+    }
+
+    .pod-name {
+      font-weight: 600;
+      font-size: 14px;
+      color: var(--text-primary);
+      margin-bottom: 2px;
+    }
+
+    .pod-namespace {
+      font-size: 12px;
+      color: var(--text-secondary);
+    }
+
+    .pod-status-badge {
+      padding: 6px 12px;
+      border-radius: 20px;
+      font-size: 12px;
+      font-weight: 600;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .pod-status-badge.running {
+      background: rgba(16, 185, 129, 0.1);
+      color: var(--accent-green);
+      border: 1px solid rgba(16, 185, 129, 0.3);
+    }
+
+    .pod-status-badge.pending {
+      background: rgba(59, 130, 246, 0.1);
+      color: var(--accent-blue);
+      border: 1px solid rgba(59, 130, 246, 0.3);
+    }
+
+    .pod-status-badge.failed {
+      background: rgba(239, 68, 68, 0.1);
+      color: var(--accent-red);
+      border: 1px solid rgba(239, 68, 68, 0.3);
+    }
+
+    .pod-status-badge.unknown {
+      background: rgba(148, 163, 184, 0.1);
+      color: var(--text-secondary);
+      border: 1px solid rgba(148, 163, 184, 0.3);
+    }
+
+    .pod-status-dot {
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+    }
+
+    .pod-status-badge.running .pod-status-dot {
+      background: var(--accent-green);
+    }
+
+    .pod-status-badge.pending .pod-status-dot {
+      background: var(--accent-blue);
+    }
+
+    .pod-status-badge.failed .pod-status-dot {
+      background: var(--accent-red);
+    }
+
+    /* Timeline */
+    .timeline {
+      max-height: 500px;
+      overflow-y: auto;
+    }
+
+    .timeline-item {
+      display: flex;
+      gap: 16px;
+      padding: 14px 0;
+      border-bottom: 1px solid var(--border-color);
+    }
+
+    .timeline-item:last-child {
+      border-bottom: none;
+    }
+
+    .timeline-time {
+      width: 60px;
+      font-size: 12px;
+      color: var(--text-muted);
+      font-family: 'Monaco', 'Consolas', monospace;
+      flex-shrink: 0;
+    }
+
+    .timeline-marker {
+      width: 12px;
+      height: 12px;
+      border-radius: 50%;
+      flex-shrink: 0;
+      margin-top: 2px;
+      border: 2px solid white;
+      box-shadow: var(--shadow-sm);
+    }
+
+    .timeline-marker.analysis { background: var(--accent-cyan); }
+    .timeline-marker.issue { background: var(--accent-red); }
+    .timeline-marker.rca { background: var(--accent-purple); }
+    .timeline-marker.fix { background: var(--accent-blue); }
+    .timeline-marker.success { background: var(--accent-green); }
+    .timeline-marker.retry { background: var(--accent-yellow); }
+
+    .timeline-content {
+      flex: 1;
+    }
+
+    .timeline-type {
+      font-size: 11px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      margin-bottom: 2px;
+    }
+
+    .timeline-type.analysis { color: var(--accent-cyan); }
+    .timeline-type.issue { color: var(--accent-red); }
+    .timeline-type.rca { color: var(--accent-purple); }
+    .timeline-type.fix { color: var(--accent-blue); }
+    .timeline-type.success { color: var(--accent-green); }
+    .timeline-type.retry { color: var(--accent-yellow); }
+
+    .timeline-message {
+      font-size: 14px;
+      color: var(--text-secondary);
+    }
+
+    /* Buttons */
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 10px 20px;
+      border-radius: 8px;
+      font-size: 14px;
+      font-weight: 600;
+      border: 1px solid transparent;
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+
+    .btn-primary {
+      background: linear-gradient(135deg, var(--accent-blue), var(--accent-purple));
+      color: white;
+      box-shadow: var(--shadow);
+    }
+
+    .btn-primary:hover {
+      transform: translateY(-1px);
+      box-shadow: 0 4px 12px rgba(59, 130, 246, 0.4);
+    }
+
+    .btn-secondary {
+      background: var(--bg-tertiary);
+      color: var(--text-primary);
+      border-color: var(--border-color);
+    }
+
+    .btn-secondary:hover {
+      background: var(--border-color);
+    }
+
+    .btn:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+
+    /* Dependency Graph Styles */
+    .graph-container {
+      min-height: 500px;
+      position: relative;
+      overflow: hidden;
+      background: var(--bg-tertiary);
+      border-radius: 8px;
+    }
+
+    .graph-canvas {
+      width: 100%;
+      height: 600px;
+    }
+
+    .graph-legend {
+      display: flex;
+      gap: 24px;
+      padding: 16px 20px;
+      background: var(--bg-secondary);
+      border-bottom: 1px solid var(--border-color);
+      flex-wrap: wrap;
+    }
+
+    /* Alerts */
+    .alert {
+      background: var(--bg-secondary);
+      border: 1px solid var(--border-color);
+      border-radius: 12px;
+      padding: 20px;
+      margin-bottom: 16px;
+      transition: all 0.2s;
+      border-left: 4px solid transparent;
+    }
+
+    .alert:hover {
+      box-shadow: var(--shadow);
+    }
+
+    .alert.critical {
+      border-color: var(--accent-red);
+      border-left-color: var(--accent-red);
+      background: rgba(239, 68, 68, 0.02);
+    }
+
+    .alert.warning {
+      border-color: var(--accent-yellow);
+      border-left-color: var(--accent-yellow);
+      background: rgba(245, 158, 11, 0.02);
+    }
+
+    .alert.info {
+      border-color: var(--accent-blue);
+      border-left-color: var(--accent-blue);
+      background: rgba(59, 130, 246, 0.02);
+    }
+
+    .alert-header {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      margin-bottom: 12px;
+    }
+
+    .alert-title {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      font-size: 16px;
+      font-weight: 600;
+      color: var(--text-primary);
+    }
+
+    .alert-severity {
+      display: inline-block;
+      padding: 4px 10px;
+      border-radius: 6px;
+      font-size: 11px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+
+    .alert.critical .alert-severity {
+      background: rgba(239, 68, 68, 0.2);
+      color: var(--accent-red);
+    }
+
+    .alert.warning .alert-severity {
+      background: rgba(245, 158, 11, 0.2);
+      color: var(--accent-yellow);
+    }
+
+    .alert-close {
+      cursor: pointer;
+      font-size: 20px;
+      color: var(--text-muted);
+      border: none;
+      background: none;
+      padding: 0;
+      transition: all 0.2s;
+    }
+
+    .alert-close:hover {
+      color: var(--text-primary);
+    }
+
+    .alert-message {
+      font-size: 14px;
+      color: var(--text-secondary);
+      margin-bottom: 12px;
+      line-height: 1.6;
+    }
+
+    .alert-details {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+      gap: 16px;
+      margin-top: 16px;
+      padding-top: 16px;
+      border-top: 1px solid var(--border-color);
+    }
+
+    .alert-detail {
+      font-size: 13px;
+    }
+
+    .alert-detail-label {
+      color: var(--text-muted);
+      font-weight: 500;
+      text-transform: uppercase;
+      font-size: 11px;
+      letter-spacing: 0.5px;
+      margin-bottom: 4px;
+    }
+
+    .alert-detail-value {
+      color: var(--text-primary);
+      font-weight: 600;
+    }
+
+    .alert-recommendations {
+      margin-top: 16px;
+      padding: 12px;
+      background: var(--bg-tertiary);
+      border-radius: 8px;
+      border-left: 3px solid var(--accent-cyan);
+    }
+
+    .alert-rec-title {
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--text-secondary);
+      text-transform: uppercase;
+      margin-bottom: 8px;
+    }
+
+    .alert-rec-list {
+      list-style: none;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+
+    .alert-rec-item {
+      font-size: 13px;
+      color: var(--text-primary);
+      padding-left: 16px;
+      position: relative;
+    }
+
+    .alert-rec-item::before {
+      content: "→";
+      position: absolute;
+      left: 0;
+      color: var(--accent-cyan);
+      font-weight: bold;
+    }
+
+    .impact-meter {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin-top: 12px;
+    }
+
+    .impact-bar {
+      flex: 1;
+      height: 24px;
+      background: var(--bg-tertiary);
+      border-radius: 12px;
+      overflow: hidden;
+    }
+
+    .impact-fill {
+      height: 100%;
+      background: linear-gradient(90deg, var(--accent-green), var(--accent-yellow), var(--accent-red));
+      transition: width 0.3s;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: white;
+      font-size: 11px;
+      font-weight: 600;
+    }
+
+    .graph-legend {
+      display: flex;
+      gap: 24px;
+      padding: 16px 20px;
+      background: var(--bg-secondary);
+      border-bottom: 1px solid var(--border-color);
+      flex-wrap: wrap;
+    }
+
+    .legend-item {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 13px;
+      color: var(--text-secondary);
+    }
+
+    .legend-dot {
+      width: 12px;
+      height: 12px;
+      border-radius: 50%;
+    }
+
+    .legend-dot.root { background: var(--accent-red); }
+    .legend-dot.cascade { background: var(--accent-yellow); }
+    .legend-dot.healthy { background: var(--accent-green); }
+    .legend-dot.unknown { background: var(--text-muted); }
+
+    /* RCA Card */
+    .rca-card {
+      background: linear-gradient(135deg, rgba(239, 68, 68, 0.05), rgba(245, 158, 11, 0.03));
+      border-color: rgba(239, 68, 68, 0.2);
+    }
+
+    .rca-root-cause {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 16px;
+      background: rgba(239, 68, 68, 0.08);
+      border-radius: 10px;
+      margin-bottom: 16px;
+      border: 1px solid rgba(239, 68, 68, 0.2);
+    }
+
+    .rca-icon {
+      width: 48px;
+      height: 48px;
+      border-radius: 10px;
+      background: rgba(239, 68, 68, 0.15);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 24px;
+    }
+
+    .rca-info {
+      flex: 1;
+    }
+
+    .rca-label {
+      font-size: 12px;
+      color: var(--accent-red);
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+
+    .rca-name {
+      font-size: 18px;
+      font-weight: 700;
+      margin-top: 2px;
+      color: var(--text-primary);
+    }
+
+    .rca-confidence {
+      text-align: right;
+    }
+
+    .rca-confidence-value {
+      font-size: 24px;
+      font-weight: 700;
+      color: var(--accent-yellow);
+    }
+
+    .rca-confidence-label {
+      font-size: 11px;
+      color: var(--text-muted);
+    }
+
+    /* Flow Steps */
+    .flow-steps {
+      display: flex;
+      flex-direction: column;
+      gap: 0;
+      padding: 20px;
+    }
+
+    .flow-step {
+      display: flex;
+      align-items: center;
+      gap: 16px;
+      padding: 16px 20px;
+      background: var(--bg-tertiary);
+      border-radius: 10px;
+      border: 2px solid transparent;
+      position: relative;
+      transition: all 0.2s;
+    }
+
+    .flow-step.root {
+      background: rgba(239, 68, 68, 0.08);
+      border-color: var(--accent-red);
+    }
+
+    .flow-step.cascade {
+      background: rgba(245, 158, 11, 0.08);
+      border-color: var(--accent-yellow);
+    }
+
+    .flow-step.healthy {
+      background: rgba(16, 185, 129, 0.05);
+      border-color: rgba(16, 185, 129, 0.3);
+    }
+
+    .flow-step-icon {
+      width: 40px;
+      height: 40px;
+      border-radius: 50%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 18px;
+      flex-shrink: 0;
+    }
+
+    .flow-step.root .flow-step-icon { background: rgba(239, 68, 68, 0.15); }
+    .flow-step.cascade .flow-step-icon { background: rgba(245, 158, 11, 0.15); }
+    .flow-step.healthy .flow-step-icon { background: rgba(16, 185, 129, 0.1); }
+
+    .flow-step-content {
+      flex: 1;
+    }
+
+    .flow-step-name {
+      font-weight: 600;
+      font-size: 15px;
+      color: var(--text-primary);
+    }
+
+    .flow-step-status {
+      font-size: 13px;
+      color: var(--text-secondary);
+    }
+
+    .flow-step-badge {
+      padding: 4px 10px;
+      border-radius: 4px;
+      font-size: 11px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+
+    .flow-step.root .flow-step-badge {
+      background: rgba(239, 68, 68, 0.15);
+      color: var(--accent-red);
+    }
+
+    .flow-step.cascade .flow-step-badge {
+      background: rgba(245, 158, 11, 0.15);
+      color: #d97706;
+    }
+
+    .flow-connector {
+      height: 32px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      position: relative;
+    }
+
+    .flow-connector::before {
+      content: '';
+      width: 2px;
+      height: 100%;
+      background: linear-gradient(180deg, var(--accent-red) 0%, var(--accent-yellow) 50%, var(--text-muted) 100%);
+    }
+
+    .flow-connector-arrow {
+      position: absolute;
+      color: var(--accent-yellow);
+      font-size: 12px;
+    }
+
+    /* Empty State */
+    .empty-state {
+      text-align: center;
+      padding: 60px 20px;
+      color: var(--text-muted);
+    }
+
+    .empty-state-icon {
+      font-size: 48px;
+      margin-bottom: 16px;
+    }
+
+    .empty-state-title {
+      font-size: 18px;
+      font-weight: 600;
+      color: var(--text-primary);
+      margin-bottom: 8px;
+    }
+
+    /* Scrollbar */
+    ::-webkit-scrollbar {
+      width: 8px;
+      height: 8px;
+    }
+
+    ::-webkit-scrollbar-track {
+      background: var(--bg-tertiary);
+      border-radius: 4px;
+    }
+
+    ::-webkit-scrollbar-thumb {
+      background: var(--border-color);
+      border-radius: 4px;
+    }
+
+    ::-webkit-scrollbar-thumb:hover {
+      background: var(--text-muted);
+    }
+
+    /* Configuration Panel */
+    .config-panel {
+      background: var(--bg-card);
+      border: 1px solid var(--border-color);
+      border-radius: 12px;
+      padding: 20px;
+      margin-bottom: 24px;
+    }
+
+    .config-row {
+      display: flex;
+      gap: 16px;
+      align-items: flex-end;
+      flex-wrap: wrap;
+    }
+
+    .config-field {
+      flex: 1;
+      min-width: 250px;
+    }
+
+    .config-label {
+      display: block;
+      font-size: 13px;
+      font-weight: 500;
+      color: var(--text-secondary);
+      margin-bottom: 6px;
+    }
+
+    .config-input {
+      width: 100%;
+      padding: 10px 14px;
+      border: 1px solid var(--border-color);
+      border-radius: 8px;
+      font-size: 14px;
+      background: var(--bg-secondary);
+      color: var(--text-primary);
+      transition: all 0.2s;
+    }
+
+    .config-input:focus {
+      outline: none;
+      border-color: var(--accent-blue);
+      box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.1);
+    }
+
+    /* Responsive */
+    @media (max-width: 768px) {
+      .navbar {
+        flex-wrap: wrap;
+        height: auto;
+        padding: 12px;
+      }
+
+      .nav-links {
+        order: 3;
+        width: 100%;
+        margin-top: 12px;
+        overflow-x: auto;
+      }
+
+      .main-content {
+        padding: 16px;
+      }
+
+      .agents-grid,
+      .stats-grid {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
+</head>
+<body>
+  <!-- Navigation -->
+  <nav class="navbar">
+    <div class="nav-brand">
+      <div class="nav-logo">🔧</div>
+      <span class="nav-title">Self-Healing System</span>
+    </div>
+    <div class="nav-links">
+      <a href="#" class="nav-link active" data-page="dashboard">Dashboard</a>
+      <a href="#" class="nav-link" data-page="pods">📦 Pods</a>
+      <a href="#" class="nav-link" data-page="alerts">🚨 Alerts</a>
+      <a href="#" class="nav-link" data-page="dependency-graph">🔗 Dependencies</a>
+      <a href="#" class="nav-link" data-page="timeline">Timeline</a>
+    </div>
+    <div class="nav-actions">
+      <div class="health-indicator healthy" id="healthIndicator">
+        <div class="pulse-dot"></div>
+        <span>Healthy</span>
+      </div>
+    </div>
+  </nav>
+
+  <!-- Main Content -->
+  <main class="main-content">
+    <!-- Dashboard Page -->
+    <div class="page active" id="page-dashboard">
+      <div class="page-header">
+        <h1 class="page-title">System Overview</h1>
+        <p class="page-subtitle">Real-time monitoring and health status of your Kubernetes cluster</p>
+      </div>
+
+      <!-- Configuration Panel -->
+      <div class="config-panel">
+        <h3 style="margin-bottom: 16px; font-size: 16px;">⚙️ Configuration</h3>
+        <div class="config-row">
+          <div class="config-field">
+            <label class="config-label">Metrics Endpoint URL (Ngrok)</label>
+            <input type="text" class="config-input" id="metricsUrl" placeholder="https://refocus-cement-spud.ngrok-free.dev/pods" value="">
+          </div>
+          <button class="btn btn-primary" id="updateConfigBtn">📡 Connect Metrics</button>
+        </div>
+        <div style="margin-top: 12px; font-size: 13px; color: var(--text-muted);" id="configStatus">
+          🔗 Enter your ngrok URL and click "Connect Metrics" to fetch real-time pod data
+        </div>
+      </div>
+
+      <!-- Stats Grid -->
+      <div class="stats-grid">
+        <div class="stat-card">
+          <div class="stat-header">
+            <span class="stat-label">Total Issues</span>
+            <div class="stat-icon blue">📊</div>
+          </div>
+          <div class="stat-value" id="totalIssues">0</div>
+          <div class="stat-change positive">No active issues</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-header">
+            <span class="stat-label">Success Rate</span>
+            <div class="stat-icon green">✓</div>
+          </div>
+          <div class="stat-value" id="successRate">100%</div>
+          <div class="stat-change positive">Auto-healing effective</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-header">
+            <span class="stat-label">Total Learnings</span>
+            <div class="stat-icon purple">🧠</div>
+          </div>
+          <div class="stat-value" id="totalLearnings">0</div>
+          <div class="stat-change positive">Continuously improving</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-header">
+            <span class="stat-label">Active Agents</span>
+            <div class="stat-icon yellow">🤖</div>
+          </div>
+          <div class="stat-value">4</div>
+          <div class="stat-change">Observer, Detector, RCA, Executor</div>
+        </div>
+      </div>
+
+      <!-- Agent Status Cards -->
+      <h2 class="page-title" style="font-size: 20px; margin-bottom: 16px;">Agent Status</h2>
+      <div class="agents-grid">
+        <div class="agent-card" id="agent-observer">
+          <div class="agent-header">
+            <div class="agent-info">
+              <div class="agent-avatar">👁️</div>
+              <div>
+                <div class="agent-name">Observer</div>
+                <div class="agent-role">Detects anomalies</div>
+              </div>
+            </div>
+            <span class="agent-status-badge idle">Idle</span>
+          </div>
+          <div class="agent-progress">
+            <div class="progress-bar">
+              <div class="progress-fill" style="width: 0%"></div>
+            </div>
+          </div>
+          <div class="agent-last-run">Last run: Never</div>
+        </div>
+
+        <div class="agent-card" id="agent-detector">
+          <div class="agent-header">
+            <div class="agent-info">
+              <div class="agent-avatar">🔍</div>
+              <div>
+                <div class="agent-name">Detector</div>
+                <div class="agent-role">Confirms issues</div>
+              </div>
+            </div>
+            <span class="agent-status-badge idle">Idle</span>
+          </div>
+          <div class="agent-progress">
+            <div class="progress-bar">
+              <div class="progress-fill" style="width: 0%"></div>
+            </div>
+          </div>
+          <div class="agent-last-run">Last run: Never</div>
+        </div>
+
+        <div class="agent-card" id="agent-rca">
+          <div class="agent-header">
+            <div class="agent-info">
+              <div class="agent-avatar">🌳</div>
+              <div>
+                <div class="agent-name">RCA</div>
+                <div class="agent-role">Root cause analysis</div>
+              </div>
+            </div>
+            <span class="agent-status-badge idle">Idle</span>
+          </div>
+          <div class="agent-progress">
+            <div class="progress-bar">
+              <div class="progress-fill" style="width: 0%"></div>
+            </div>
+          </div>
+          <div class="agent-last-run">Last run: Never</div>
+        </div>
+
+        <div class="agent-card" id="agent-executor">
+          <div class="agent-header">
+            <div class="agent-info">
+              <div class="agent-avatar">⚡</div>
+              <div>
+                <div class="agent-name">Executor</div>
+                <div class="agent-role">Applies fixes</div>
+              </div>
+            </div>
+            <span class="agent-status-badge idle">Idle</span>
+          </div>
+          <div class="agent-progress">
+            <div class="progress-bar">
+              <div class="progress-fill" style="width: 0%"></div>
+            </div>
+          </div>
+          <div class="agent-last-run">Last run: Never</div>
+        </div>
+      </div>
+
+      <!-- Active Issues -->
+      <div class="card">
+        <div class="card-header">
+          <h3 class="card-title">
+            ⚠️ Active Issues
+            <span id="issueCount" style="background: var(--bg-tertiary); padding: 2px 10px; border-radius: 20px; font-size: 13px;">0</span>
+          </h3>
+          <button class="btn btn-primary" id="runHealingBtn" onclick="triggerHealing()">
+            🚀 Run Self-Healing
+          </button>
+        </div>
+        <div class="card-body">
+          <div class="issues-list" id="issuesList">
+            <div class="empty-state">
+              <div class="empty-state-icon">✅</div>
+              <div class="empty-state-title">All Systems Operational</div>
+              <p>No active issues detected. Click "Run Self-Healing" to start a scan.</p>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Pods Page -->
+    <div class="page" id="page-pods">
+      <div class="page-header">
+        <h1 class="page-title">📦 Pods Overview</h1>
+        <p class="page-subtitle">All pods in your cluster with real-time status</p>
+      </div>
+
+      <div class="stats-grid">
+        <div class="stat-card">
+          <div class="stat-header">
+            <span class="stat-label">Total Pods</span>
+            <div class="stat-icon blue">📊</div>
+          </div>
+          <div class="stat-value" id="podsTotal">0</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-header">
+            <span class="stat-label">Running</span>
+            <div class="stat-icon green">✅</div>
+          </div>
+          <div class="stat-value" id="podsRunning">0</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-header">
+            <span class="stat-label">Pending</span>
+            <div class="stat-icon yellow">⏳</div>
+          </div>
+          <div class="stat-value" id="podsPending">0</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-header">
+            <span class="stat-label">Failed</span>
+            <div class="stat-icon red">❌</div>
+          </div>
+          <div class="stat-value" id="podsFailed">0</div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-header">
+          <h3 class="card-title">🔄 Pod List</h3>
+          <div style="font-size: 13px; color: var(--text-secondary);">Real-time pod status from ngrok</div>
+        </div>
+        <div class="card-body">
+          <div class="pods-list" id="podsList">
+            <div class="empty-state">
+              <div class="empty-state-icon">📦</div>
+              <div class="empty-state-title">No Pods Available</div>
+              <p>Connect metrics to view pods from your cluster.</p>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Alerts Page -->
+    <div class="page" id="page-alerts">
+      <div class="page-header">
+        <h1 class="page-title">🚨 Alert Center</h1>
+        <p class="page-subtitle">Real-time alerts on system failures and performance issues</p>
+      </div>
+
+      <div class="stats-grid">
+        <div class="stat-card">
+          <div class="stat-header">
+            <span class="stat-label">Critical Alerts</span>
+            <div class="stat-icon red">🔴</div>
+          </div>
+          <div class="stat-value" id="alertsCritical">0</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-header">
+            <span class="stat-label">Warnings</span>
+            <div class="stat-icon yellow">⚠️</div>
+          </div>
+          <div class="stat-value" id="alertsWarning">0</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-header">
+            <span class="stat-label">Impact Score</span>
+            <div class="stat-icon purple">📊</div>
+          </div>
+          <div class="stat-value" id="impactScore">0</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-header">
+            <span class="stat-label">Affected Pods</span>
+            <div class="stat-icon blue">📦</div>
+          </div>
+          <div class="stat-value" id="affectedPodsCount">0</div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-header">
+          <h3 class="card-title">🚨 Active Alerts</h3>
+          <div style="font-size: 13px; color: var(--text-secondary);">System health and failure notifications</div>
+        </div>
+        <div class="card-body">
+          <div id="alertsList">
+            <div class="empty-state">
+              <div class="empty-state-icon">✅</div>
+              <div class="empty-state-title">No Active Alerts</div>
+              <p>Your system is healthy. All pods are running normally.</p>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Dependency Graph Page -->
+    <div class="page" id="page-dependency-graph">
+      <div class="page-header">
+        <div>
+          <h1 class="page-title">🔗 Dependency Graph</h1>
+          <p class="page-subtitle">Visualize service dependencies and failure impact analysis</p>
+        </div>
+        <!-- Inline metrics connection -->
+        <div style="display: flex; gap: 8px; align-items: center; margin-left: auto;">
+          <input type="text" id="depMetricsUrl" placeholder="Enter ngrok URL..."
+            value="https://refocus-cement-spud.ngrok-free.dev/pods"
+            style="padding: 8px 12px; border: 1px solid #e2e8f0; border-radius: 6px; font-size: 13px; width: 280px;">
+          <button class="btn btn-primary" id="depConnectBtn">
+            📡 Connect
+          </button>
+        </div>
+      </div>
+
+      <!-- Connection Status -->
+      <div id="depConnectionStatus" style="display: none; margin-bottom: 16px; padding: 12px 16px; border-radius: 8px; font-size: 14px;"></div>
+
+      <!-- Graph Stats -->
+      <div class="stats-grid">
+        <div class="stat-card">
+          <div class="stat-header">
+            <span class="stat-label">Total Services</span>
+            <div class="stat-icon blue">🔧</div>
+          </div>
+          <div class="stat-value" id="depGraphTotalNodes">0</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-header">
+            <span class="stat-label">Dependencies</span>
+            <div class="stat-icon purple">🔗</div>
+          </div>
+          <div class="stat-value" id="depGraphTotalLinks">0</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-header">
+            <span class="stat-label">Critical Path</span>
+            <div class="stat-icon red">⚠️</div>
+          </div>
+          <div class="stat-value" id="depGraphCriticalPath">-</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-header">
+            <span class="stat-label">Root Cause</span>
+            <div class="stat-icon yellow">💥</div>
+          </div>
+          <div class="stat-value" id="depGraphRootCause" style="font-size: 18px;">-</div>
+        </div>
+      </div>
+
+      <!-- Main Graph Visualization -->
+      <div class="card" style="margin-bottom: 24px;">
+        <div class="card-header" style="flex-wrap: wrap; gap: 12px;">
+          <h3 class="card-title">🕸️ Service Dependency Network</h3>
+          <!-- Legend -->
+          <div style="display: flex; gap: 8px; align-items: center; flex-wrap: wrap; font-size: 11px;">
+            <span style="display: flex; align-items: center; gap: 4px; padding: 4px 8px; background: #fef2f2; border-radius: 4px; border: 1px solid #dc2626;">
+              <span style="width: 10px; height: 10px; background: #dc2626; border-radius: 50%;"></span> Root Cause
+            </span>
+            <span style="display: flex; align-items: center; gap: 4px; padding: 4px 8px; background: #fefce8; border-radius: 4px; border: 1px solid #eab308;">
+              <span style="width: 10px; height: 10px; background: #eab308; border-radius: 50%;"></span> Affected
+            </span>
+            <span style="display: flex; align-items: center; gap: 4px; padding: 4px 8px; background: #f0fdf4; border-radius: 4px; border: 1px solid #22c55e;">
+              <span style="width: 10px; height: 10px; background: #22c55e; border-radius: 50%;"></span> Healthy
+            </span>
+          </div>
+        </div>
+        <div class="card-body" style="padding: 0; overflow: hidden;">
+          <div id="dependencyGraphContainer" style="width: 100%; height: 520px; position: relative; background: #fafafa; border-radius: 0 0 12px 12px; overflow: hidden;">
+            <svg id="dependencyGraphSvg" width="100%" height="100%" style="display: block;">
+              <defs>
+                <linearGradient id="bg-gradient" x1="0%" y1="0%" x2="0%" y2="100%">
+                  <stop offset="0%" style="stop-color:#f8fafc;stop-opacity:1" />
+                  <stop offset="100%" style="stop-color:#f1f5f9;stop-opacity:1" />
+                </linearGradient>
+              </defs>
+              <rect width="100%" height="100%" fill="url(#bg-gradient)" />
+              <g id="graphEdges"></g>
+              <g id="graphNodes"></g>
+            </svg>
+            <!-- Empty State -->
+            <div id="graphEmptyState" style="position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; background: #fafafa;">
+              <div style="font-size: 48px; margin-bottom: 16px;">🕸️</div>
+              <div style="font-size: 18px; font-weight: 600; color: #374151; margin-bottom: 8px;">No Dependency Data</div>
+              <p style="color: #6b7280; font-size: 14px; margin: 0;">Run self-healing to build the dependency graph</p>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Dependency Chain / RCA Flow -->
+      <div class="card" style="margin-bottom: 24px;">
+        <div class="card-header">
+          <h3 class="card-title">🌳 Root Cause Chain</h3>
+        </div>
+        <div class="card-body">
+          <div id="dependencyFlow">
+            <div class="empty-state">
+              <div class="empty-state-icon">🔗</div>
+              <div class="empty-state-title">No Active Chain</div>
+              <p>Root cause analysis will display the failure chain here.</p>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Agent Status Cards (Moved from Agents Page) -->
+      <div class="card">
+        <div class="card-header">
+          <h3 class="card-title">🤖 Healing Agents Status</h3>
+        </div>
+        <div class="card-body">
+          <div class="agents-grid" id="agentsGrid">
+            <div class="agent-card" id="agent-observer">
+              <div class="agent-header">
+                <div class="agent-info">
+                  <div class="agent-avatar">👁️</div>
+                  <div>
+                    <div class="agent-name">Observer</div>
+                    <div class="agent-role">Detects anomalies</div>
+                  </div>
+                </div>
+                <span class="agent-status-badge idle">Idle</span>
+              </div>
+              <div class="agent-progress">
+                <div class="progress-bar">
+                  <div class="progress-fill" style="width: 0%"></div>
+                </div>
+              </div>
+              <div class="agent-last-run">Last run: Never</div>
+            </div>
+
+            <div class="agent-card" id="agent-detector">
+              <div class="agent-header">
+                <div class="agent-info">
+                  <div class="agent-avatar">🔍</div>
+                  <div>
+                    <div class="agent-name">Detector</div>
+                    <div class="agent-role">Confirms issues</div>
+                  </div>
+                </div>
+                <span class="agent-status-badge idle">Idle</span>
+              </div>
+              <div class="agent-progress">
+                <div class="progress-bar">
+                  <div class="progress-fill" style="width: 0%"></div>
+                </div>
+              </div>
+              <div class="agent-last-run">Last run: Never</div>
+            </div>
+
+            <div class="agent-card" id="agent-rca">
+              <div class="agent-header">
+                <div class="agent-info">
+                  <div class="agent-avatar">🌳</div>
+                  <div>
+                    <div class="agent-name">RCA</div>
+                    <div class="agent-role">Root cause analysis</div>
+                  </div>
+                </div>
+                <span class="agent-status-badge idle">Idle</span>
+              </div>
+              <div class="agent-progress">
+                <div class="progress-bar">
+                  <div class="progress-fill" style="width: 0%"></div>
+                </div>
+              </div>
+              <div class="agent-last-run">Last run: Never</div>
+            </div>
+
+            <div class="agent-card" id="agent-executor">
+              <div class="agent-header">
+                <div class="agent-info">
+                  <div class="agent-avatar">⚡</div>
+                  <div>
+                    <div class="agent-name">Executor</div>
+                    <div class="agent-role">Applies fixes</div>
+                  </div>
+                </div>
+                <span class="agent-status-badge idle">Idle</span>
+              </div>
+              <div class="agent-progress">
+                <div class="progress-bar">
+                  <div class="progress-fill" style="width: 0%"></div>
+                </div>
+              </div>
+              <div class="agent-last-run">Last run: Never</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Timeline Page -->
+    <div class="page" id="page-timeline">
+      <div class="page-header">
+        <h1 class="page-title">Event Timeline</h1>
+        <p class="page-subtitle">Chronological view of all system events and healing actions</p>
+      </div>
+
+      <div class="card">
+        <div class="card-header">
+          <h3 class="card-title">⏱️ Recent Events</h3>
+          <button class="btn btn-secondary" onclick="clearTimeline()">Clear</button>
+        </div>
+        <div class="card-body">
+          <div class="timeline" id="timeline">
+            <div class="empty-state">
+              <div class="empty-state-icon">📋</div>
+              <div class="empty-state-title">No Events Yet</div>
+              <p>Run the self-healing system to start recording events.</p>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </main>
+
+  <script src="/dashboard/app.js"></script>
+</body>
+</html>
