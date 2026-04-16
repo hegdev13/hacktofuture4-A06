@@ -4,12 +4,25 @@ import { z } from "zod";
 
 export const runtime = "nodejs";
 
+const FailureTypeSchema = z.enum([
+  "crash_app",
+  "image_pull_error",
+  "oom_kill",
+  "dependency_break",
+  "probe_failure",
+]);
+
 const BodySchema = z.object({
-  podName: z.string().min(1),
+  failure_type: FailureTypeSchema.optional(),
+  failureType: FailureTypeSchema.optional(),
+  target_name: z.string().min(1).optional(),
+  targetName: z.string().min(1).optional(),
+  podName: z.string().min(1).optional(),
   namespace: z.string().min(1).default("default"),
 });
 
 type KubectlResult = {
+  command: string;
   ok: boolean;
   stdout: string;
   stderr: string;
@@ -19,6 +32,7 @@ type KubectlResult = {
 function runKubectl(args: string[]): KubectlResult {
   const run = spawnSync("kubectl", args, { encoding: "utf-8" });
   return {
+    command: `kubectl ${args.join(" ")}`,
     ok: run.status === 0,
     stdout: run.stdout || "",
     stderr: run.stderr || "",
@@ -53,7 +67,7 @@ function queryOwner(namespace: string, resourceType: string, resourceName: strin
   ]);
 }
 
-function resolveScaleTarget(namespace: string, podName: string): { resourceType: string; resourceName: string } | null {
+function resolveWorkloadTarget(namespace: string, podName: string): { resourceType: string; resourceName: string } | null {
   const podOwnerRes = queryOwner(namespace, "pod", podName);
   if (!podOwnerRes.ok) {
     return null;
@@ -91,6 +105,64 @@ function resolveScaleTarget(namespace: string, podName: string): { resourceType:
   return null;
 }
 
+function kubectlExists(resourceType: string, name: string, namespace: string): boolean {
+  const res = runKubectl(["get", resourceType, name, "-n", namespace]);
+  return res.ok;
+}
+
+function resolveDeploymentName(namespace: string, targetName: string): string | null {
+  if (kubectlExists("deployment", targetName, namespace)) {
+    return targetName;
+  }
+
+  if (kubectlExists("pod", targetName, namespace)) {
+    const target = resolveWorkloadTarget(namespace, targetName);
+    if (target?.resourceType === "deployment") {
+      return target.resourceName;
+    }
+  }
+
+  return null;
+}
+
+function firstPodForWorkload(namespace: string, workloadName: string): string | null {
+  const pods = runKubectl(["get", "pods", "-n", namespace, "--no-headers"]);
+  if (!pods.ok) {
+    return null;
+  }
+
+  const lines = pods.stdout
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
+
+  const match = lines.find((line) => line.startsWith(`${workloadName}-`));
+  if (!match) {
+    return null;
+  }
+
+  return match.split(/\s+/)[0] || null;
+}
+
+function firstContainerName(namespace: string, deploymentName: string): string | null {
+  const res = runKubectl([
+    "get",
+    "deployment",
+    deploymentName,
+    "-n",
+    namespace,
+    "-o",
+    "jsonpath={.spec.template.spec.containers[0].name}",
+  ]);
+
+  if (!res.ok) {
+    return null;
+  }
+
+  const name = res.stdout.trim();
+  return name || null;
+}
+
 export async function POST(request: Request) {
   const body = await request.json().catch(() => null);
   const parsed = BodySchema.safeParse(body);
@@ -98,54 +170,235 @@ export async function POST(request: Request) {
     return NextResponse.json({ ok: false, error: "invalid_request" }, { status: 400 });
   }
 
-  const { podName, namespace } = parsed.data;
-  if (namespace !== "default") {
+  const requestedFailureType = parsed.data.failure_type || parsed.data.failureType;
+  const namespace = parsed.data.namespace;
+  const targetName = (parsed.data.target_name || parsed.data.targetName || parsed.data.podName || "").trim();
+
+  if (!targetName) {
+    return NextResponse.json({ ok: false, error: "target_name_required" }, { status: 400 });
+  }
+
+  const commandsExecuted: KubectlResult[] = [];
+  const errors: string[] = [];
+
+  // STEP 1: validate target using real cluster state
+  const prePods = runKubectl(["get", "pods", "-n", namespace]);
+  commandsExecuted.push(prePods);
+  if (!prePods.ok) {
     return NextResponse.json(
       {
         ok: false,
-        error: "only_default_namespace_supported",
+        "Failure Type Applied": failureType,
+        "Target Resource": `${namespace}/${targetName}`,
+        "Commands Executed": commandsExecuted,
+        "Observed Pod State (REAL)": "unavailable",
+        Errors: [prePods.stderr || "failed to list pods"],
+        Confidence: "FAILED",
       },
-      { status: 400 },
+      { status: 500 },
     );
   }
 
-  const target = resolveScaleTarget(namespace, podName);
+  let applyResult: KubectlResult | null = null;
+  let targetResource = targetName;
+  let affectedPod = "";
+  let failureType = requestedFailureType as z.infer<typeof FailureTypeSchema> | undefined;
 
-  if (target) {
-    const scaleRes = runKubectl([
-      "scale",
-      `${target.resourceType}/${target.resourceName}`,
-      "-n",
-      namespace,
-      "--replicas=0",
-    ]);
+  if (!failureType) {
+    const options: Array<z.infer<typeof FailureTypeSchema>> = [
+      "crash_app",
+      "image_pull_error",
+      "oom_kill",
+      "probe_failure",
+    ];
 
-    if (!scaleRes.ok) {
+    if (kubectlExists("svc", targetName, namespace)) {
+      options.push("dependency_break");
+    }
+
+    failureType = options[Math.floor(Math.random() * options.length)] || "crash_app";
+  }
+
+  // STEP 2: apply actual failure based on type
+  if (failureType === "dependency_break") {
+    if (!kubectlExists("svc", targetName, namespace)) {
       return NextResponse.json(
         {
           ok: false,
-          error: scaleRes.stderr || `Failed to scale ${target.resourceType}/${target.resourceName}`,
+          "Failure Type Applied": failureType,
+          "Target Resource": `svc/${namespace}/${targetName}`,
+          "Commands Executed": commandsExecuted,
+          "Observed Pod State (REAL)": prePods.stdout,
+          Errors: [`service ${targetName} not found in namespace ${namespace}`],
+          Confidence: "FAILED",
         },
-        { status: 500 },
+        { status: 404 },
       );
     }
 
-    return NextResponse.json({
-      ok: true,
-      action: "scaled_to_zero",
-      targetKind: target.resourceType,
-      targetName: target.resourceName,
-      namespace,
-      message: `Scaled ${target.resourceType}/${target.resourceName} to 0 replicas.`,
-      output: scaleRes.stdout,
-    });
+    applyResult = runKubectl(["delete", "svc", targetName, "-n", namespace]);
+    commandsExecuted.push(applyResult);
+    targetResource = `svc/${targetName}`;
+  } else {
+    const deploymentName = resolveDeploymentName(namespace, targetName);
+    if (!deploymentName) {
+      return NextResponse.json(
+        {
+          ok: false,
+          "Failure Type Applied": failureType,
+          "Target Resource": `${namespace}/${targetName}`,
+          "Commands Executed": commandsExecuted,
+          "Observed Pod State (REAL)": prePods.stdout,
+          Errors: [
+            `target ${targetName} not found as deployment or pod with deployment owner in namespace ${namespace}`,
+          ],
+          Confidence: "FAILED",
+        },
+        { status: 404 },
+      );
+    }
+
+    targetResource = `deployment/${deploymentName}`;
+
+    if (failureType === "crash_app") {
+      applyResult = runKubectl([
+        "patch",
+        "deployment",
+        deploymentName,
+        "-n",
+        namespace,
+        "--type=json",
+        "-p",
+        '[{"op":"replace","path":"/spec/template/spec/containers/0/command","value":["sh","-c","exit 1"]}]',
+      ]);
+      commandsExecuted.push(applyResult);
+    } else if (failureType === "image_pull_error") {
+      applyResult = runKubectl([
+        "set",
+        "image",
+        `deployment/${deploymentName}`,
+        "*=invalid-image:latest",
+        "-n",
+        namespace,
+      ]);
+      commandsExecuted.push(applyResult);
+    } else if (failureType === "oom_kill") {
+      const containerName = firstContainerName(namespace, deploymentName) || deploymentName;
+      const patch = JSON.stringify({
+        spec: {
+          template: {
+            spec: {
+              containers: [
+                {
+                  name: containerName,
+                  resources: { limits: { memory: "20Mi" } },
+                },
+              ],
+            },
+          },
+        },
+      });
+
+      applyResult = runKubectl([
+        "patch",
+        "deployment",
+        deploymentName,
+        "-n",
+        namespace,
+        "-p",
+        patch,
+      ]);
+      commandsExecuted.push(applyResult);
+    } else if (failureType === "probe_failure") {
+      const containerName = firstContainerName(namespace, deploymentName) || deploymentName;
+      const patch = JSON.stringify({
+        spec: {
+          template: {
+            spec: {
+              containers: [
+                {
+                  name: containerName,
+                  livenessProbe: {
+                    httpGet: {
+                      path: "/wrong",
+                      port: 8080,
+                    },
+                  },
+                },
+              ],
+            },
+          },
+        },
+      });
+
+      applyResult = runKubectl([
+        "patch",
+        "deployment",
+        deploymentName,
+        "-n",
+        namespace,
+        "-p",
+        patch,
+      ]);
+      commandsExecuted.push(applyResult);
+    }
+
+    affectedPod = firstPodForWorkload(namespace, deploymentName) || "";
   }
+
+  if (!applyResult || !applyResult.ok) {
+    errors.push(applyResult?.stderr || "failure injection command failed");
+  }
+
+  // STEP 3: observe result from live cluster state
+  const postPods = runKubectl(["get", "pods", "-n", namespace]);
+  commandsExecuted.push(postPods);
+  if (!postPods.ok) {
+    errors.push(postPods.stderr || "failed to list pods after failure injection");
+  }
+
+  if (!affectedPod && kubectlExists("pod", targetName, namespace)) {
+    affectedPod = targetName;
+  }
+
+  let describeResult: KubectlResult | null = null;
+  if (affectedPod) {
+    describeResult = runKubectl(["describe", "pod", affectedPod, "-n", namespace]);
+    commandsExecuted.push(describeResult);
+    if (!describeResult.ok) {
+      errors.push(describeResult.stderr || `failed to describe pod ${affectedPod}`);
+    }
+  } else {
+    errors.push("could not determine affected pod for describe");
+  }
+
+  const confidence = !applyResult || !applyResult.ok ? "FAILED" : errors.length ? "PARTIAL" : "REAL";
+  const ok = confidence !== "FAILED";
+
+  // Backward-compatible fields for existing dashboard button behavior
+  const targetKind = targetResource.split("/")[0] || "resource";
+  const targetNameOut = targetResource.split("/")[1] || targetName;
 
   return NextResponse.json(
     {
-      ok: false,
-      error: "unsupported_workload_for_scale_to_zero",
+      ok,
+      action: failureType,
+      targetKind,
+      targetName: targetNameOut,
+      namespace,
+      message: ok ? `Applied ${failureType} on ${targetResource}` : `Failed to apply ${failureType} on ${targetResource}`,
+      "Failure Type Applied": failureType,
+      "Target Resource": `${namespace}/${targetResource}`,
+      "Commands Executed": commandsExecuted,
+      "Observed Pod State (REAL)": {
+        pods_before: prePods.stdout,
+        pods_after: postPods.stdout,
+        affected_pod: affectedPod || null,
+        describe_output: describeResult?.stdout || null,
+      },
+      Errors: errors,
+      Confidence: confidence,
     },
-    { status: 409 },
+    { status: ok ? 200 : 500 },
   );
 }

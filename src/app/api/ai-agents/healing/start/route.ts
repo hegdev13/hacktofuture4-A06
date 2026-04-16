@@ -5,6 +5,18 @@ import type { HealingScenario, HealingTargetKind } from "@/lib/healing/types";
 export const runtime = "nodejs";
 
 export async function POST(request: Request) {
+  const sourceHeader = request.headers.get("x-healing-source");
+  if (sourceHeader !== "dashboard-healing-page") {
+    return NextResponse.json(
+      {
+        ok: false,
+        error: "healing_start_restricted",
+        details: "Healing can only be started from the /dashboard/healing Self Heal button.",
+      },
+      { status: 403 },
+    );
+  }
+
   const body = (await request.json().catch(() => ({}))) as {
     scenario?: HealingScenario;
     dryRun?: boolean;

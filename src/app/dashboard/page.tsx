@@ -357,63 +357,10 @@ export default function DashboardOverviewPage() {
   }, [failablePods, poll, requestFailPod]);
 
   const startHealing = useCallback(async () => {
-    setIsHealingInProgress(true);
-    setShowOptionsModal(true);
     setDecisionAnalysis(null);
-    
-    try {
-      const response = await fetch("/api/self-heal", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          scenario: "pod-crash",
-          dryRun: false,
-          metricsUrl: selectedEp?.ngrok_url,
-          strictLive: false,
-        }),
-      });
-
-      const data = await response.json();
-      
-      if (data.ok) {
-        // Fetch decision analysis after a short delay to allow backend processing
-        setTimeout(async () => {
-          try {
-            const page = new URL(window.location.href);
-            const issueId = page.searchParams.get("issue_id") || (data.status?.activeIssueId || "unknown");
-            
-            const analysisRes = await fetch(
-              `/api/healing/decision-analysis?issue_id=${encodeURIComponent(issueId)}`
-            );
-            
-            if (analysisRes.ok) {
-              const analysisData = await analysisRes.json();
-              if (analysisData.ok && analysisData.data?.raw) {
-                setDecisionAnalysis({
-                  options: analysisData.data.raw.options || [],
-                  selected_option: analysisData.data.raw.selected_option || "",
-                  selection_reason: analysisData.data.raw.selection_reason || "",
-                  root_cause: analysisData.data.raw.root_cause || "unknown",
-                  affected_resources_count: analysisData.data.raw.affected_resources_count || 0,
-                });
-              }
-            }
-          } catch (err) {
-            console.error("Error fetching decision analysis:", err);
-          }
-        }, 2000);
-
-        void poll();
-      } else {
-        setShowOptionsModal(false);
-      }
-    } catch (error) {
-      console.error("Healing error:", error);
-      setShowOptionsModal(false);
-    } finally {
-      setIsHealingInProgress(false);
-    }
-  }, [selectedEp?.ngrok_url, poll]);
+    setShowOptionsModal(false);
+    window.location.href = "/dashboard/healing";
+  }, []);
 
   useEffect(() => {
     const onEp = () => {

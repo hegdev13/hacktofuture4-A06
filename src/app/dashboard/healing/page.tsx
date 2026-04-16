@@ -361,7 +361,10 @@ export default function HealingDashboardPage() {
     try {
       const res = await fetch("/api/ai-agents/healing/start", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          "x-healing-source": "dashboard-healing-page",
+        },
         body: JSON.stringify({
           scenario,
           dryRun,
