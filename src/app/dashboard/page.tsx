@@ -247,6 +247,8 @@ export default function DashboardOverviewPage() {
     return Array.from(map.values()).sort((a, b) => a.pod_name.localeCompare(b.pod_name));
   }, [rows]);
 
+  const failablePods = useMemo(() => latestByPod.filter((r) => r.namespace === "default"), [latestByPod]);
+
   const requestFailPod = useCallback(async (podName: string, namespace: string) => {
     const res = await fetch("/api/dashboard/fail-pod", {
       method: "POST",
@@ -266,7 +268,7 @@ export default function DashboardOverviewPage() {
       throw new Error(data.error || `Failed to fail pod (${res.status})`);
     }
 
-    const action = data.action === "scaled_to_zero" ? "scaled to 0" : "deleted";
+    const action = data.action === "scaled_to_zero" ? "scaled to 0" : "skipped";
     const resource = data.targetKind && data.targetName ? `${data.targetKind}/${data.targetName}` : podName;
     return { action, resource };
   }, []);
@@ -291,8 +293,8 @@ export default function DashboardOverviewPage() {
   );
 
   const failAllPods = useCallback(async () => {
-    if (!latestByPod.length) {
-      setFailError("No pods available to fail.");
+    if (!failablePods.length) {
+      setFailError("No default-namespace pods available to fail.");
       return;
     }
 
@@ -303,7 +305,7 @@ export default function DashboardOverviewPage() {
       let success = 0;
       let failed = 0;
 
-      for (const row of latestByPod) {
+      for (const row of failablePods) {
         try {
           await requestFailPod(row.pod_name, row.namespace);
           success += 1;
@@ -322,7 +324,7 @@ export default function DashboardOverviewPage() {
       setFailingPodKey(null);
       void poll();
     }
-  }, [latestByPod, poll, requestFailPod]);
+  }, [failablePods, poll, requestFailPod]);
 
   useEffect(() => {
     const onEp = () => {
@@ -557,10 +559,10 @@ export default function DashboardOverviewPage() {
             </div>
             <button
               onClick={() => void failAllPods()}
-              disabled={failingAllPods || Boolean(failingPodKey) || !latestByPod.length}
+              disabled={failingAllPods || Boolean(failingPodKey) || !failablePods.length}
               className="rounded-md border border-[#e3c7c7] bg-[#fff1f1] px-3 py-2 text-xs font-semibold text-[#9f3232] hover:bg-[#ffe6e6] disabled:cursor-not-allowed disabled:opacity-60"
             >
-              {failingAllPods ? "Failing All..." : `Fail All Pods (${latestByPod.length})`}
+              {failingAllPods ? "Failing All..." : `Fail Default Pods (${failablePods.length})`}
             </button>
           </div>
           {failError ? <div className="text-xs font-medium text-danger">{failError}</div> : null}
@@ -588,7 +590,7 @@ export default function DashboardOverviewPage() {
                     <td className="py-2">
                       <button
                         onClick={() => void failPod(r.pod_name, r.namespace)}
-                        disabled={Boolean(failingPodKey) || failingAllPods}
+                        disabled={Boolean(failingPodKey) || failingAllPods || r.namespace !== "default"}
                         className="rounded-md border border-[#e3c7c7] bg-[#fff6f6] px-2 py-1 text-xs font-semibold text-[#9f3232] hover:bg-[#ffe9e9] disabled:cursor-not-allowed disabled:opacity-60"
                       >
                         {failingPodKey === `${r.namespace}/${r.pod_name}` ? "Failing..." : "Fail Pod"}

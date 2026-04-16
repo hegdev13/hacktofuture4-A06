@@ -73,19 +73,19 @@ function resolveScaleTarget(namespace: string, podName: string): { resourceType:
   if (podOwner.kind === "ReplicaSet") {
     const rsOwnerRes = queryOwner(namespace, "rs", podOwner.name);
     if (!rsOwnerRes.ok) {
-      return { resourceType: "rs", resourceName: podOwner.name };
+      return null;
     }
 
     const rsOwner = parseOwner(rsOwnerRes.stdout);
     if (!rsOwner) {
-      return { resourceType: "rs", resourceName: podOwner.name };
+      return null;
     }
 
     if (rsOwner.kind === "Deployment") {
       return { resourceType: "deployment", resourceName: rsOwner.name };
     }
 
-    return { resourceType: "rs", resourceName: podOwner.name };
+    return null;
   }
 
   return null;
@@ -99,6 +99,16 @@ export async function POST(request: Request) {
   }
 
   const { podName, namespace } = parsed.data;
+  if (namespace !== "default") {
+    return NextResponse.json(
+      {
+        ok: false,
+        error: "only_default_namespace_supported",
+      },
+      { status: 400 },
+    );
+  }
+
   const target = resolveScaleTarget(namespace, podName);
 
   if (target) {
@@ -131,24 +141,11 @@ export async function POST(request: Request) {
     });
   }
 
-  const deleteRes = runKubectl(["delete", "pod", podName, "-n", namespace, "--force", "--grace-period=0"]);
-  if (!deleteRes.ok) {
-    return NextResponse.json(
-      {
-        ok: false,
-        error: deleteRes.stderr || `Failed to delete pod ${namespace}/${podName}`,
-      },
-      { status: 500 },
-    );
-  }
-
-  return NextResponse.json({
-    ok: true,
-    action: "pod_deleted",
-    targetKind: "pod",
-    targetName: podName,
-    namespace,
-    warning: "Pod was deleted directly. If managed by a controller, it may restart automatically.",
-    output: deleteRes.stdout,
-  });
+  return NextResponse.json(
+    {
+      ok: false,
+      error: "unsupported_workload_for_scale_to_zero",
+    },
+    { status: 409 },
+  );
 }
