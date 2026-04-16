@@ -14,6 +14,8 @@ export async function runHealingOrchestrator(input) {
   const targetName = (input.targetName || "").trim();
   const targetNamespace = (input.targetNamespace || "default").trim() || "default";
   const targetKind = input.targetKind || "pod";
+  const remediationPreference = input.remediationPreference;
+  const customCommand = (input.customCommand || "").trim();
 
   const kubectl = checkKubectlAccess();
   if (!kubectl.ok) {
@@ -42,6 +44,8 @@ export async function runHealingOrchestrator(input) {
     targetName: targetName || undefined,
     targetNamespace: targetName ? targetNamespace : undefined,
     targetKind: targetName ? targetKind : undefined,
+    remediationPreference,
+    customCommand: customCommand || undefined,
   });
 
   if (started.activeIssueId) {

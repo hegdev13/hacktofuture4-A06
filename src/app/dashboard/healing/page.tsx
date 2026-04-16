@@ -79,6 +79,8 @@ type RemediationOption = {
   tradeoff: string[];
   score: number;
   estimatedCost: string;
+  executionStrategy: "restart-workload" | "scale-replicas" | "dependency-first" | "custom-command";
+  source?: "gemini" | "fallback" | "custom";
 };
 
 type PrefilledTarget = {
@@ -129,6 +131,19 @@ function deploymentNameFromPodName(podName: string) {
   return podName;
 }
 
+function parseEventData<T>(evt: Event): T | null {
+  const raw = (evt as MessageEvent).data;
+  if (typeof raw !== "string" || !raw.trim() || raw === "undefined") {
+    return null;
+  }
+
+  try {
+    return JSON.parse(raw) as T;
+  } catch {
+    return null;
+  }
+}
+
 export default function HealingDashboardPage() {
   const [status, setStatus] = useState<AgentRunnerStatus>({ state: "idle", totalLogs: 0 });
   const [logs, setLogs] = useState<StructuredHealingLog[]>([]);
@@ -149,6 +164,10 @@ export default function HealingDashboardPage() {
   const [targetLoading, setTargetLoading] = useState(false);
   const [targetError, setTargetError] = useState<string>("");
   const [selectedRemediationId, setSelectedRemediationId] = useState<string>("");
+  const [llmRemediationOptions, setLlmRemediationOptions] = useState<RemediationOption[]>([]);
+  const [llmOptionsLoading, setLlmOptionsLoading] = useState(false);
+  const [llmOptionsError, setLlmOptionsError] = useState<string>("");
+  const [customCommand, setCustomCommand] = useState<string>("");
   const [prefilledTarget, setPrefilledTarget] = useState<PrefilledTarget | null>(null);
   const eventSourceRef = useRef<EventSource | null>(null);
 
@@ -322,28 +341,32 @@ export default function HealingDashboardPage() {
     eventSourceRef.current = es;
 
     es.addEventListener("init", (evt) => {
-      const data = JSON.parse((evt as MessageEvent).data) as {
+      const data = parseEventData<{
         status: AgentRunnerStatus;
         logs: StructuredHealingLog[];
         lifecycle: IssueLifecycle[];
-      };
+      }>(evt);
+      if (!data) return;
       setStatus(data.status);
       setLogs(data.logs || []);
       setLifecycle(data.lifecycle || []);
     });
 
     es.addEventListener("log", (evt) => {
-      const log = JSON.parse((evt as MessageEvent).data) as StructuredHealingLog;
+      const log = parseEventData<StructuredHealingLog>(evt);
+      if (!log) return;
       setLogs((prev) => [...prev, log].slice(-1200));
     });
 
     es.addEventListener("status", (evt) => {
-      const s = JSON.parse((evt as MessageEvent).data) as AgentRunnerStatus;
+      const s = parseEventData<AgentRunnerStatus>(evt);
+      if (!s) return;
       setStatus(s);
     });
 
     es.addEventListener("lifecycle", (evt) => {
-      const lc = JSON.parse((evt as MessageEvent).data) as IssueLifecycle[];
+      const lc = parseEventData<IssueLifecycle[]>(evt);
+      if (!lc) return;
       setLifecycle(lc);
     });
 
@@ -394,6 +417,11 @@ export default function HealingDashboardPage() {
       return;
     }
 
+    if (selectedRemediation?.executionStrategy === "custom-command" && !customCommand.trim()) {
+      setStartError("Enter a custom kubectl command for Option 4 before starting healing.");
+      return;
+    }
+
     const preferredTarget = selectedTarget || explicitTarget;
     const effectiveTargetKind: HealingTargetKind = selectedTargetMatchesExplicit
       ? (selectedTarget as HealingTarget).kind
@@ -427,7 +455,8 @@ export default function HealingDashboardPage() {
           targetName,
           targetNamespace: effectiveTargetNamespace,
           targetKind: effectiveTargetKind,
-          remediationPreference: selectedRemediation?.id || null,
+          remediationPreference: selectedRemediation?.executionStrategy || null,
+          customCommand: selectedRemediation?.executionStrategy === "custom-command" ? customCommand.trim() : null,
         }),
       });
 
@@ -507,6 +536,10 @@ export default function HealingDashboardPage() {
     selectedTargetHasFailure || hasFailureTargets || status.state === "running";
 
   const remediationOptions = useMemo<RemediationOption[]>(() => {
+    if (llmRemediationOptions.length) {
+      return llmRemediationOptions;
+    }
+
     const baseName = selectedTarget?.kind === "deployment" ? "deployment" : "pod";
     const scaleUpScore = scenario === "high-cpu" ? 92 : 84;
     const restartScore = scenario === "pod-crash" ? 89 : 77;
@@ -521,6 +554,8 @@ export default function HealingDashboardPage() {
         tradeoff: ["Costs extra CPU/memory", "Does not fix the original crash cause directly"],
         score: scaleUpScore,
         estimatedCost: "Moderate resource cost, low disruption",
+        executionStrategy: "scale-replicas" as const,
+        source: "fallback" as const,
       },
       {
         id: "restart-workload",
@@ -530,6 +565,8 @@ export default function HealingDashboardPage() {
         tradeoff: ["Brief downtime possible", "May just mask a deeper dependency problem"],
         score: restartScore,
         estimatedCost: "Low cost, short disruption window",
+        executionStrategy: "restart-workload" as const,
+        source: "fallback" as const,
       },
       {
         id: "dependency-first",
@@ -539,9 +576,28 @@ export default function HealingDashboardPage() {
         tradeoff: ["Slower than a direct restart", "Needs more investigation time"],
         score: dependencyScore,
         estimatedCost: "Higher analysis cost, lower repeat-failure risk",
+        executionStrategy: "dependency-first" as const,
+        source: "fallback" as const,
       },
     ].sort((a, b) => b.score - a.score);
-  }, [scenario, selectedTarget?.kind]);
+  }, [llmRemediationOptions, scenario, selectedTarget?.kind]);
+
+  const optionsWithCustom = useMemo<RemediationOption[]>(() => {
+    return [
+      ...remediationOptions,
+      {
+        id: "custom-command",
+        title: "Custom command (SRE override)",
+        summary: "Run your own healing command exactly as entered. This overrides agent strategy selection.",
+        advantage: ["Full manual control", "Useful for incident-specific one-off actions"],
+        tradeoff: ["Higher operator risk", "May execute successfully but still not heal the workload"],
+        score: 60,
+        estimatedCost: "Operator-defined",
+        executionStrategy: "custom-command",
+        source: "custom",
+      },
+    ];
+  }, [remediationOptions]);
 
   const bestRemediation = remediationOptions[0] || null;
 
@@ -557,7 +613,48 @@ export default function HealingDashboardPage() {
     }
   }, [bestRemediation, selectedRemediationId]);
 
-  const selectedRemediation = remediationOptions.find((option) => option.id === selectedRemediationId) || bestRemediation;
+  const selectedRemediation = optionsWithCustom.find((option) => option.id === selectedRemediationId) || bestRemediation;
+
+  useEffect(() => {
+    const loadOptions = async () => {
+      const explicitTarget = prefilledTarget;
+      const selected = targets.find((t) => `${t.namespace}/${t.kind}/${t.pod_name}` === selectedTargetId);
+      const targetName = selected?.pod_name || explicitTarget?.name || "";
+      const targetNamespace = selected?.namespace || explicitTarget?.namespace || "default";
+      const effectiveTargetKind = selected?.kind || explicitTarget?.kind || targetKind;
+
+      if (!targetName) {
+        setLlmRemediationOptions([]);
+        setLlmOptionsError("");
+        return;
+      }
+
+      setLlmOptionsLoading(true);
+      setLlmOptionsError("");
+      try {
+        const url = new URL("/api/ai-agents/healing/options", window.location.origin);
+        url.searchParams.set("scenario", scenario);
+        url.searchParams.set("targetName", targetName);
+        url.searchParams.set("targetNamespace", targetNamespace);
+        url.searchParams.set("targetKind", effectiveTargetKind);
+
+        const res = await fetch(url.toString(), { cache: "no-store" });
+        const data = (await res.json()) as { ok?: boolean; error?: string; options?: RemediationOption[] };
+        if (!res.ok || !data.ok || !Array.isArray(data.options)) {
+          throw new Error(data.error || `Failed to load options (${res.status})`);
+        }
+
+        setLlmRemediationOptions(data.options.slice(0, 3));
+      } catch (error) {
+        setLlmOptionsError(error instanceof Error ? error.message : String(error));
+        setLlmRemediationOptions([]);
+      } finally {
+        setLlmOptionsLoading(false);
+      }
+    };
+
+    void loadOptions();
+  }, [prefilledTarget, scenario, selectedTargetId, targetKind, targets]);
 
   return (
     <div className="space-y-4">
@@ -648,16 +745,18 @@ export default function HealingDashboardPage() {
           <div>
             <div className="text-xl font-bold tracking-tight text-[#1f2b33]">Healing decision options</div>
             <div className="text-sm text-muted">
-              Three practical choices are scored here. Pick the one you want, then click Start Healing.
+              Top three choices are fetched dynamically via Gemini. Option 4 lets you run a custom command.
             </div>
+            {llmOptionsLoading ? <div className="mt-1 text-xs text-muted">Fetching Gemini remediation options...</div> : null}
+            {llmOptionsError ? <div className="mt-1 text-xs text-red-600">Gemini options fallback: {llmOptionsError}</div> : null}
           </div>
           <div className="rounded-full bg-[#eef5ea] px-3 py-1 text-xs font-semibold text-[#4f6b3d]">
             Recommended: {bestRemediation?.title || "-"} ({bestRemediation?.score ?? 0}/100)
           </div>
         </CardHeader>
         <CardBody>
-          <div className="grid gap-3 lg:grid-cols-3">
-            {remediationOptions.map((option, index) => {
+          <div className="grid gap-3 lg:grid-cols-4">
+            {optionsWithCustom.map((option, index) => {
               const isSelected = option.id === selectedRemediationId;
               const isBest = option.id === bestRemediation?.id;
               return (
@@ -700,13 +799,33 @@ export default function HealingDashboardPage() {
                         isBest ? "bg-[#e8f5e8] text-[#3f6a3f]" : "bg-[#f3ece2] text-[#6d5a43]"
                       }`}
                     >
-                      {isBest ? "Best score" : isSelected ? "Chosen by SRE" : "Available"}
+                      {option.source === "custom"
+                        ? (isSelected ? "Chosen by SRE" : "Manual override")
+                        : isBest
+                          ? "Best score"
+                          : isSelected
+                            ? "Chosen by SRE"
+                            : "Available"}
                     </span>
                   </div>
                 </button>
               );
             })}
           </div>
+
+          {selectedRemediation?.executionStrategy === "custom-command" ? (
+            <div className="mt-3 rounded-2xl border border-[#e6dbc9] bg-[#fffaf2] p-4">
+              <div className="text-sm font-semibold text-[#1f2b33]">Option 4 command input</div>
+              <div className="mt-1 text-xs text-[#5b6872]">This command will be executed as-is when you click Start Healing.</div>
+              <textarea
+                value={customCommand}
+                onChange={(e) => setCustomCommand(e.target.value)}
+                rows={3}
+                placeholder="kubectl rollout restart deployment/paymentservice -n default"
+                className="mt-2 w-full rounded-lg border border-[#dfd4c2] bg-white px-3 py-2 text-sm"
+              />
+            </div>
+          ) : null}
 
           {selectedRemediation ? (
             <div className="mt-4 rounded-2xl border border-[#d9e7d0] bg-[#f7fbf3] p-4">

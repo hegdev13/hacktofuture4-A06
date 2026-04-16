@@ -27,9 +27,12 @@ type StartOptions = {
   targetName?: string;
   targetNamespace?: string;
   targetKind?: "pod" | "deployment";
+  remediationPreference?: "restart-workload" | "scale-replicas" | "dependency-first" | "custom-command";
+  customCommand?: string;
 };
 
 class HealingAgentRunnerService {
+  readonly version = "2026-04-17-custom-remediation-v1";
   private logs: StructuredHealingLog[] = [];
   private listeners = new Set<(event: StreamEvent) => void>();
   private issueLifecycle = new Map<string, IssueLifecycle>();
@@ -143,10 +146,6 @@ class HealingAgentRunnerService {
     this.emit({
       type: "status",
       payload: this.status,
-    });
-    this.emit({
-      type: "log",
-      payload: undefined as never,
     });
     this.emit({
       type: "lifecycle",
@@ -352,6 +351,10 @@ class HealingAgentRunnerService {
   }
 
   private runHealingProcess(issueId: string, options: StartOptions) {
+    if (options.remediationPreference === "custom-command" && options.customCommand?.trim()) {
+      return this.runCustomCommand(issueId, options.customCommand.trim());
+    }
+
     const scriptPath = path.resolve(process.cwd(), "src", "ai-agents", "self-healing-system", "main.js");
     const metricsUrl = options.metricsUrl?.trim() || process.env.METRICS_URL || "";
     const dryRun = typeof options.dryRun === "boolean" ? options.dryRun : false;
@@ -368,6 +371,7 @@ class HealingAgentRunnerService {
           MANUAL_TARGET_NAME: options.targetName || "",
           MANUAL_TARGET_NAMESPACE: options.targetNamespace || "default",
           MANUAL_TARGET_KIND: options.targetKind || "pod",
+          REMEDIATION_PREFERENCE: options.remediationPreference || "",
           LOG_LEVEL: process.env.LOG_LEVEL || "info",
         },
         stdio: ["ignore", "pipe", "pipe"],
@@ -391,6 +395,57 @@ class HealingAgentRunnerService {
           return;
         }
         reject(new Error(`Self-healing process exited with code ${code ?? -1}`));
+      });
+    });
+  }
+
+  private runCustomCommand(issueId: string, command: string) {
+    return new Promise<void>((resolve, reject) => {
+      this.appendLog({
+        agent_name: "ExecutionerAgent",
+        event_type: "FIXING",
+        issue_id: issueId,
+        description: `Executing custom healing command: ${command}`,
+        action_taken: "Running SRE custom command",
+        status: "IN_PROGRESS",
+      });
+
+      const isWindows = process.platform === "win32";
+      const child = isWindows
+        ? spawn("powershell", ["-NoProfile", "-Command", command], { cwd: process.cwd(), stdio: ["ignore", "pipe", "pipe"] })
+        : spawn("sh", ["-lc", command], { cwd: process.cwd(), stdio: ["ignore", "pipe", "pipe"] });
+
+      let stdout = "";
+      let stderr = "";
+
+      child.stdout.on("data", (chunk: Buffer) => {
+        stdout += chunk.toString("utf8");
+      });
+
+      child.stderr.on("data", (chunk: Buffer) => {
+        stderr += chunk.toString("utf8");
+      });
+
+      child.on("error", (err) => {
+        reject(err);
+      });
+
+      child.on("close", (code) => {
+        if (code === 0) {
+          this.appendLog({
+            agent_name: "ExecutionerAgent",
+            event_type: "ANALYZING",
+            issue_id: issueId,
+            description: "Custom command executed. Healing outcome must be verified from live status.",
+            action_taken: "Execution completed (no automatic health verification)",
+            status: "IN_PROGRESS",
+          });
+          resolve();
+          return;
+        }
+
+        const details = (stderr || stdout || `exit code ${code ?? -1}`).trim();
+        reject(new Error(`Custom command failed: ${details}`));
       });
     });
   }
@@ -500,9 +555,8 @@ class HealingAgentRunnerService {
   }
 
   private getRunOutcome(): "fixed" | "no-op" {
-    const lifecycle = this.getIssueLifecycle();
-    const hasAppliedFix = lifecycle.some((item) => Boolean(item.fix_applied_at));
-    return hasAppliedFix ? "fixed" : "no-op";
+    const hasResolved = this.logs.some((log) => log.event_type === "RESOLVED" && log.status === "SUCCESS");
+    return hasResolved ? "fixed" : "no-op";
   }
 }
 
@@ -510,7 +564,8 @@ declare global {
   var __healingRunnerService: HealingAgentRunnerService | undefined;
 }
 
-export const healingRunnerService = globalThis.__healingRunnerService || new HealingAgentRunnerService();
-if (!globalThis.__healingRunnerService) {
-  globalThis.__healingRunnerService = healingRunnerService;
+if (!globalThis.__healingRunnerService || globalThis.__healingRunnerService.version !== "2026-04-17-custom-remediation-v1") {
+  globalThis.__healingRunnerService = new HealingAgentRunnerService();
 }
+
+export const healingRunnerService = globalThis.__healingRunnerService;

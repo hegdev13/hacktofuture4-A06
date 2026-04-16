@@ -219,6 +219,33 @@ class ExecutionerAgent {
 
     // Apply recommendation if confidence is high enough
     const explicitDeploymentTarget = manualTargetKind === 'deployment' || rootCauseType === 'deployment';
+    const preferred = String(process.env.REMEDIATION_PREFERENCE || '').trim().toLowerCase();
+
+    if (preferred === 'restart-workload') {
+      strategy = {
+        type: explicitDeploymentTarget ? 'restart_deployment' : 'restart_pod',
+        target: explicitDeploymentTarget ? this.getDeploymentName(rootCause, clusterState) : rootCause,
+        namespace: this.getNamespace(rootCause, clusterState),
+        priority: 1,
+      };
+    } else if (preferred === 'scale-replicas') {
+      strategy = {
+        type: 'scale_up',
+        target: this.getDeploymentName(rootCause, clusterState),
+        namespace: this.getNamespace(rootCause, clusterState),
+        replicas: this.calculateReplicas(rootCause, clusterState, 1),
+        priority: 1,
+      };
+    } else if (preferred === 'dependency-first') {
+      const dep = rcaOutput.chainDetails?.find(d => d.depth > 0 && !d.health.healthy);
+      strategy = {
+        type: dep ? 'restart_dependency_first' : (explicitDeploymentTarget ? 'restart_deployment' : 'restart_pod'),
+        target: dep ? dep.name : rootCause,
+        originalTarget: rootCause,
+        namespace: this.getNamespace(dep ? dep.name : rootCause, clusterState),
+        priority: 1,
+      };
+    }
 
     if (!explicitDeploymentTarget && recommendation && recommendation.confidence >= config.memory.minConfidenceForLearning) {
       logger.info(`Using recommended fix: ${recommendation.fixType} (confidence: ${recommendation.confidence}%)`);

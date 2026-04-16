@@ -25,6 +25,8 @@ export async function POST(request: Request) {
     targetName?: string;
     targetNamespace?: string;
     targetKind?: HealingTargetKind;
+    remediationPreference?: "restart-workload" | "scale-replicas" | "dependency-first" | "custom-command";
+    customCommand?: string;
   };
 
   const result = await triggerSelfHeal(body);

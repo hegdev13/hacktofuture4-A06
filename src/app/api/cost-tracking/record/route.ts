@@ -56,15 +56,16 @@ export async function POST(request: Request) {
 
     if (error) {
       console.error("[CostTracking] DB insert error:", error);
-        console.error("[CostTracking] Failed to insert:", { stage, input_tokens, output_tokens, cost_usd });
+      console.error("[CostTracking] Failed to insert:", { stage, input_tokens, output_tokens, cost_usd });
       // Still return success but note the error
       return NextResponse.json({
         ok: true,
         data: { ...body, id: `fallback-${Date.now()}` },
         warning: error.message,
-        console.log("[CostTracking] Successfully recorded cost:", { stage, cost_usd, tokens: total_tokens });
       });
     }
+
+    console.log("[CostTracking] Successfully recorded cost:", { stage, cost_usd, tokens: total_tokens });
 
     return NextResponse.json({ ok: true, data: data?.[0] || body });
   } catch (error) {

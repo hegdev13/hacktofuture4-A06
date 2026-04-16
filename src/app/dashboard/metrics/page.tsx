@@ -28,6 +28,31 @@ type UpstreamPod = {
   restart_count?: number | null;
 };
 
+type CostSummaryResponse = {
+  total_tokens: number;
+  total_cost_usd: number;
+  total_cost_inr?: number;
+  healing_events_count: number;
+  stages: Record<string, { tokens: number; cost: number }>;
+  cost_per_heal: number;
+  cost_per_heal_inr?: number;
+  monthly_estimate: number;
+  monthly_estimate_inr?: number;
+  exchange_rate?: number;
+  record_count?: number;
+  model_filter?: string;
+  data_source?: string;
+  recent_records?: Array<{
+    stage: string;
+    model: string;
+    input_tokens: number;
+    output_tokens: number;
+    total_tokens: number;
+    cost_usd: number;
+    created_at: string | null;
+  }>;
+};
+
 function podsToRows(endpointId: string, pods: UpstreamPod[], fetchedAt: string): SnapshotRow[] {
   return pods.map((p) => ({
     id: crypto.randomUUID(),
@@ -46,6 +71,8 @@ export default function MetricsPage() {
   const endpointId = useSelectedEndpointId();
   const [rows, setRows] = useState<SnapshotRow[]>([]);
   const [fetchError, setFetchError] = useState<string | null>(null);
+  const [costSummary, setCostSummary] = useState<CostSummaryResponse | null>(null);
+  const [costError, setCostError] = useState<string | null>(null);
 
   useEffect(() => {
     if (!endpointId) {
@@ -87,6 +114,46 @@ export default function MetricsPage() {
     return () => clearInterval(id);
   }, [endpointId]);
 
+  useEffect(() => {
+    if (!endpointId) {
+      setCostSummary(null);
+      setCostError(null);
+      return;
+    }
+
+    const pollCost = async () => {
+      try {
+        const selected = await readSelectedEndpoint();
+        if (!selected) {
+          setCostSummary(null);
+          setCostError("Selected endpoint not found");
+          return;
+        }
+
+        const url = new URL("/api/cost-tracking/summary", window.location.origin);
+        url.searchParams.set("days", "30");
+        url.searchParams.set("model", "gemini");
+
+        const response = await fetch(url.toString(), { cache: "no-store" });
+        const data = (await response.json()) as CostSummaryResponse & { error?: string; details?: string };
+        if (!response.ok) {
+          throw new Error(data.error || data.details || `Request failed (${response.status})`);
+        }
+
+        setCostSummary(data);
+        setCostError(null);
+      } catch (error) {
+        setCostError(error instanceof Error ? error.message : String(error));
+      }
+    };
+
+    void pollCost();
+    const id = setInterval(() => {
+      void pollCost();
+    }, 10000);
+    return () => clearInterval(id);
+  }, [endpointId]);
+
   const latestByPod = useMemo(() => {
     const map = new Map<string, SnapshotRow>();
     for (const r of rows) {
@@ -125,6 +192,18 @@ export default function MetricsPage() {
         restarts: r.restart_count,
       }));
   }, [latestByPod]);
+
+  const stageCostBars = useMemo(() => {
+    if (!costSummary?.stages) return [];
+    return Object.entries(costSummary.stages)
+      .map(([stage, stats]) => ({
+        stage: stage.length > 22 ? `${stage.slice(0, 22)}...` : stage,
+        usd: Number(stats.cost || 0),
+        tokens: Number(stats.tokens || 0),
+      }))
+      .sort((a, b) => b.usd - a.usd)
+      .slice(0, 10);
+  }, [costSummary]);
 
   if (!endpointId) {
     return (
@@ -203,6 +282,112 @@ export default function MetricsPage() {
           </CardBody>
         </Card>
       </div>
+
+      <Card>
+        <CardHeader>
+          <div className="text-2xl font-bold tracking-tight text-[#1f2b33]">LLM Cost (Gemini · Real usage)</div>
+          <div className="text-sm text-muted">
+            Live totals from Supabase cost records for Gemini calls only.
+          </div>
+        </CardHeader>
+        <CardBody>
+          {costError ? <div className="text-sm text-danger">Could not load Gemini cost data: {costError}</div> : null}
+
+          {costSummary ? (
+            <div className="space-y-4">
+              <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+                <div className="rounded-xl bg-[#fff9ef] p-3">
+                  <div className="text-xs text-muted">Total tokens (30d)</div>
+                  <div className="mt-1 text-xl font-semibold text-[#1f2b33]">{formatNumber(costSummary.total_tokens || 0)}</div>
+                </div>
+                <div className="rounded-xl bg-[#fff9ef] p-3">
+                  <div className="text-xs text-muted">Total cost (USD)</div>
+                  <div className="mt-1 text-xl font-semibold text-[#1f2b33]">${(costSummary.total_cost_usd || 0).toFixed(6)}</div>
+                </div>
+                <div className="rounded-xl bg-[#fff9ef] p-3">
+                  <div className="text-xs text-muted">Total cost (INR)</div>
+                  <div className="mt-1 text-xl font-semibold text-[#1f2b33]">₹{(costSummary.total_cost_inr || 0).toFixed(2)}</div>
+                </div>
+                <div className="rounded-xl bg-[#fff9ef] p-3">
+                  <div className="text-xs text-muted">Gemini records</div>
+                  <div className="mt-1 text-xl font-semibold text-[#1f2b33]">{formatNumber(costSummary.record_count || 0)}</div>
+                </div>
+              </div>
+
+              <div className="grid gap-4 lg:grid-cols-2">
+                <div className="h-64 rounded-xl border border-[#ede3d3] p-2">
+                  {stageCostBars.length ? (
+                    <ResponsiveContainer width="100%" height="100%">
+                      <BarChart data={stageCostBars} layout="vertical" margin={{ left: 8, right: 8, top: 8, bottom: 8 }}>
+                        <CartesianGrid strokeDasharray="3 3" stroke="rgba(90,107,118,0.15)" />
+                        <XAxis type="number" tick={{ fill: "#6f7a84", fontSize: 12 }} />
+                        <YAxis type="category" dataKey="stage" width={150} tick={{ fill: "#6f7a84", fontSize: 11 }} />
+                        <Tooltip
+                          formatter={(value: number, key: string) =>
+                            key === "usd" ? [`$${Number(value).toFixed(6)}`, "Cost"] : [formatNumber(Number(value)), "Tokens"]
+                          }
+                          contentStyle={{ background: "#fff9f0", border: "1px solid #e7ddcd", color: "#2f3a42", fontSize: 12 }}
+                        />
+                        <Bar dataKey="usd" fill="#5a9b7d" radius={[0, 8, 8, 0]} />
+                      </BarChart>
+                    </ResponsiveContainer>
+                  ) : (
+                    <div className="text-sm text-muted">No Gemini stage cost data yet.</div>
+                  )}
+                </div>
+
+                <div className="rounded-xl border border-[#ede3d3] p-3">
+                  <div className="mb-2 text-sm font-semibold text-[#1f2b33]">Cost summary</div>
+                  <div className="space-y-1 text-sm text-[#4f5d68]">
+                    <div>Healing events: {formatNumber(costSummary.healing_events_count || 0)}</div>
+                    <div>Cost per heal: ${(costSummary.cost_per_heal || 0).toFixed(6)}</div>
+                    <div>Cost per heal (INR): ₹{(costSummary.cost_per_heal_inr || 0).toFixed(4)}</div>
+                    <div>Monthly estimate: ${(costSummary.monthly_estimate || 0).toFixed(2)}</div>
+                    <div>Monthly estimate (INR): ₹{(costSummary.monthly_estimate_inr || 0).toFixed(2)}</div>
+                    <div>USD/INR rate: {(costSummary.exchange_rate || 0).toFixed(2)}</div>
+                    <div>Model filter: {costSummary.model_filter || "gemini"}</div>
+                    <div>Data source: {costSummary.data_source || "supabase"}</div>
+                  </div>
+                </div>
+              </div>
+
+              {Array.isArray(costSummary.recent_records) && costSummary.recent_records.length ? (
+                <div className="overflow-auto">
+                  <div className="mb-2 text-sm font-semibold text-[#1f2b33]">Recent Gemini cost records</div>
+                  <table className="min-w-full text-sm">
+                    <thead className="text-xs text-muted">
+                      <tr className="border-b border-[#ede3d3]">
+                        <th className="py-2 text-left font-medium">Time</th>
+                        <th className="py-2 text-left font-medium">Stage</th>
+                        <th className="py-2 text-left font-medium">Model</th>
+                        <th className="py-2 text-left font-medium">Input</th>
+                        <th className="py-2 text-left font-medium">Output</th>
+                        <th className="py-2 text-left font-medium">Total</th>
+                        <th className="py-2 text-left font-medium">Cost (USD)</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {costSummary.recent_records.map((record, idx) => (
+                        <tr key={`${record.stage}-${record.created_at || idx}-${idx}`} className="border-b border-[#f0e7d9]">
+                          <td className="py-2 text-[#4f5d68]">{record.created_at ? new Date(record.created_at).toLocaleString() : "—"}</td>
+                          <td className="py-2 text-[#4f5d68]">{record.stage}</td>
+                          <td className="py-2 text-[#4f5d68]">{record.model}</td>
+                          <td className="py-2 text-[#4f5d68]">{formatNumber(record.input_tokens || 0)}</td>
+                          <td className="py-2 text-[#4f5d68]">{formatNumber(record.output_tokens || 0)}</td>
+                          <td className="py-2 text-[#4f5d68]">{formatNumber(record.total_tokens || 0)}</td>
+                          <td className="py-2 text-[#4f5d68]">${Number(record.cost_usd || 0).toFixed(6)}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              ) : null}
+            </div>
+          ) : (
+            <div className="text-sm text-muted">Loading Gemini cost metrics...</div>
+          )}
+        </CardBody>
+      </Card>
 
       <Card>
         <CardHeader>
