@@ -139,6 +139,10 @@ export default function DashboardOverviewPage() {
   const [fetchError, setFetchError] = useState<string | null>(null);
   const [uiReady, setUiReady] = useState(false);
   const [selectedEp, setSelectedEp] = useState<Endpoint | null>(null);
+  const [failingPodKey, setFailingPodKey] = useState<string | null>(null);
+  const [failingAllPods, setFailingAllPods] = useState(false);
+  const [failError, setFailError] = useState<string | null>(null);
+  const [failMessage, setFailMessage] = useState<string | null>(null);
 
   const poll = useCallback(async () => {
     try {
@@ -234,6 +238,92 @@ export default function DashboardOverviewPage() {
     }
   }, []);
 
+  const latestByPod = useMemo(() => {
+    const map = new Map<string, SnapshotRow>();
+    for (const r of rows) {
+      const key = `${r.namespace}/${r.pod_name}`;
+      if (!map.has(key)) map.set(key, r);
+    }
+    return Array.from(map.values()).sort((a, b) => a.pod_name.localeCompare(b.pod_name));
+  }, [rows]);
+
+  const requestFailPod = useCallback(async (podName: string, namespace: string) => {
+    const res = await fetch("/api/dashboard/fail-pod", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ podName, namespace }),
+    });
+
+    const data = (await res.json().catch(() => ({}))) as {
+      ok?: boolean;
+      error?: string;
+      action?: string;
+      targetKind?: string;
+      targetName?: string;
+    };
+
+    if (!res.ok || !data.ok) {
+      throw new Error(data.error || `Failed to fail pod (${res.status})`);
+    }
+
+    const action = data.action === "scaled_to_zero" ? "scaled to 0" : "deleted";
+    const resource = data.targetKind && data.targetName ? `${data.targetKind}/${data.targetName}` : podName;
+    return { action, resource };
+  }, []);
+
+  const failPod = useCallback(
+    async (podName: string, namespace: string) => {
+      const key = `${namespace}/${podName}`;
+      setFailError(null);
+      setFailMessage(null);
+      setFailingPodKey(key);
+      try {
+        const result = await requestFailPod(podName, namespace);
+        setFailMessage(`Failed target: ${namespace}/${result.resource} (${result.action}).`);
+      } catch (e) {
+        setFailError(e instanceof Error ? e.message : String(e));
+      } finally {
+        setFailingPodKey(null);
+        void poll();
+      }
+    },
+    [poll, requestFailPod],
+  );
+
+  const failAllPods = useCallback(async () => {
+    if (!latestByPod.length) {
+      setFailError("No pods available to fail.");
+      return;
+    }
+
+    setFailError(null);
+    setFailMessage(null);
+    setFailingAllPods(true);
+    try {
+      let success = 0;
+      let failed = 0;
+
+      for (const row of latestByPod) {
+        try {
+          await requestFailPod(row.pod_name, row.namespace);
+          success += 1;
+        } catch {
+          failed += 1;
+        }
+      }
+
+      if (failed > 0) {
+        setFailError(`Failed ${failed} pod action(s). Succeeded for ${success}.`);
+      } else {
+        setFailMessage(`Failed all visible pods successfully (${success}).`);
+      }
+    } finally {
+      setFailingAllPods(false);
+      setFailingPodKey(null);
+      void poll();
+    }
+  }, [latestByPod, poll, requestFailPod]);
+
   useEffect(() => {
     const onEp = () => {
       setHistory([]);
@@ -250,15 +340,6 @@ export default function DashboardOverviewPage() {
       window.removeEventListener("kubepulse-endpoint", onEp);
     };
   }, [poll]);
-
-  const latestByPod = useMemo(() => {
-    const map = new Map<string, SnapshotRow>();
-    for (const r of rows) {
-      const key = `${r.namespace}/${r.pod_name}`;
-      if (!map.has(key)) map.set(key, r);
-    }
-    return Array.from(map.values()).sort((a, b) => a.pod_name.localeCompare(b.pod_name));
-  }, [rows]);
 
   const cluster = useMemo(() => {
     if (summaryLatest) {
@@ -467,10 +548,23 @@ export default function DashboardOverviewPage() {
 
       <Card>
         <CardHeader>
-          <div className="text-xl font-bold tracking-tight text-[#1f2b33]">Pod health</div>
-          <div className="text-xs text-muted">
-            Latest status per pod from upstream {loading ? "(refreshing…)" : ""}
+          <div className="flex items-center justify-between gap-3">
+            <div>
+              <div className="text-xl font-bold tracking-tight text-[#1f2b33]">Pod health</div>
+              <div className="text-xs text-muted">
+                Latest status per pod from upstream {loading ? "(refreshing…)" : ""}
+              </div>
+            </div>
+            <button
+              onClick={() => void failAllPods()}
+              disabled={failingAllPods || Boolean(failingPodKey) || !latestByPod.length}
+              className="rounded-md border border-[#e3c7c7] bg-[#fff1f1] px-3 py-2 text-xs font-semibold text-[#9f3232] hover:bg-[#ffe6e6] disabled:cursor-not-allowed disabled:opacity-60"
+            >
+              {failingAllPods ? "Failing All..." : `Fail All Pods (${latestByPod.length})`}
+            </button>
           </div>
+          {failError ? <div className="text-xs font-medium text-danger">{failError}</div> : null}
+          {failMessage ? <div className="text-xs font-medium text-ok">{failMessage}</div> : null}
         </CardHeader>
         <CardBody>
           <div className="overflow-auto">
@@ -481,6 +575,7 @@ export default function DashboardOverviewPage() {
                   <th className="py-2 text-left font-medium">Namespace</th>
                   <th className="py-2 text-left font-medium">Status</th>
                   <th className="py-2 text-left font-medium">Restarts</th>
+                  <th className="py-2 text-left font-medium">Action</th>
                 </tr>
               </thead>
               <tbody>
@@ -490,11 +585,20 @@ export default function DashboardOverviewPage() {
                     <td className="py-2 text-[#4f5d68]">{r.namespace}</td>
                     <td className={cn("py-2 font-medium", statusColor(r.status))}>{r.status}</td>
                     <td className="py-2 text-[#4f5d68]">{r.restart_count}</td>
+                    <td className="py-2">
+                      <button
+                        onClick={() => void failPod(r.pod_name, r.namespace)}
+                        disabled={Boolean(failingPodKey) || failingAllPods}
+                        className="rounded-md border border-[#e3c7c7] bg-[#fff6f6] px-2 py-1 text-xs font-semibold text-[#9f3232] hover:bg-[#ffe9e9] disabled:cursor-not-allowed disabled:opacity-60"
+                      >
+                        {failingPodKey === `${r.namespace}/${r.pod_name}` ? "Failing..." : "Fail Pod"}
+                      </button>
+                    </td>
                   </tr>
                 ))}
                 {!latestByPod.length && !fetchError ? (
                   <tr>
-                    <td className="py-4 text-muted" colSpan={4}>
+                    <td className="py-4 text-muted" colSpan={5}>
                       Loading pod list…
                     </td>
                   </tr>
