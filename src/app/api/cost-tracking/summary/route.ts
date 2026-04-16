@@ -80,6 +80,21 @@ const DEMO_COSTS = [
   },
 ];
 
+async function getLiveExchangeRate(): Promise<number> {
+  try {
+    const response = await fetch(
+      "https://api.frankfurter.app/latest?from=USD&to=INR",
+      { cache: "no-store" },
+    );
+    if (!response.ok) throw new Error("Failed to fetch rate");
+    const data = (await response.json()) as { rates?: { INR?: number } };
+    return data?.rates?.INR || 93.44;
+  } catch (error) {
+    console.warn("[CostSummary] Exchange rate fetch failed, using fallback:", error);
+    return 93.44;
+  }
+}
+
 export async function GET(request: Request) {
   try {
     const url = new URL(request.url);
@@ -103,6 +118,9 @@ export async function GET(request: Request) {
         console.warn("[CostSummary] Query error, using demo data:", error);
       }
     }
+
+    // Fetch live exchange rate
+    const exchangeRate = await getLiveExchangeRate();
 
     // Aggregate by stage
     const stageStats: Record<string, { tokens: number; cost: number }> = {};
@@ -131,15 +149,24 @@ export async function GET(request: Request) {
 
     const healingEventsCount = issueIds.size || 1;
     const costPerHeal = totalCost / (healingEventsCount || 1);
-    const monthlyEstimate = costPerHeal * 1000; // Assume ~1000 healing events/month
+    const monthlyEstimate = costPerHeal * 1000;
+
+    // Convert to INR
+    const totalCostINR = totalCost * exchangeRate;
+    const costPerHealINR = costPerHeal * exchangeRate;
+    const monthlyEstimateINR = monthlyEstimate * exchangeRate;
 
     return NextResponse.json({
       total_tokens: totalTokens,
       total_cost_usd: parseFloat(totalCost.toFixed(6)),
+      total_cost_inr: parseFloat(totalCostINR.toFixed(2)),
       healing_events_count: healingEventsCount,
       stages: stageStats,
       cost_per_heal: parseFloat(costPerHeal.toFixed(6)),
+      cost_per_heal_inr: parseFloat(costPerHealINR.toFixed(2)),
       monthly_estimate: parseFloat(monthlyEstimate.toFixed(2)),
+      monthly_estimate_inr: parseFloat(monthlyEstimateINR.toFixed(2)),
+      exchange_rate: exchangeRate,
       record_count: records.length,
     });
   } catch (error) {

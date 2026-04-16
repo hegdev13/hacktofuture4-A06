@@ -43,10 +43,14 @@ type AlertHistoryRow = {
 interface CostSummary {
   total_tokens: number;
   total_cost_usd: number;
+  total_cost_inr?: number;
   healing_events_count: number;
   stages: Record<string, { tokens: number; cost: number }>;
   cost_per_heal: number;
+  cost_per_heal_inr?: number;
   monthly_estimate: number;
+  monthly_estimate_inr?: number;
+  exchange_rate?: number;
   record_count?: number;
 }
 
@@ -223,7 +227,10 @@ export default function AlertsPage() {
             <div className="grid gap-4 md:grid-cols-4">
               <div className="rounded-2xl bg-[#fffdf8] p-4 shadow-[0_10px_22px_rgba(70,86,94,0.09)]">
                 <div className="text-xs uppercase tracking-[0.12em] text-[#7d8893]">Total Cost</div>
-                <div className="mt-2 text-2xl font-bold text-[#1f2b33]">${(summary?.total_cost_usd || 0).toFixed(6)}</div>
+                <div className="mt-2 space-y-1">
+                  <div className="text-lg font-bold text-[#1f2b33]">${(summary?.total_cost_usd || 0).toFixed(6)}</div>
+                  <div className="text-sm font-semibold text-[#7d8893]">₹{(summary?.total_cost_inr || 0).toFixed(2)}</div>
+                </div>
               </div>
               <div className="rounded-2xl bg-[#fffdf8] p-4 shadow-[0_10px_22px_rgba(70,86,94,0.09)]">
                 <div className="text-xs uppercase tracking-[0.12em] text-[#7d8893]">Total Tokens</div>
@@ -235,7 +242,10 @@ export default function AlertsPage() {
               </div>
               <div className="rounded-2xl bg-[#fffdf8] p-4 shadow-[0_10px_22px_rgba(70,86,94,0.09)]">
                 <div className="text-xs uppercase tracking-[0.12em] text-[#7d8893]">Cost / Heal</div>
-                <div className="mt-2 text-2xl font-bold text-[#1f2b33]">${(summary?.cost_per_heal || 0).toFixed(6)}</div>
+                <div className="mt-2 space-y-1">
+                  <div className="text-lg font-bold text-[#1f2b33]">${(summary?.cost_per_heal || 0).toFixed(6)}</div>
+                  <div className="text-sm font-semibold text-[#7d8893]">₹{(summary?.cost_per_heal_inr || 0).toFixed(4)}</div>
+                </div>
               </div>
             </div>
           )}
@@ -391,7 +401,8 @@ export default function AlertsPage() {
                   <CardBody className="p-6">
                     <div className="space-y-2">
                       <p className="text-sm font-medium text-slate-400">Total Cost</p>
-                      <p className="text-3xl font-bold text-white">${(summary?.total_cost_usd || 0).toFixed(6)}</p>
+                      <p className="text-2xl font-bold text-white">${(summary?.total_cost_usd || 0).toFixed(6)}</p>
+                      <p className="text-sm font-semibold text-slate-300">₹{(summary?.total_cost_inr || 0).toFixed(2)}</p>
                     </div>
                   </CardBody>
                 </Card>
@@ -418,7 +429,8 @@ export default function AlertsPage() {
                   <CardBody className="p-6">
                     <div className="space-y-2">
                       <p className="text-sm font-medium text-slate-400">Cost/Heal</p>
-                      <p className="text-3xl font-bold text-white">${(summary?.cost_per_heal || 0).toFixed(6)}</p>
+                      <p className="text-2xl font-bold text-white">${(summary?.cost_per_heal || 0).toFixed(6)}</p>
+                      <p className="text-sm font-semibold text-slate-300">₹{(summary?.cost_per_heal_inr || 0).toFixed(4)}</p>
                     </div>
                   </CardBody>
                 </Card>
@@ -432,7 +444,10 @@ export default function AlertsPage() {
                       <p className="font-medium text-green-400">📈 Monthly Projection (1000 events)</p>
                       <p className="mt-1 text-sm text-green-300/80">Based on current usage patterns</p>
                     </div>
-                    <p className="text-3xl font-bold text-green-400">${(summary?.monthly_estimate || 0).toFixed(2)}</p>
+                    <div className="text-right">
+                      <p className="text-2xl font-bold text-green-400">${(summary?.monthly_estimate || 0).toFixed(2)}</p>
+                      <p className="text-sm font-semibold text-green-300">₹{(summary?.monthly_estimate_inr || 0).toFixed(0)}</p>
+                    </div>
                   </div>
                 </CardBody>
               </Card>
@@ -535,4 +550,5 @@ export default function AlertsPage() {
     </div>
   );
 }
+
 
