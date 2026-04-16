@@ -8,9 +8,11 @@ const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABAS
 
 async function getSupabase() {
   if (!supabaseUrl || !supabaseKey) {
-    console.warn("[CostTracking] Supabase credentials missing, using mock storage");
+    console.warn("[CostTracking] Supabase credentials missing");
+    console.warn(`  URL: ${supabaseUrl ? "✓" : "✗"}, Key: ${supabaseKey ? "✓" : "✗"}`);
     return null;
   }
+  console.log("[CostTracking] Supabase credentials available, connecting...");
   return createClient(supabaseUrl, supabaseKey);
 }
 
