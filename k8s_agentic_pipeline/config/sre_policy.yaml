@@ -1,0 +1,59 @@
+# SRE Policy Configuration for K8s Agentic Decision Pipeline
+# This file defines cost constraints, performance thresholds, and business impact
+
+# Cost constraints define the financial boundaries for recommendations
+cost_constraints:
+  # Maximum hourly cost increase allowed for any single action (USD)
+  max_hourly_cost_increase: 10.0
+
+  # Maximum monthly budget impact allowed (USD)
+  max_monthly_budget_impact: 500.0
+
+  # Weight between cost (1.0) and performance (0.0) priority
+  # 0.0 = pure performance priority
+  # 1.0 = pure cost priority
+  cost_vs_performance_weight: 0.7
+
+# Performance thresholds define when the system needs attention
+performance_thresholds:
+  # Maximum CPU utilization percentage before action needed
+  cpu_percent_max: 80.0
+
+  # Maximum memory utilization percentage before action needed
+  memory_percent_max: 85.0
+
+  # Maximum P95 latency in milliseconds
+  latency_p95_ms_max: 200.0
+
+  # Minimum availability percentage required
+  availability_min: 99.9
+
+  # Maximum error rate percentage allowed
+  error_rate_max: 1.0
+
+# Business impact defines the cost of incidents for ROI calculations
+business_impact:
+  # Cost per minute of complete downtime (USD)
+  downtime_cost_per_minute: 1000.0
+
+  # Cost per minute of degraded performance (USD)
+  degradation_cost_per_minute: 200.0
+
+# Cloud provider configuration for cost calculations
+cloud_provider:
+  # Provider name: aws, gcp, or azure
+  name: aws
+
+  # Region for pricing
+  region: us-east-1
+
+  # Pricing configuration (USD)
+  pricing:
+    # Cost per vCPU per hour
+    vcpu_hourly: 0.0416
+
+    # Cost per GB of memory per hour
+    memory_gb_hourly: 0.0052
+
+    # Cost per GB of network egress
+    network_gb: 0.09

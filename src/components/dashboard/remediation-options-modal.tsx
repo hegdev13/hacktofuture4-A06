@@ -5,12 +5,16 @@ type RemediationOption = {
   id: string;
   name: string;
   description: string;
+  steps: string[];
   cost: {
     downtime: string;
+    downtime_seconds: number;
     resource_impact: string;
     risk_level: string;
+    execution_time: string;
   };
   pros: string[];
+  cons: string[];
   confidence: number;
 };
 
@@ -20,6 +24,8 @@ type OptionsModalProps = {
   selectedOption: string;
   selectionReason: string;
   onClose: () => void;
+  onSelectOption: (optionId: string) => void;
+  onStartHealing: () => void;
   isLoading?: boolean;
 };
 
@@ -29,6 +35,8 @@ export function RemediationOptionsModal({
   selectedOption,
   selectionReason,
   onClose,
+  onSelectOption,
+  onStartHealing,
   isLoading = false,
 }: OptionsModalProps) {
   const [displayedOption, setDisplayedOption] = useState(0);
@@ -72,7 +80,10 @@ export function RemediationOptionsModal({
             {options.map((opt, idx) => (
               <button
                 key={opt.id}
-                onClick={() => setDisplayedOption(idx)}
+                onClick={() => {
+                  setDisplayedOption(idx);
+                  onSelectOption(opt.id);
+                }}
                 className={cn(
                   "px-4 py-2 text-sm font-semibold rounded transition",
                   displayedOption === idx
@@ -151,6 +162,13 @@ export function RemediationOptionsModal({
             className="rounded-md border border-[#d9c7b8] bg-[#f5f0e8] px-4 py-2 text-sm font-semibold text-[#4f5d68] hover:bg-[#ece5da]"
           >
             Close
+          </button>
+          <button
+            onClick={onStartHealing}
+            disabled={isLoading || !selectedOption}
+            className="rounded-md border border-[#b8d4a8] bg-[#e8f5e8] px-4 py-2 text-sm font-semibold text-[#2f5f3a] hover:bg-[#dff0df] disabled:cursor-not-allowed disabled:opacity-60"
+          >
+            {isLoading ? "Starting..." : "Start Healing with Selected"}
           </button>
           {selectedIdx >= 0 && (
             <div className="flex items-center gap-2 rounded-md bg-[#e8f5e8] px-4 py-2 text-sm font-semibold text-ok">

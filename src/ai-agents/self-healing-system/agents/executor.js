@@ -22,6 +22,37 @@ class ExecutionerAgent {
       'local-path-storage',
       'ingress-nginx',
     ]);
+    this.llmStrategy = this.readLLMStrategyFromEnv();
+    this.llmOptionSteps = this.readLLMOptionStepsFromEnv();
+  }
+
+  readLLMOptionStepsFromEnv() {
+    const raw = String(process.env.LLM_OPTION_STEPS_JSON || '').trim();
+    if (!raw) return [];
+    try {
+      const parsed = JSON.parse(raw);
+      if (!Array.isArray(parsed)) return [];
+      return parsed.map((s) => String(s || '').trim()).filter(Boolean);
+    } catch {
+      return [];
+    }
+  }
+
+  readLLMStrategyFromEnv() {
+    const type = String(process.env.LLM_STRATEGY_TYPE || '').trim();
+    if (!type) return null;
+
+    const allowed = new Set(['restart_pod', 'restart_deployment', 'scale_up', 'rollback']);
+    if (!allowed.has(type)) return null;
+
+    const replicasRaw = Number(process.env.LLM_STRATEGY_REPLICAS || 0);
+    const replicas = Number.isFinite(replicasRaw) && replicasRaw > 0 ? Math.floor(replicasRaw) : undefined;
+
+    return {
+      type,
+      replicas,
+      reason: String(process.env.LLM_STRATEGY_REASON || '').trim(),
+    };
   }
 
   /**
@@ -108,6 +139,7 @@ class ExecutionerAgent {
     const rootCause = rcaOutput.rootCause;
     const rootCauseType = rcaOutput.rootCauseType;
     const manualTargetKind = rcaOutput.manualTargetKind;
+    const manualTargetNamespace = rcaOutput.manualTargetNamespace;
     const failureChain = rcaOutput.failureChain;
 
     // First issue in chain gives context
@@ -115,6 +147,35 @@ class ExecutionerAgent {
     const primaryReason = rcaOutput.chainDetails?.[0]?.health?.reason || '';
     const primaryIssueLower = String(primaryIssue || '').toLowerCase();
     const primaryReasonLower = String(primaryReason || '').toLowerCase();
+    let strategy;
+
+    if (this.llmOptionSteps.length > 0) {
+      const namespace = manualTargetNamespace || this.getNamespace(rootCause, clusterState);
+      return {
+        type: 'runbook_steps',
+        target: this.getDeploymentName(rootCause, clusterState),
+        namespace,
+        steps: this.llmOptionSteps,
+        priority: 0,
+      };
+    }
+
+    if (this.llmStrategy) {
+      strategy = {
+        type: this.llmStrategy.type,
+        target: this.llmStrategy.type === 'restart_pod' ? rootCause : this.getDeploymentName(rootCause, clusterState),
+        namespace: manualTargetNamespace || this.getNamespace(rootCause, clusterState),
+        replicas: this.llmStrategy.replicas,
+        priority: 0,
+      };
+
+      if (strategy.type === 'scale_up' && (!strategy.replicas || strategy.replicas < 1)) {
+        strategy.replicas = this.calculateReplicas(rootCause, clusterState, 1);
+      }
+
+      logger.info(`Using LLM-selected strategy: ${strategy.type}${this.llmStrategy.reason ? ` (${this.llmStrategy.reason})` : ''}`);
+      return strategy;
+    }
 
     if (
       primaryIssueLower.includes('image_pull') ||
@@ -133,7 +194,7 @@ class ExecutionerAgent {
     }
 
     // Strategy selection logic
-    let strategy = {
+    strategy = {
       type: manualTargetKind === 'deployment' || rootCauseType === 'deployment' ? 'restart_deployment' : 'restart_pod',
       target: rootCause,
       namespace: this.getNamespace(rootCause, clusterState),
@@ -277,6 +338,10 @@ class ExecutionerAgent {
       let result;
 
       switch (strategy.type) {
+        case 'runbook_steps':
+          result = this.executeRunbookSteps(strategy.steps, strategy.namespace);
+          break;
+
         case 'restart_pod':
           result = this.restartPod(strategy.target, strategy.namespace);
           break;
@@ -625,6 +690,63 @@ class ExecutionerAgent {
     return { output, command: `kubectl ${args.join(' ')}` };
   }
 
+  tokenizeCommand(command) {
+    const matches = String(command || '').match(/(?:[^\s\"]+|\"[^\"]*\")+/g) || [];
+    return matches.map((t) => t.replace(/^\"|\"$/g, ''));
+  }
+
+  ensureNamespaceArg(args, namespace) {
+    const hasNamespace = args.includes('-n') || args.includes('--namespace') || args.includes('-A') || args.includes('--all-namespaces');
+    if (hasNamespace || !namespace) return args;
+    return [...args, '-n', namespace];
+  }
+
+  executeRunbookSteps(steps, namespace) {
+    if (!Array.isArray(steps) || steps.length === 0) {
+      return {
+        status: 'failed',
+        message: 'Selected option contains no executable steps',
+      };
+    }
+
+    const outputs = [];
+
+    try {
+      for (const step of steps) {
+        const tokens = this.tokenizeCommand(step);
+        if (tokens.length === 0) continue;
+        if (tokens[0] !== 'kubectl') {
+          return {
+            status: 'failed',
+            message: `Unsupported step (only kubectl commands are allowed): ${step}`,
+          };
+        }
+
+        const args = this.ensureNamespaceArg(tokens.slice(1), namespace);
+        const output = this.runKubectl(args, this.timeoutMs);
+        outputs.push({ step, command: `kubectl ${args.join(' ')}`, output });
+      }
+
+      return {
+        status: this.dryRun ? 'simulated' : 'success',
+        message: `Executed ${steps.length} selected option step(s)`,
+        action: {
+          type: 'RUNBOOK',
+          resource: 'deployment',
+          name: 'selected-option',
+          namespace,
+          message: 'Executed selected remediation option commands',
+        },
+        metadata: { steps: outputs },
+      };
+    } catch (error) {
+      return {
+        status: 'failed',
+        message: `Runbook step execution failed: ${error.message}`,
+      };
+    }
+  }
+
   /**
    * Verify that a fix was applied successfully
    */
@@ -756,7 +878,7 @@ class ExecutionerAgent {
    */
   validateStrategy(strategy) {
     if (!strategy || !strategy.type) return false;
-    if (!this.strategies.includes(strategy.type)) return false;
+    if (strategy.type !== 'runbook_steps' && !this.strategies.includes(strategy.type)) return false;
     if (!strategy.target) return false;
     if (strategy.namespace && this.protectedNamespaces.has(String(strategy.namespace).toLowerCase())) {
       logger.warn(`Blocked unsafe fix in protected namespace: ${strategy.namespace}`);

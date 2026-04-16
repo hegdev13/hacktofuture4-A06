@@ -170,18 +170,44 @@ class SelfHealingSystem {
 
       if (manualTarget) {
         if (manualTarget.kind === 'deployment') {
-          logger.timelineEvent('fix', `Executing explicit deployment restart for ${manualTarget.namespace}/${manualTarget.name}`);
+          logger.timelineEvent('fix', `Executing explicit deployment healing for ${manualTarget.namespace}/${manualTarget.name}`);
           this.setAgentStatus('executor', 'running', {
             step: 'executing',
-            fixType: 'restart_deployment',
+            fixType: 'option_selected',
             target: manualTarget.name,
             status: 'running',
           });
 
-          const fixResult = executor.restartDeployment(manualTarget.name, manualTarget.namespace);
+          const selectedOptionSteps =
+            typeof executor.readLLMOptionStepsFromEnv === 'function'
+              ? executor.readLLMOptionStepsFromEnv()
+              : [];
+
+          let fixResult;
+          if (Array.isArray(selectedOptionSteps) && selectedOptionSteps.length > 0) {
+            logger.timelineEvent('fix', `Executing selected option commands for ${manualTarget.namespace}/${manualTarget.name}`);
+            fixResult = executor.executeRunbookSteps(selectedOptionSteps, manualTarget.namespace);
+          } else {
+            const manualRcaOutput = {
+              rootCause: manualTarget.name,
+              rootCauseType: 'deployment',
+              manualTargetKind: 'deployment',
+              manualTargetNamespace: manualTarget.namespace,
+              failureChain: ['manual_target_selected'],
+              chainDetails: [{ depth: 0, name: manualTarget.name, health: { healthy: false, reason: 'manual-target' } }],
+              affectedResources: [manualTarget.name],
+            };
+
+            fixResult = await executor.executeFix(manualRcaOutput, currentState);
+          }
           let verification = null;
 
-          if (fixResult.status === 'success' && !this.getExecutionMode().dryRun && executor.verifyFixes !== false) {
+          if (
+            fixResult.status === 'success' &&
+            fixResult.action?.type !== 'RUNBOOK' &&
+            !this.getExecutionMode().dryRun &&
+            executor.verifyFixes !== false
+          ) {
             verification = await executor.verifyFix(fixResult.action, currentState);
           }
 
@@ -1139,8 +1165,42 @@ const system = new SelfHealingSystem();
 // Export for programmatic use
 module.exports = system;
 
+function readCliArgValue(prefix) {
+  const hit = process.argv.find((arg) => arg.startsWith(prefix));
+  if (!hit) return '';
+  return hit.slice(prefix.length);
+}
+
 // Run if called directly
 if (require.main === module) {
+  const optionStepsB64 = readCliArgValue('--llm-option-steps-b64=');
+  if (optionStepsB64 && !process.env.LLM_OPTION_STEPS_JSON) {
+    try {
+      process.env.LLM_OPTION_STEPS_JSON = Buffer.from(optionStepsB64, 'base64').toString('utf8');
+    } catch {
+      // Ignore malformed value and continue with environment defaults.
+    }
+  }
+
+  const llmStrategyTypeArg = readCliArgValue('--llm-strategy-type=');
+  if (llmStrategyTypeArg && !process.env.LLM_STRATEGY_TYPE) {
+    process.env.LLM_STRATEGY_TYPE = llmStrategyTypeArg;
+  }
+
+  const llmStrategyReplicasArg = readCliArgValue('--llm-strategy-replicas=');
+  if (llmStrategyReplicasArg && !process.env.LLM_STRATEGY_REPLICAS) {
+    process.env.LLM_STRATEGY_REPLICAS = llmStrategyReplicasArg;
+  }
+
+  const llmStrategyReasonB64 = readCliArgValue('--llm-strategy-reason-b64=');
+  if (llmStrategyReasonB64 && !process.env.LLM_STRATEGY_REASON) {
+    try {
+      process.env.LLM_STRATEGY_REASON = Buffer.from(llmStrategyReasonB64, 'base64').toString('utf8');
+    } catch {
+      // Ignore malformed value and continue with environment defaults.
+    }
+  }
+
   // Check if metrics URL is provided via environment
   if (process.env.METRICS_URL) {
     system.setMetricsUrl(process.env.METRICS_URL);

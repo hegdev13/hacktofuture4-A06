@@ -9,5 +9,9 @@ export async function triggerSelfHeal(input = {}) {
     targetName: input.targetName,
     targetNamespace: input.targetNamespace,
     targetKind: input.targetKind,
+    selectedOption: input.selectedOption,
+    selectionReason: input.selectionReason,
+    selectedOptionSteps: input.selectedOptionSteps,
+    decisionOptions: input.decisionOptions,
   });
 }

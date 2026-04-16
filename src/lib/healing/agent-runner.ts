@@ -27,6 +27,10 @@ type StartOptions = {
   targetName?: string;
   targetNamespace?: string;
   targetKind?: "pod" | "deployment";
+  llmStrategyType?: "restart_pod" | "restart_deployment" | "scale_up" | "rollback";
+  llmStrategyReplicas?: number;
+  llmStrategyReason?: string;
+  llmOptionSteps?: string[];
 };
 
 class HealingAgentRunnerService {
@@ -356,9 +360,25 @@ class HealingAgentRunnerService {
     const metricsUrl = options.metricsUrl?.trim() || process.env.METRICS_URL || "";
     const dryRun = typeof options.dryRun === "boolean" ? options.dryRun : false;
     const strictLive = typeof options.strictLive === "boolean" ? options.strictLive : true;
+    const childArgs = [scriptPath];
+
+    if (Array.isArray(options.llmOptionSteps) && options.llmOptionSteps.length > 0) {
+      const encoded = Buffer.from(JSON.stringify(options.llmOptionSteps), "utf8").toString("base64");
+      childArgs.push(`--llm-option-steps-b64=${encoded}`);
+    }
+    if (options.llmStrategyType) {
+      childArgs.push(`--llm-strategy-type=${options.llmStrategyType}`);
+    }
+    if (typeof options.llmStrategyReplicas === "number" && Number.isFinite(options.llmStrategyReplicas)) {
+      childArgs.push(`--llm-strategy-replicas=${String(options.llmStrategyReplicas)}`);
+    }
+    if (options.llmStrategyReason) {
+      const encoded = Buffer.from(options.llmStrategyReason, "utf8").toString("base64");
+      childArgs.push(`--llm-strategy-reason-b64=${encoded}`);
+    }
 
     return new Promise<void>((resolve, reject) => {
-      const child = spawn(process.execPath, [scriptPath], {
+      const child = spawn(process.execPath, childArgs, {
         cwd: process.cwd(),
         env: {
           ...process.env,
@@ -368,6 +388,16 @@ class HealingAgentRunnerService {
           MANUAL_TARGET_NAME: options.targetName || "",
           MANUAL_TARGET_NAMESPACE: options.targetNamespace || "default",
           MANUAL_TARGET_KIND: options.targetKind || "pod",
+          LLM_STRATEGY_TYPE: options.llmStrategyType || "",
+          LLM_STRATEGY_REPLICAS:
+            typeof options.llmStrategyReplicas === "number" && Number.isFinite(options.llmStrategyReplicas)
+              ? String(options.llmStrategyReplicas)
+              : "",
+          LLM_STRATEGY_REASON: options.llmStrategyReason || "",
+          LLM_OPTION_STEPS_JSON:
+            Array.isArray(options.llmOptionSteps) && options.llmOptionSteps.length > 0
+              ? JSON.stringify(options.llmOptionSteps)
+              : "",
           LOG_LEVEL: process.env.LOG_LEVEL || "info",
         },
         stdio: ["ignore", "pipe", "pipe"],

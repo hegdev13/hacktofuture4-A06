@@ -4,6 +4,41 @@ import { join } from "node:path";
 const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-1.5-flash";
 const INPUT_COST_PER_1K = Number(process.env.GEMINI_INPUT_COST_PER_1K || 0.000075);
 const OUTPUT_COST_PER_1K = Number(process.env.GEMINI_OUTPUT_COST_PER_1K || 0.0003);
+const DEFAULT_GEMINI_BASE_URL = "https://generativelanguage.googleapis.com";
+
+function getGeminiBaseUrl() {
+  return (
+    process.env.GOOGLE_GEMINI_BASE_URL ||
+    process.env.GEMINI_API_BASE_URL ||
+    process.env.GEMINI_BASEURL ||
+    process.env.GEMINI_BASE_URL ||
+    DEFAULT_GEMINI_BASE_URL
+  ).replace(/\/+$/, "");
+}
+
+function buildGeminiRequestConfig(apiKey) {
+  const baseUrl = getGeminiBaseUrl();
+  const endpoint = `/v1beta/models/${encodeURIComponent(GEMINI_MODEL)}:generateContent`;
+  const isDirectGoogleApi = /(^https?:\/\/)?([^/]+\.)?generativelanguage\.googleapis\.com/i.test(baseUrl);
+
+  if (isDirectGoogleApi) {
+    return {
+      url: `${baseUrl}${endpoint}?key=${encodeURIComponent(apiKey)}`,
+      headers: { "Content-Type": "application/json" },
+      viaTokentapProxy: false,
+    };
+  }
+
+  // tokentap proxy mode: keep API key in header and forward through local base URL.
+  return {
+    url: `${baseUrl}${endpoint}`,
+    headers: {
+      "Content-Type": "application/json",
+      "x-goog-api-key": apiKey,
+    },
+    viaTokentapProxy: true,
+  };
+}
 
 function clamp01(value) {
   const n = Number(value);
@@ -144,11 +179,10 @@ function promptForTask(task, context) {
 
 async function runSingleTask(task, context, apiKey) {
   const prompt = promptForTask(task, context);
-
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(GEMINI_MODEL)}:generateContent?key=${encodeURIComponent(apiKey)}`;
-  const response = await fetch(url, {
+  const requestConfig = buildGeminiRequestConfig(apiKey);
+  const response = await fetch(requestConfig.url, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: requestConfig.headers,
     body: JSON.stringify({
       contents: [{ role: "user", parts: [{ text: prompt }] }],
       generationConfig: {
@@ -183,6 +217,7 @@ async function runSingleTask(task, context, apiKey) {
   const cost = computeCost(inputTokens, outputTokens);
   normalized.metadata.cost_usd = Number(cost.toFixed(6));
   normalized.metadata.model = GEMINI_MODEL;
+  normalized.metadata.via_tokentap_proxy = requestConfig.viaTokentapProxy;
   printLLMLogTable(normalized, cost);
 
   appendStructuredLog({
@@ -191,6 +226,7 @@ async function runSingleTask(task, context, apiKey) {
       ...normalized.metadata,
       model: GEMINI_MODEL,
       cost_usd: Number(cost.toFixed(6)),
+      via_tokentap_proxy: requestConfig.viaTokentapProxy,
       timestamp: new Date().toISOString(),
     },
   });

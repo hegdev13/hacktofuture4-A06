@@ -3,6 +3,39 @@ import "server-only";
 import type { AgentRunnerStatus, HealingSummary, StructuredHealingLog } from "@/lib/healing/types";
 
 const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-1.5-flash";
+const DEFAULT_GEMINI_BASE_URL = "https://generativelanguage.googleapis.com";
+
+function getGeminiBaseUrl(): string {
+  return (
+    process.env.GOOGLE_GEMINI_BASE_URL ||
+    process.env.GEMINI_API_BASE_URL ||
+    process.env.GEMINI_BASEURL ||
+    process.env.GEMINI_BASE_URL ||
+    DEFAULT_GEMINI_BASE_URL
+  ).replace(/\/+$/, "");
+}
+
+function buildGeminiRequest(apiKey: string): { url: string; headers: Record<string, string> } {
+  const baseUrl = getGeminiBaseUrl();
+  const endpoint = `/v1beta/models/${encodeURIComponent(GEMINI_MODEL)}:generateContent`;
+  const isDirectGoogleApi = /(^https?:\/\/)?([^/]+\.)?generativelanguage\.googleapis\.com/i.test(baseUrl);
+
+  if (isDirectGoogleApi) {
+    return {
+      url: `${baseUrl}${endpoint}?key=${encodeURIComponent(apiKey)}`,
+      headers: { "Content-Type": "application/json" },
+    };
+  }
+
+  // tokentap proxy mode: keep auth in header while preserving provider path detection.
+  return {
+    url: `${baseUrl}${endpoint}`,
+    headers: {
+      "Content-Type": "application/json",
+      "x-goog-api-key": apiKey,
+    },
+  };
+}
 
 function fallbackSummary(logs: StructuredHealingLog[], status: AgentRunnerStatus): HealingSummary {
   const last = logs.at(-1);
@@ -89,12 +122,12 @@ export async function generateGeminiHealingSummary(
     `Logs: ${JSON.stringify(compactLogs)}`,
   ].join("\n");
 
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(GEMINI_MODEL)}:generateContent?key=${encodeURIComponent(apiKey)}`;
+  const request = buildGeminiRequest(apiKey);
 
   try {
-    const response = await fetch(url, {
+    const response = await fetch(request.url, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: request.headers,
       body: JSON.stringify({
         contents: [{ role: "user", parts: [{ text: prompt }] }],
         generationConfig: {

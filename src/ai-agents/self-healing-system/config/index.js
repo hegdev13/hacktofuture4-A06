@@ -46,6 +46,7 @@ const config = {
     verifyFixes: process.env.VERIFY_FIXES !== 'false', // Verify fixes after execution (default: true)
     verifyTimeoutMs: 60000, // Max time to wait for fix verification
     strategies: [
+      'runbook_steps',
       'restart_pod',
       'restart_deployment',
       'scale_up',

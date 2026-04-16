@@ -1,4 +1,4 @@
-#Codeclan
+# Codeclan
 
 ## KubePulse (Supabase-powered Kubernetes monitoring dashboard)
 
@@ -53,6 +53,30 @@ npm run dev
 ```
 
 Open `http://localhost:3000`.
+
+### Optional: Tokentap for LLM cost-per-call tracking
+
+This repo now supports running Gemini calls through a local tokentap proxy.
+
+1. Install Python deps:
+
+```bash
+pip install -r requirements.txt
+```
+
+1. Start tokentap in terminal 1:
+
+```bash
+npm run tokentap:start
+```
+
+1. Start app through tokentap base URL in terminal 2:
+
+```bash
+npm run dev:tokentap
+```
+
+Per-call LLM cost (`cost_usd`) continues to be logged in `logs/llm-agent-logs.jsonl`, and requests can be inspected in tokentap's live dashboard.
 
 ---
 
@@ -126,7 +150,6 @@ curl -X POST "http://localhost:3000/api/healing-actions" ^
 ```
 
 These events show up in `/dashboard/alerts` in real time.
-
 
 You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
 

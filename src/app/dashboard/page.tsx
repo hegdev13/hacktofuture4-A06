@@ -170,6 +170,13 @@ function summarizePods(pods: UpstreamPod[]) {
   };
 }
 
+function deploymentNameFromPodName(podName: string) {
+  const parts = String(podName || "").split("-");
+  if (parts.length >= 3) return parts.slice(0, -2).join("-");
+  if (parts.length >= 2) return parts.slice(0, -1).join("-");
+  return podName;
+}
+
 export default function DashboardOverviewPage() {
   const [rows, setRows] = useState<SnapshotRow[]>([]);
   const [stickyFailedRows, setStickyFailedRows] = useState<Record<string, SnapshotRow>>({});
@@ -188,6 +195,7 @@ export default function DashboardOverviewPage() {
   const [decisionAnalysis, setDecisionAnalysis] = useState<DecisionAnalysisData | null>(null);
   const [showOptionsModal, setShowOptionsModal] = useState(false);
   const [isHealingInProgress, setIsHealingInProgress] = useState(false);
+  const [healingTarget, setHealingTarget] = useState<{ podName: string; namespace: string } | null>(null);
 
   const poll = useCallback(async () => {
     try {
@@ -228,12 +236,18 @@ export default function DashboardOverviewPage() {
       }));
         setRows(podsToRows(sel.id, normalized, fetchedAt));
         setStickyFailedRows((prev) => {
-          const liveKeys = new Set(normalized.map((p) => `${p.namespace ?? "default"}/${p.pod_name}`));
+          const recoveredWorkloads = new Set(
+            normalized
+              .filter((p) => String(p.status || "").toLowerCase().includes("running"))
+              .map((p) => `${p.namespace ?? "default"}/${deploymentNameFromPodName(p.pod_name)}`),
+          );
           const next = { ...prev };
           for (const key of Object.keys(next)) {
-            if (liveKeys.has(key)) {
+            const [ns, podName] = key.split("/");
+            const workloadKey = `${ns}/${deploymentNameFromPodName(podName || "")}`;
+            if (recoveredWorkloads.has(workloadKey)) {
               delete next[key];
-          }
+            }
           }
           return next;
         });
@@ -422,11 +436,77 @@ export default function DashboardOverviewPage() {
   }, [failablePods, markPodAsFailed, poll, requestFailPod]);
 
   const startHealing = useCallback(async () => {
-    setIsHealingInProgress(true);
+    const failedCount = latestByPod.filter((p) => {
+      const s = String(p.status || "").toLowerCase();
+      return s.includes("failed") || s.includes("crash") || s.includes("backoff") || s.includes("error") || s.includes("pending");
+    }).length;
+
+    const failedCandidate =
+      latestByPod.find((p) => {
+        const s = String(p.status || "").toLowerCase();
+        return s.includes("failed") || s.includes("crash") || s.includes("backoff") || s.includes("error") || s.includes("pending");
+      }) || latestByPod[0];
+
+    if (!failedCandidate) {
+      setFailError("No pod available to heal.");
+      return;
+    }
+
+    setHealingTarget({ podName: failedCandidate.pod_name, namespace: failedCandidate.namespace });
     setShowOptionsModal(true);
     setDecisionAnalysis(null);
-    
+    setIsHealingInProgress(true);
+
     try {
+      const res = await fetch("/api/self-heal", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          preview: true,
+          scenario: "pod-crash",
+          metricsUrl: selectedEp?.ngrok_url,
+          rootCause: deploymentNameFromPodName(failedCandidate.pod_name),
+          failureChain: [failedCandidate.status],
+          affectedCount: failedCount,
+          targetName: deploymentNameFromPodName(failedCandidate.pod_name),
+          targetNamespace: failedCandidate.namespace,
+          targetKind: "deployment",
+        }),
+      });
+
+      const data = await res.json();
+      if (!res.ok || !data?.ok || !data?.decision?.options?.length) {
+        throw new Error(data?.error || "Failed to load LLM remediation options");
+      }
+
+      setDecisionAnalysis({
+        options: data.decision.options,
+        selected_option: data.decision.selected_option || data.decision.options[0].id,
+        selection_reason: data.decision.selection_reason || "Chosen by LLM",
+        root_cause: data.decision.root_cause || deploymentNameFromPodName(failedCandidate.pod_name),
+        affected_resources_count: data.decision.affected_resources_count || failedCount,
+      });
+    } catch (error) {
+      setShowOptionsModal(false);
+      setFailError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setIsHealingInProgress(false);
+    }
+  }, [latestByPod, selectedEp?.ngrok_url]);
+
+  const executeSelectedHealing = useCallback(async () => {
+    if (!decisionAnalysis?.selected_option || !healingTarget) {
+      setFailError("Select a remediation option first.");
+      return;
+    }
+
+    setIsHealingInProgress(true);
+    setFailError(null);
+    setFailMessage(null);
+    try {
+      const selectedOptionDetails =
+        decisionAnalysis.options.find((opt) => opt.id === decisionAnalysis.selected_option) || null;
+
       const response = await fetch("/api/self-heal", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -435,50 +515,33 @@ export default function DashboardOverviewPage() {
           dryRun: false,
           metricsUrl: selectedEp?.ngrok_url,
           strictLive: false,
+          targetName: deploymentNameFromPodName(healingTarget.podName),
+          targetNamespace: healingTarget.namespace,
+          targetKind: "deployment",
+          selectedOption: decisionAnalysis.selected_option,
+          selectionReason: decisionAnalysis.selection_reason,
+          decisionOptions: decisionAnalysis.options,
+          selectedOptionSteps: Array.isArray(selectedOptionDetails?.steps) ? selectedOptionDetails.steps : [],
         }),
       });
 
       const data = await response.json();
-      
-      if (data.ok) {
-        // Fetch decision analysis after a short delay to allow backend processing
-        setTimeout(async () => {
-          try {
-            const page = new URL(window.location.href);
-            const issueId = page.searchParams.get("issue_id") || (data.status?.activeIssueId || "unknown");
-            
-            const analysisRes = await fetch(
-              `/api/healing/decision-analysis?issue_id=${encodeURIComponent(issueId)}`
-            );
-            
-            if (analysisRes.ok) {
-              const analysisData = await analysisRes.json();
-              if (analysisData.ok && analysisData.data?.raw) {
-                setDecisionAnalysis({
-                  options: analysisData.data.raw.options || [],
-                  selected_option: analysisData.data.raw.selected_option || "",
-                  selection_reason: analysisData.data.raw.selection_reason || "",
-                  root_cause: analysisData.data.raw.root_cause || "unknown",
-                  affected_resources_count: analysisData.data.raw.affected_resources_count || 0,
-                });
-              }
-            }
-          } catch (err) {
-            console.error("Error fetching decision analysis:", err);
-          }
-        }, 2000);
-
-        void poll();
-      } else {
-        setShowOptionsModal(false);
+      if (!response.ok || !data?.ok) {
+        throw new Error(data?.details || data?.error || `Failed to start healing (${response.status})`);
       }
-    } catch (error) {
-      console.error("Healing error:", error);
+
       setShowOptionsModal(false);
+      setFailMessage(`Healing started for ${healingTarget.namespace}/${deploymentNameFromPodName(healingTarget.podName)}.`);
+      void poll();
+      setTimeout(() => {
+        void poll();
+      }, 3500);
+    } catch (error) {
+      setFailError(error instanceof Error ? error.message : String(error));
     } finally {
       setIsHealingInProgress(false);
     }
-  }, [selectedEp?.ngrok_url, poll]);
+  }, [decisionAnalysis, healingTarget, poll, selectedEp?.ngrok_url]);
 
   useEffect(() => {
     const onEp = () => {
@@ -819,6 +882,10 @@ export default function DashboardOverviewPage() {
         selectedOption={decisionAnalysis?.selected_option || ""}
         selectionReason={decisionAnalysis?.selection_reason || ""}
         onClose={() => setShowOptionsModal(false)}
+        onSelectOption={(optionId) =>
+          setDecisionAnalysis((prev) => (prev ? { ...prev, selected_option: optionId } : prev))
+        }
+        onStartHealing={() => void executeSelectedHealing()}
         isLoading={isHealingInProgress}
       />
     </div>

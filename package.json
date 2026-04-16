@@ -4,8 +4,10 @@
   "private": true,
   "scripts": {
     "dev": "next dev",
+    "dev:tokentap": "GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:8080 npm run dev",
     "build": "next build",
     "start": "next start",
+    "tokentap:start": "tokentap start --port 8080",
     "lint": "eslint",
     "train:rca-model": "python3 ai_agents/lightgbm_rca.py --mode train --output-dir ai_agents/models --rows 12000",
     "sim:load": "node scripts/push-cpu-pattern.cjs --profile high --duration 120 --interval 2",
