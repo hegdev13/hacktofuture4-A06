@@ -7,7 +7,6 @@ interface Pod {
   id: string;
   name: string;
   status: "running" | "failed" | "pending";
-  failureType?: "healthy" | "root-cause" | "cascading";
   message?: string;
   dependsOn?: string[];
 }
@@ -47,13 +46,7 @@ export function DependencyTree({ pods }: DependencyTreeProps) {
     setExpandedPods(newExpanded);
   };
 
-  const getStatusIcon = (status: string, failureType?: Pod["failureType"]) => {
-    if (failureType === "root-cause") {
-      return <AlertCircle className="w-4 h-4 text-rose-400" />;
-    }
-    if (failureType === "cascading") {
-      return <Zap className="w-4 h-4 text-amber-400" />;
-    }
+  const getStatusIcon = (status: string) => {
     switch (status) {
       case "running":
         return <CheckCircle className="w-4 h-4 text-emerald-400" />;
@@ -66,13 +59,7 @@ export function DependencyTree({ pods }: DependencyTreeProps) {
     }
   };
 
-  const getStatusBgColor = (status: string, failureType?: Pod["failureType"], isRootCause: boolean = false) => {
-    if (isRootCause || failureType === "root-cause") {
-      return "bg-red-900/40 border border-red-700/60 hover:bg-red-900/60";
-    }
-    if (failureType === "cascading") {
-      return "bg-amber-900/25 border border-amber-700/60 hover:bg-amber-900/35";
-    }
+  const getStatusBgColor = (status: string) => {
     switch (status) {
       case "running":
         return "bg-emerald-900/20 border border-emerald-700/40 hover:bg-emerald-900/30";
@@ -85,13 +72,7 @@ export function DependencyTree({ pods }: DependencyTreeProps) {
     }
   };
 
-  const getTextColor = (status: string, failureType?: Pod["failureType"], isRootCause: boolean = false) => {
-    if (isRootCause || failureType === "root-cause") {
-      return "text-red-300";
-    }
-    if (failureType === "cascading") {
-      return "text-amber-300";
-    }
+  const getTextColor = (status: string) => {
     switch (status) {
       case "running":
         return "text-emerald-300";
@@ -104,43 +85,18 @@ export function DependencyTree({ pods }: DependencyTreeProps) {
     }
   };
 
-  const findRootCausePods = () => {
-    const flaggedRoots = pods.filter((p) => p.failureType === "root-cause").map((p) => p.id);
-    if (flaggedRoots.length) {
-      return new Set(flaggedRoots);
-    }
-
-    const failedPods = pods.filter((p) => p.status === "failed");
-    const rootCauses = new Set<string>();
-
-    failedPods.forEach((pod) => {
-      if (pod.dependsOn) {
-        pod.dependsOn.forEach((depId) => {
-          const depPod = pods.find((p) => p.id === depId);
-          if (depPod?.status === "failed") {
-            rootCauses.add(depId);
-          }
-        });
-      }
-    });
-
-    return rootCauses;
-  };
-
-  const rootCausePods = findRootCausePods();
   const hasIssues = pods.some(p => p.status !== "running");
 
   const renderPodNode = (pod: Pod, level: number = 0) => {
     const isDependencyNode = dependentMap.get(pod.id);
     const isExpanded = expandedPods.has(pod.id);
-    const isRootCause = rootCausePods.has(pod.id);
 
     return (
       <div key={pod.id}>
         <div
           className={`
             flex items-center gap-2 px-3 py-2 rounded-lg border transition-all cursor-pointer
-            ${getStatusBgColor(pod.status, pod.failureType, isRootCause)}
+            ${getStatusBgColor(pod.status)}
           `}
           style={{ marginLeft: `${level * 24}px` }}
           onClick={() => isDependencyNode && toggleExpand(pod.id)}
@@ -159,22 +115,15 @@ export function DependencyTree({ pods }: DependencyTreeProps) {
           </div>
 
           {/* Status icon */}
-          <div className="flex-shrink-0">{getStatusIcon(pod.status, pod.failureType)}</div>
+          <div className="flex-shrink-0">{getStatusIcon(pod.status)}</div>
 
           {/* Pod name and info */}
           <div className="flex-1 min-w-0">
             <div className="flex items-center gap-2 flex-wrap">
-              <span className={`font-medium text-sm ${getTextColor(pod.status, pod.failureType, isRootCause)}`}>
+              <span className={`font-medium text-sm ${getTextColor(pod.status)}`}>
                 {pod.name}
               </span>
-              {isRootCause && (
-                <span className="text-xs font-bold bg-red-600 text-white px-2 py-0.5 rounded-full">
-                  ROOT CAUSE
-                </span>
-              )}
-              {pod.failureType === "cascading" ? (
-                <span className="text-xs font-medium text-amber-400">Cascading</span>
-              ) : pod.status === "failed" ? (
+              {pod.status === "failed" ? (
                 <span className="text-xs font-medium text-rose-400">Failed</span>
               ) : pod.status === "pending" ? (
                 <span className="text-xs font-medium text-amber-400">Pending</span>

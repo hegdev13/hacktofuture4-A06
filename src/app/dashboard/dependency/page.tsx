@@ -1,6 +1,12 @@
 "use client";
 
-import { useEffect, useState } from "react";
+/**
+ * Dependency Graph Page
+ * Displays service dependencies and pod states with real-time propagation
+ * Shows how services depend on each other and cascade failures
+ */
+
+import { useCallback, useEffect, useState } from "react";
 import { Card, CardBody, CardHeader } from "@/components/ui/card";
 import { useSelectedEndpointId } from "@/components/dashboard/use-endpoint";
 import { readSelectedEndpoint } from "@/lib/endpoints-client";
@@ -11,116 +17,175 @@ type GraphPod = {
   id: string;
   name: string;
   status: "running" | "failed" | "pending";
-  failureType: "healthy" | "root-cause" | "cascading";
-  failureReason?: string;
   dependsOn: string[];
-};
-
-type Remediation = {
-  priority: string;
-  action: string;
-  reason: string;
-  command: string;
-  impact?: string;
+  healthScore?: number;
 };
 
 type AnalysisPayload = {
-  root_cause: string;
-  action: string;
-  confidence: number;
-  summary: string;
+  graphPods: GraphPod[];
   status: "healthy" | "degraded" | "critical";
   healthPercent: number;
-  remediations: Remediation[];
-  graphPods: GraphPod[];
+  summary: string;
 };
 
-function logicalServiceKey(name: string): string {
-  return name.toLowerCase().split("-")[0] || name.toLowerCase();
+function normalizeServiceKey(value: string): string {
+  return value
+    .toLowerCase()
+    .trim()
+    .replace(/\s*\(.*$/, "")
+    .replace(/\s*\[.*$/, "")
+    .replace(/\s+.*/, "")
+    .replace(/^https?:\/\//, "")
+    .replace(/:\d+$/, "")
+    .replace(/\.svc\.cluster\.local$/, "")
+    .split(".")[0]
+    .replace(/-[a-f0-9]{8,10}-[a-z0-9]{5}$/i, "")
+    .replace(/-\d+$/, "")
+    .replace(/-service$/, "service")
+    .replace(/[^a-z0-9-]/g, "");
+}
+
+function statusRank(status: GraphPod["status"]): number {
+  if (status === "failed") return 3;
+  if (status === "pending") return 2;
+  return 1;
+}
+
+function consolidateGraphPods(graphPods: GraphPod[]): GraphPod[] {
+  const byKey = new Map<string, GraphPod>();
+
+  for (const pod of graphPods) {
+    const key = normalizeServiceKey(pod.name) || normalizeServiceKey(pod.id) || pod.name.toLowerCase();
+    const existing = byKey.get(key);
+
+    if (!existing) {
+      byKey.set(key, {
+        ...pod,
+        id: key,
+        name: key,
+        dependsOn: [...(pod.dependsOn || [])],
+      });
+      continue;
+    }
+
+    byKey.set(key, {
+      ...existing,
+      status: statusRank(pod.status) > statusRank(existing.status) ? pod.status : existing.status,
+      healthScore: Math.min(existing.healthScore ?? 100, pod.healthScore ?? 100),
+      dependsOn: Array.from(new Set([...(existing.dependsOn || []), ...(pod.dependsOn || [])])),
+    });
+  }
+
+  return Array.from(byKey.values());
 }
 
 function inferDependenciesByServiceName(graphPods: GraphPod[]): Map<string, string[]> {
-  const byKey = new Map<string, string>();
-  graphPods.forEach((p) => {
-    const k = logicalServiceKey(p.name);
-    if (!byKey.has(k)) byKey.set(k, p.name);
-  });
+  const byLower = new Map(graphPods.map((p) => [p.name.toLowerCase(), p.name]));
+  const map = new Map<string, string[]>();
 
-  // Opinionated defaults for common K8s microservice stacks (e.g., Online Boutique style)
-  const template: Record<string, string[]> = {
-    frontend: ["checkoutservice", "productcatalogservice", "recommendationservice", "cartservice", "currencyservice"],
-    checkoutservice: ["cartservice", "paymentservice", "shippingservice", "emailservice", "productcatalogservice", "currencyservice"],
-    cartservice: ["redis"],
-    recommendationservice: ["productcatalogservice"],
-    paymentservice: [],
-    productcatalogservice: [],
-    currencyservice: [],
-    emailservice: [],
-    shippingservice: [],
-    adservice: [],
-    loadgenerator: ["frontend"],
-    otel: [],
-    kube: [],
-    coredns: [],
-    etcd: [],
-    redis: [],
+  const resolve = (name: string) => byLower.get(name.toLowerCase());
+
+  const add = (source: string, candidates: string[]) => {
+    const src = resolve(source);
+    if (!src) return;
+    const deps = candidates
+      .map((c) => resolve(c))
+      .filter((d): d is string => Boolean(d) && d !== src);
+    map.set(src, Array.from(new Set(deps)));
   };
 
-  const resolveTemplateKey = (serviceKey: string): string => {
-    if (serviceKey.startsWith("redis")) return "redis";
-    if (serviceKey.startsWith("otel")) return "otel";
-    if (serviceKey.startsWith("kube")) return "kube";
-    if (serviceKey.startsWith("frontend")) return "frontend";
-    if (serviceKey.startsWith("checkout")) return "checkoutservice";
-    if (serviceKey.startsWith("productcatalog")) return "productcatalogservice";
-    if (serviceKey.startsWith("recommendation")) return "recommendationservice";
-    if (serviceKey.startsWith("payment")) return "paymentservice";
-    if (serviceKey.startsWith("shipping")) return "shippingservice";
-    if (serviceKey.startsWith("currency")) return "currencyservice";
-    if (serviceKey.startsWith("email")) return "emailservice";
-    if (serviceKey.startsWith("cart")) return "cartservice";
-    if (serviceKey.startsWith("loadgenerator")) return "loadgenerator";
-    if (serviceKey.startsWith("adservice")) return "adservice";
-    if (serviceKey.startsWith("coredns")) return "coredns";
-    if (serviceKey.startsWith("etcd")) return "etcd";
-    return serviceKey;
-  };
+  add("frontend", [
+    "adservice",
+    "cartservice",
+    "checkoutservice",
+    "currencyservice",
+    "productcatalogservice",
+    "recommendationservice",
+    "shippingservice",
+  ]);
 
-  const inferred = new Map<string, string[]>();
-  graphPods.forEach((pod) => {
-    const serviceKey = resolveTemplateKey(logicalServiceKey(pod.name));
-    const deps = template[serviceKey] || [];
-    const resolved = deps
-      .map((depKey) => {
-        for (const [k, actualName] of byKey.entries()) {
-          if (k.startsWith(depKey)) return actualName;
-        }
-        return undefined;
-      })
-      .filter((d): d is string => Boolean(d));
-    inferred.set(pod.name, resolved);
-  });
+  add("checkoutservice", [
+    "cartservice",
+    "currencyservice",
+    "paymentservice",
+    "productcatalogservice",
+    "shippingservice",
+    "emailservice",
+  ]);
 
-  return inferred;
+  add("recommendationservice", ["productcatalogservice"]);
+  add("cartservice", ["redis-cart", "productcatalogservice"]);
+  add("paymentservice", ["emailservice", "currencyservice"]);
+
+  for (const pod of graphPods) {
+    if (map.has(pod.name)) continue;
+    const low = pod.name.toLowerCase();
+    if (low.includes("frontend") || low.includes("ui") || low.includes("web")) {
+      const deps = graphPods
+        .map((p) => p.name)
+        .filter((n) => n !== pod.name && /service|api|backend/i.test(n));
+      if (deps.length) map.set(pod.name, deps);
+    } else if (low.includes("api") || low.includes("backend")) {
+      const deps = graphPods
+        .map((p) => p.name)
+        .filter((n) => n !== pod.name && /db|postgres|mysql|redis|cache/i.test(n));
+      if (deps.length) map.set(pod.name, deps);
+    }
+  }
+
+  return map;
 }
 
 // Helper to convert GraphPod to SVG Pod format
-const convertGraphPodToSvgPod = (graphPods: GraphPod[], rootCauseName?: string): Pod[] => {
-  const idToName = new Map(graphPods.map((p) => [p.id, p.name]));
-  const inferredDeps = inferDependenciesByServiceName(graphPods);
+const convertGraphPodToSvgPod = (graphPods: GraphPod[]): Pod[] => {
+  const consolidatedPods = consolidateGraphPods(graphPods);
 
-  const normalizedRoot = rootCauseName?.toLowerCase().trim();
-  const explicitRoot = graphPods.find((p) => p.failureType === "root-cause")?.name;
-  const namedRoot = graphPods.find((p) => p.name.toLowerCase() === normalizedRoot)?.name;
-  const fallbackRoot =
-    graphPods.find((p) => p.name.toLowerCase().includes("frontend"))?.name ||
-    graphPods.find((p) => p.status === "failed")?.name ||
-    graphPods[0]?.name;
-  const effectiveRoot = explicitRoot || namedRoot || fallbackRoot;
+  const normalize = (value: string) =>
+    value
+      .toLowerCase()
+      .trim()
+      .replace(/\s*\(.*$/, "")
+      .replace(/\s*\[.*$/, "")
+      .replace(/\s+.*/, "")
+      .replace(/^https?:\/\//, "")
+      .replace(/:\d+$/, "")
+      .replace(/\.svc\.cluster\.local$/, "")
+      .split(".")[0]
+      .replace(/-[a-f0-9]{8,10}-[a-z0-9]{5}$/i, "")
+      .replace(/-\d+$/, "")
+      .replace(/[^a-z0-9-]/g, "");
 
-  const hasRealEdges = graphPods.some((p) => (p.dependsOn || []).length > 0);
+  const idToName = new Map(consolidatedPods.map((p) => [p.id, p.name]));
+  const nameToName = new Map(consolidatedPods.map((p) => 
+    [p.name.toLowerCase(), p.name]
+  ));
+  const aliasToName = new Map<string, string>();
+  const inferredFallback = inferDependenciesByServiceName(consolidatedPods);
+  const apiHasAnyEdges = consolidatedPods.some((p) => (p.dependsOn || []).length > 0);
 
-  return graphPods.map((pod) => {
+  for (const pod of consolidatedPods) {
+    const base = normalize(pod.name);
+    const compact = base.replace(/-/g, "");
+    aliasToName.set(base, pod.name);
+    aliasToName.set(compact, pod.name);
+    if (base.endsWith("-service")) {
+      aliasToName.set(base.replace(/-service$/, "service"), pod.name);
+    }
+    if (base.endsWith("service")) {
+      aliasToName.set(base.replace(/service$/, "-service"), pod.name);
+    }
+  }
+
+  const resolveDepToPodName = (dep: string): string => {
+    if (idToName.has(dep)) return idToName.get(dep)!;
+    const lower = dep.toLowerCase();
+    if (nameToName.has(lower)) return nameToName.get(lower)!;
+    const normalized = normalize(dep);
+    const compact = normalized.replace(/-/g, "");
+    return aliasToName.get(normalized) || aliasToName.get(compact) || dep;
+  };
+
+  return consolidatedPods.map((pod) => {
     // Infer node type from pod name patterns
     let nodeType: "gateway" | "web" | "compute" | "storage" | "system" = "compute";
     if (
@@ -153,7 +218,6 @@ const convertGraphPodToSvgPod = (graphPods: GraphPod[], rootCauseName?: string):
       nodeType = "system";
     }
 
-
     // Map status to uppercase
     const statusMap: {
       [key in "running" | "failed" | "pending"]: "RUNNING" | "FAILED" | "PENDING";
@@ -163,18 +227,21 @@ const convertGraphPodToSvgPod = (graphPods: GraphPod[], rootCauseName?: string):
       pending: "PENDING",
     };
 
-    // Normalize dependsOn to pod names (input can contain ids or names)
-    const normalizedDependsOn = (pod.dependsOn || []).map((dep) => idToName.get(dep) || dep);
-    const effectiveDependsOn = hasRealEdges
-      ? normalizedDependsOn
-      : (inferredDeps.get(pod.name) || []);
+    const rawDependsOn = apiHasAnyEdges
+      ? (pod.dependsOn || [])
+      : (inferredFallback.get(pod.name) || []);
+
+    const effectiveDependsOn = rawDependsOn
+      .map((dep) => resolveDepToPodName(dep))
+      .filter((d) => d && d !== pod.name);
 
     // Calculate impactedBy: which pods depend on this pod
-    const impactedBy = graphPods
+    const impactedBy = consolidatedPods
       .filter((p) => {
-        const deps = hasRealEdges
-          ? (p.dependsOn || []).map((dep) => idToName.get(dep) || dep)
-          : (inferredDeps.get(p.name) || []);
+        const candidateDeps = apiHasAnyEdges
+          ? (p.dependsOn || [])
+          : (inferredFallback.get(p.name) || []);
+        const deps = candidateDeps.map((dep) => resolveDepToPodName(dep));
         return deps.includes(pod.name);
       })
       .map((p) => p.name);
@@ -182,7 +249,7 @@ const convertGraphPodToSvgPod = (graphPods: GraphPod[], rootCauseName?: string):
     return {
       name: pod.name,
       status: statusMap[pod.status],
-      isRootCause: pod.name === effectiveRoot,
+      isRootCause: false,  // No RCA - all just visualization
       dependsOn: effectiveDependsOn,
       impactedBy,
       nodeType,
@@ -196,6 +263,44 @@ export default function DependencyGraphPage() {
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
 
+  const fetchAnalysis = useCallback(async () => {
+    if (!endpointId) {
+      setAnalysis(null);
+      setError(null);
+      return;
+    }
+
+    try {
+      setLoading(true);
+      const selected = await readSelectedEndpoint();
+      if (!selected) {
+        setAnalysis(null);
+        setError("Selected endpoint not found");
+        return;
+      }
+
+      const u = new URL("/api/dependencies/analyze", window.location.origin);
+      u.searchParams.set("endpoint", selected.id);
+      const res = await fetch(u.toString(), { cache: "no-store" });
+      const data = (await res.json()) as {
+        ok?: boolean;
+        error?: string;
+        analysis?: AnalysisPayload;
+      };
+
+      if (!res.ok || !data.ok || !data.analysis) {
+        throw new Error(data.error || `Request failed (${res.status})`);
+      }
+
+      setAnalysis(data.analysis);
+      setError(null);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setLoading(false);
+    }
+  }, [endpointId]);
+
   useEffect(() => {
     if (!endpointId) {
       setAnalysis(null);
@@ -203,45 +308,13 @@ export default function DependencyGraphPage() {
       return;
     }
 
-    const poll = async () => {
-      try {
-        setLoading(true);
-        const selected = await readSelectedEndpoint();
-        if (!selected) {
-          setAnalysis(null);
-          setError("Selected endpoint not found");
-          return;
-        }
-
-        const u = new URL("/api/ai-agents/analyze", window.location.origin);
-        u.searchParams.set("endpoint", selected.id);
-        const res = await fetch(u.toString(), { cache: "no-store" });
-        const data = (await res.json()) as {
-          ok?: boolean;
-          error?: string;
-          analysis?: AnalysisPayload;
-        };
-
-        if (!res.ok || !data.ok || !data.analysis) {
-          throw new Error(data.error || `Request failed (${res.status})`);
-        }
-
-        setAnalysis(data.analysis);
-        setError(null);
-      } catch (e) {
-        setError(e instanceof Error ? e.message : String(e));
-      } finally {
-        setLoading(false);
-      }
-    };
-
-    void poll();
+    void fetchAnalysis();
     const id = setInterval(() => {
-      void poll();
+      void fetchAnalysis();
     }, 6000);
 
     return () => clearInterval(id);
-  }, [endpointId]);
+  }, [endpointId, fetchAnalysis]);
 
   if (!endpointId) {
     return (
@@ -264,10 +337,10 @@ export default function DependencyGraphPage() {
         </Card>
       ) : null}
 
-      <div className="grid gap-4 md:grid-cols-4">
+      <div className="grid gap-4 md:grid-cols-3">
         <Card>
           <CardBody>
-            <div className="text-xs text-muted">AI Status</div>
+            <div className="text-xs text-muted">Cluster Status</div>
             <div className="mt-1 text-xl font-semibold capitalize text-[#1f2b33]">
               {analysis?.status ?? (loading ? "loading" : "-")}
             </div>
@@ -283,17 +356,9 @@ export default function DependencyGraphPage() {
         </Card>
         <Card>
           <CardBody>
-            <div className="text-xs text-muted">Root Cause</div>
+            <div className="text-xs text-muted">Services</div>
             <div className="mt-1 text-xl font-semibold text-[#1f2b33]">
-              {analysis?.root_cause ?? "-"}
-            </div>
-          </CardBody>
-        </Card>
-        <Card>
-          <CardBody>
-            <div className="text-xs text-muted">Confidence</div>
-            <div className="mt-1 text-xl font-semibold text-[#1f2b33]">
-              {typeof analysis?.confidence === "number" ? `${Math.round(analysis.confidence * 100)}%` : "-"}
+              {analysis?.graphPods?.length ?? "-"}
             </div>
           </CardBody>
         </Card>
@@ -301,19 +366,29 @@ export default function DependencyGraphPage() {
 
       <Card>
         <CardHeader>
-          <div className="text-2xl font-bold tracking-tight text-[#1f2b33]">AI Summary</div>
-          <div className="text-sm text-muted">Live output from the integrated ai_agents branch.</div>
+          <div className="text-2xl font-bold tracking-tight text-[#1f2b33]">Dependency Graph Summary</div>
+          <div className="text-sm text-muted">Real-time service dependency visualization and state propagation.</div>
         </CardHeader>
         <CardBody>
-          <div className="text-sm text-[#4f5d68]">{analysis?.summary ?? "Waiting for analysis..."}</div>
+          <div className="text-sm text-[#4f5d68]">{analysis?.summary ?? "Analyzing dependencies..."}</div>
         </CardBody>
       </Card>
 
       {analysis?.graphPods?.length ? (
         <div className="space-y-4">
+          <div className="flex justify-end">
+            <button
+              type="button"
+              onClick={() => void fetchAnalysis()}
+              disabled={loading}
+              className="rounded-md border border-slate-300 bg-white px-3 py-1.5 text-sm font-semibold text-slate-700 shadow-sm transition-colors hover:bg-slate-100 disabled:cursor-not-allowed disabled:opacity-60"
+            >
+              {loading ? "Refreshing..." : "Refresh Graph"}
+            </button>
+          </div>
           <div className="rounded-lg shadow-lg overflow-hidden bg-white">
             <DependencyGraphSVG 
-              pods={convertGraphPodToSvgPod(analysis.graphPods, analysis.root_cause)} 
+              pods={convertGraphPodToSvgPod(analysis.graphPods)} 
               width={1200}
               height={700}
             />
@@ -323,8 +398,6 @@ export default function DependencyGraphPage() {
               id: p.id,
               name: p.name,
               status: p.status,
-              failureType: p.failureType,
-              message: p.failureReason,
               dependsOn: p.dependsOn,
             }))}
           />
@@ -336,29 +409,6 @@ export default function DependencyGraphPage() {
           </CardBody>
         </Card>
       )}
-
-      <Card>
-        <CardHeader>
-          <div className="text-2xl font-bold tracking-tight text-[#1f2b33]">Suggested Actions</div>
-          <div className="text-sm text-muted">Top remediations generated by the AI agent.</div>
-        </CardHeader>
-        <CardBody>
-          {analysis?.remediations?.length ? (
-            <div className="space-y-3">
-              {analysis.remediations.slice(0, 6).map((r, idx) => (
-                <div key={`${r.action}-${idx}`} className="rounded-xl border border-[#e9dece] bg-[#fff8ee] p-3">
-                  <div className="text-xs uppercase tracking-[0.12em] text-muted">{r.priority}</div>
-                  <div className="mt-1 text-sm font-semibold text-[#1f2b33]">{r.action}</div>
-                  <div className="mt-1 text-sm text-[#4f5d68]">{r.reason}</div>
-                  <div className="mt-2 rounded-md bg-[#f6edde] px-2 py-1 text-xs text-[#5b6872]">{r.command}</div>
-                </div>
-              ))}
-            </div>
-          ) : (
-            <div className="text-sm text-muted">No remediation needed right now.</div>
-          )}
-        </CardBody>
-      </Card>
     </div>
   );
 }

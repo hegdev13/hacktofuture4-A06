@@ -6,7 +6,11 @@
   "scripts": {
     "start": "node main.js",
     "test": "node tests/run-tests.js",
+    "test:graph": "node tests.js",
+    "test:propagation": "node propagation-example.js",
     "demo": "node demo/run-demo.js",
+    "example": "node example.js",
+    "propagation": "node propagation-example.js",
     "dry-run": "DRY_RUN=true node main.js",
     "real": "DRY_RUN=false KUBECONFIG=true node main.js"
   },

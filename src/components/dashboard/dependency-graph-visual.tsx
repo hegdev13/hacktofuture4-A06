@@ -41,6 +41,11 @@ export function DependencyGraphVisual({ pods }: DependencyGraphVisualProps) {
   const [positions, setPositions] = useState<Record<string, NodePosition>>({});
   const [dragging, setDragging] = useState<DragState>(null);
 
+  const clampToCanvas = (x: number, y: number) => ({
+    x: Math.max(nodeRadius, Math.min(width - nodeRadius, x)),
+    y: Math.max(nodeRadius, Math.min(height - nodeRadius, y)),
+  });
+
   const failedPods = pods.filter((p) => p.status === "failed");
   const pendingPods = pods.filter((p) => p.status === "pending");
   const healthyPods = pods.filter((p) => p.status === "running");
@@ -112,8 +117,7 @@ export function DependencyGraphVisual({ pods }: DependencyGraphVisualProps) {
       levelPods.forEach((pod, idx) => {
         builtPositions.push({
           id: pod.id,
-          x,
-          y: marginY + gap * (idx + 1),
+          ...clampToCanvas(x, marginY + gap * (idx + 1)),
         });
       });
     }
@@ -204,7 +208,11 @@ export function DependencyGraphVisual({ pods }: DependencyGraphVisualProps) {
     setPositions((prev) => {
       const next: Record<string, NodePosition> = {};
       for (const node of graph.positions) {
-        next[node.id] = prev[node.id] ?? node;
+        const prior = prev[node.id] ?? node;
+        next[node.id] = {
+          ...node,
+          ...clampToCanvas(prior.x, prior.y),
+        };
       }
       return next;
     });
@@ -284,6 +292,7 @@ export function DependencyGraphVisual({ pods }: DependencyGraphVisualProps) {
   const onNodePointerDown = (e: React.PointerEvent<SVGGElement>, id: string) => {
     const node = positions[id];
     if (!node) return;
+    e.currentTarget.setPointerCapture?.(e.pointerId);
     const point = toSvgPoint(e.clientX, e.clientY);
     setDragging({ id, offsetX: point.x - node.x, offsetY: point.y - node.y });
   };
@@ -341,12 +350,12 @@ export function DependencyGraphVisual({ pods }: DependencyGraphVisualProps) {
         </div>
       </div>
 
-      <div className="overflow-auto rounded-xl border border-[#d7dbe1] bg-[#efeff1] p-2">
+      <div className="overflow-hidden rounded-xl border border-[#d7dbe1] bg-[#efeff1] p-2">
         <svg
           ref={svgRef}
-          className="w-full min-w-[1150px]"
+          className="block w-full"
           viewBox={`0 0 ${width} ${height}`}
-          preserveAspectRatio="xMinYMin meet"
+          preserveAspectRatio="xMidYMid meet"
           onPointerMove={onPointerMove}
           onPointerUp={() => setDragging(null)}
           onPointerLeave={() => setDragging(null)}
