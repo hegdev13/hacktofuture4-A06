@@ -137,6 +137,28 @@ export async function getGeminiHealingPlan(context) {
     const cleaned = text.replace(/^```json\s*/i, "").replace(/```$/i, "").trim();
     const parsed = JSON.parse(cleaned);
 
+    // Capture token usage metadata
+    const usageMetadata = data?.usageMetadata || {};
+    const inputTokens = usageMetadata.promptTokenCount || 0;
+    const outputTokens = usageMetadata.candidatesTokenCount || 0;
+
+    // Record cost asynchronously (non-blocking)
+    if (inputTokens > 0 || outputTokens > 0) {
+      fetch("/api/cost-tracking/record", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          stage: "plan",
+          input_tokens: inputTokens,
+          output_tokens: outputTokens,
+          total_tokens: inputTokens + outputTokens,
+          cost_usd: (inputTokens / 1000000) * 0.075 + (outputTokens / 1000000) * 0.30,
+          model: GEMINI_MODEL,
+          scenario: context.scenario,
+        }),
+      }).catch((e) => console.error("[CostTracking] Failed to record plan costs:", e));
+    }
+
     return {
       summary: String(parsed.summary || "AI plan generated."),
       steps: Array.isArray(parsed.steps) ? parsed.steps.map((s) => String(s)) : [],
@@ -144,6 +166,11 @@ export async function getGeminiHealingPlan(context) {
       source: "gemini",
       scenario: context.scenario,
       metricsUrl: context.metricsUrl,
+      usageMetadata: {
+        inputTokens,
+        outputTokens,
+        cost: (inputTokens / 1000000) * 0.075 + (outputTokens / 1000000) * 0.30,
+      },
     };
   } catch {
     return fallbackRecommendation(context);
@@ -234,7 +261,29 @@ export async function getRemediationOptions(context) {
       return fallbackMultiOptions({ scenario: context.scenario, rootCause, affectedPods: affectedCount });
     }
 
-    return {
+      // Capture token usage metadata
+      const usageMetadata = data?.usageMetadata || {};
+      const inputTokens = usageMetadata.promptTokenCount || 0;
+      const outputTokens = usageMetadata.candidatesTokenCount || 0;
+
+      // Record cost asynchronously (non-blocking)
+      if (inputTokens > 0 || outputTokens > 0) {
+        fetch("/api/cost-tracking/record", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            stage: "options",
+            input_tokens: inputTokens,
+            output_tokens: outputTokens,
+            total_tokens: inputTokens + outputTokens,
+            cost_usd: (inputTokens / 1000000) * 0.075 + (outputTokens / 1000000) * 0.30,
+            model: GEMINI_MODEL,
+            scenario: context.scenario,
+          }),
+        }).catch((e) => console.error("[CostTracking] Failed to record options costs:", e));
+      }
+
+      return {
       options: parsed.options.map((opt) => ({
         id: String(opt.id || "option_unknown"),
         name: String(opt.name || "Option"),
@@ -254,6 +303,11 @@ export async function getRemediationOptions(context) {
       selected_option: String(parsed.selected_option || "option_a"),
       selection_reason: String(parsed.selection_reason || "Best balance of risk and effectiveness."),
       source: "gemini",
+      usageMetadata: {
+        inputTokens,
+        outputTokens,
+        cost: (inputTokens / 1000000) * 0.075 + (outputTokens / 1000000) * 0.30,
+      },
     };
   } catch {
     return fallbackMultiOptions({ scenario: context.scenario, rootCause, affectedPods: affectedCount });
