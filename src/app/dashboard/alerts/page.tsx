@@ -142,10 +142,14 @@ export default function AlertsPage() {
     async function fetchCosts() {
       setCostLoading(true);
       try {
-        const response = await fetch("/api/cost-tracking/summary?days=28");
+        const response = await fetch("/api/cost-tracking/summary?days=28", { 
+          cache: "no-store",
+          headers: { "Cache-Control": "no-cache" }
+        });
         if (response.ok) {
           const data = await response.json();
           setSummary(data);
+          console.log("[Dashboard] Cost data fetched:", { tokens: data.total_tokens, cost_usd: data.total_cost_usd, source: data.data_source });
 
           // Transform stages data
           const stagesArray: StageBreakdown[] = [];
@@ -178,7 +182,7 @@ export default function AlertsPage() {
           }
         }
       } catch (error) {
-        console.error("Failed to fetch costs:", error);
+        console.error("[Dashboard] Failed to fetch costs:", error);
       } finally {
         setCostLoading(false);
       }
@@ -186,6 +190,11 @@ export default function AlertsPage() {
 
     if (activeTab === "costs") {
       fetchCosts();
+          // Auto-refresh cost data every 5 seconds
+          const costRefreshId = setInterval(() => {
+            fetchCosts();
+          }, 5000);
+          return () => clearInterval(costRefreshId);
     }
   }, [activeTab]);
 

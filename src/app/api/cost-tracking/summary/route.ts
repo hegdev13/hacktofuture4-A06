@@ -113,12 +113,13 @@ export async function GET(request: Request) {
         .select("*")
         .gte("created_at", cutoffDate.toISOString());
 
-      if (!error && data) {
+      if (!error && Array.isArray(data)) {
         records = data;
         dataSource = "supabase";
         console.log(`[CostSummary] Loaded ${data.length} records from Supabase`);
       } else if (error) {
         console.warn("[CostSummary] Query error, using demo data:", error);
+        console.warn("[CostSummary] Error details:", error.message);
       }
     } else {
       console.warn("[CostSummary] Supabase not configured, using demo data");
