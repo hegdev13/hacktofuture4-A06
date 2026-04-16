@@ -1,4 +1,4 @@
-import { getGeminiHealingPlan } from "@/ai-agents/geminiClient";
+import { getGeminiHealingPlan, getRemediationOptions } from "@/ai-agents/geminiClient";
 import {
   checkKubectlAccess,
   getRunnerSnapshot,
@@ -67,6 +67,45 @@ export async function runHealingOrchestrator(input) {
       reasoning: `source=${plan.source}`,
       raw: { plan },
     });
+
+    // Generate multiple remediation options for decision analysis
+    const remediationOptions = await getRemediationOptions({
+      scenario,
+      rootCause: targetName || "unknown-pod",
+      failureChain: [],
+      affectedCount: 0,
+    });
+
+    // Store decision analysis
+    if (remediationOptions.options && remediationOptions.options.length > 0) {
+      try {
+        await fetch(process.env.NEXT_PUBLIC_APP_URL ? `${process.env.NEXT_PUBLIC_APP_URL}/api/healing/decision-analysis` : "/api/healing/decision-analysis", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            issue_id: started.activeIssueId,
+            root_cause: remediationOptions.root_cause || targetName || "unknown",
+            options: remediationOptions.options,
+            selected_option: remediationOptions.selected_option,
+            selection_reason: remediationOptions.selection_reason,
+            affected_resources_count: 0,
+          }),
+        });
+
+        pushRunnerLog({
+          issue_id: started.activeIssueId,
+          agent_name: "DecisionAnalyzer",
+          event_type: "REMEDIATION_OPTIONS",
+          description: `Generated ${remediationOptions.options.length} remediation options`,
+          action_taken: `Selected: ${remediationOptions.selected_option}. Reason: ${remediationOptions.selection_reason}`,
+          status: "IN_PROGRESS",
+          confidence: remediationOptions.options.find((opt) => opt.id === remediationOptions.selected_option)?.confidence || 0.5,
+          raw: { options: remediationOptions },
+        });
+      } catch (err) {
+        console.error("Failed to store decision analysis:", err);
+      }
+    }
   }
 
   return {

@@ -16,6 +16,77 @@ function fallbackRecommendation({ scenario, metricsUrl }) {
   };
 }
 
+function fallbackMultiOptions({ scenario, rootCause, affectedPods }) {
+  return {
+    options: [
+      {
+        id: "option_a",
+        name: "Quick Restart",
+        description: `Restart ${rootCause} pod immediately`,
+        steps: [
+          `Delete pod: kubectl delete pod ${rootCause} -n default`,
+          "Wait for deployment controller to create new pod",
+          "Verify service connectivity",
+        ],
+        cost: {
+          downtime: "30-60 seconds",
+          downtime_seconds: 45,
+          resource_impact: "Minimal",
+          risk_level: "low",
+          execution_time: "45 seconds",
+        },
+        pros: ["Fastest approach", "Minimal resource overhead"],
+        cons: ["Brief service disruption", "May not fix root cause"],
+        confidence: 0.65,
+      },
+      {
+        id: "option_b",
+        name: "Rollout Restart",
+        description: "Perform rolling restart of deployment",
+        steps: [
+          `Rollout restart: kubectl rollout restart deployment/${rootCause} -n default`,
+          "Monitor rollout status",
+          "Verify all pods are ready",
+        ],
+        cost: {
+          downtime: "Minimal",
+          downtime_seconds: 5,
+          resource_impact: "Moderate (temp 2x pod count)",
+          risk_level: "medium",
+          execution_time: "2-3 minutes",
+        },
+        pros: ["Zero-downtime rolling update", "Controlled pod replacement"],
+        cons: ["Longer execution time", "Temporary resource increase"],
+        confidence: 0.78,
+      },
+      {
+        id: "option_c",
+        name: "Dependency Reset",
+        description: "Restart dependent services then target",
+        steps: [
+          "Identify and restart dependencies first",
+          `Restart ${rootCause} pod`,
+          "Monitor cascade recovery",
+          "Validate full service health",
+        ],
+        cost: {
+          downtime: "60-90 seconds",
+          downtime_seconds: 75,
+          resource_impact: "Moderate",
+          risk_level: "medium",
+          execution_time: "3-4 minutes",
+        },
+        pros: ["Addresses upstream issues", "Higher success rate"],
+        cons: ["Longer total downtime", "More complex recovery"],
+        confidence: 0.82,
+      },
+    ],
+    selected_option: "option_b",
+    selection_reason: "Rolling restart provides best balance of speed, reliability, and zero-downtime deployment.",
+    source: "fallback",
+  };
+}
+
 export async function getGeminiHealingPlan(context) {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) {
@@ -76,5 +147,115 @@ export async function getGeminiHealingPlan(context) {
     };
   } catch {
     return fallbackRecommendation(context);
+  }
+}
+
+/**
+ * Generate multiple remediation options with cost analysis
+ * Returns 3 options with pros/cons and selected best option
+ */
+export async function getRemediationOptions(context) {
+  const apiKey = process.env.GEMINI_API_KEY;
+  const { rootCause, failureChain, affectedCount = 0 } = context;
+
+  if (!apiKey) {
+    return fallbackMultiOptions({
+      scenario: context.scenario,
+      rootCause: rootCause || "unknown-pod",
+      affectedPods: affectedCount,
+    });
+  }
+
+  const prompt = [
+    "You are a Kubernetes SRE expert. Generate exactly 3 remediation strategies as JSON.",
+    "Return ONLY valid JSON with this structure:",
+    "{",
+    '  "options": [',
+    '    {',
+    '      "id": "option_a", "name": "...", "description": "...",',
+    '      "steps": ["...", "..."],',
+    '      "cost": {',
+    '        "downtime": "description", "downtime_seconds": number,',
+    '        "resource_impact": "Minimal|Moderate|High",',
+    '        "risk_level": "low|medium|high",',
+    '        "execution_time": "X minutes"',
+    "      },",
+    '      "pros": ["..."], "cons": ["..."], "confidence": 0.0-1.0',
+    "    },",
+    "    ... (option_b, option_c)",
+    "  ],",
+    '  "selected_option": "option_a",',
+    '  "selection_reason": "Why this option is best..."',
+    "}",
+    "",
+    `Root cause: ${rootCause || "unknown pod failure"}`,
+    `Failure chain: ${(failureChain || []).join(" -> ") || "untraced"}`,
+    `Affected resources count: ${affectedCount}`,
+    "Generate practical Kubernetes recovery strategies ONLY.",
+  ].join("\n");
+
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(GEMINI_MODEL)}:generateContent?key=${encodeURIComponent(apiKey)}`;
+
+  try {
+    const response = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        contents: [{ role: "user", parts: [{ text: prompt }] }],
+        generationConfig: {
+          temperature: 0.3,
+          topP: 0.9,
+          maxOutputTokens: 1500,
+        },
+      }),
+      cache: "no-store",
+    });
+
+    if (!response.ok) {
+      return fallbackMultiOptions({ scenario: context.scenario, rootCause, affectedPods: affectedCount });
+    }
+
+    const data = await response.json();
+    const text =
+      data?.candidates?.[0]?.content?.parts
+        ?.map((p) => p?.text || "")
+        .join("\n")
+        .trim() || "";
+
+    if (!text) {
+      return fallbackMultiOptions({ scenario: context.scenario, rootCause, affectedPods: affectedCount });
+    }
+
+    const cleaned = text.replace(/^```json\s*/i, "").replace(/```$/i, "").trim();
+    const parsed = JSON.parse(cleaned);
+
+    // Validate structure
+    if (!Array.isArray(parsed.options) || parsed.options.length < 3) {
+      return fallbackMultiOptions({ scenario: context.scenario, rootCause, affectedPods: affectedCount });
+    }
+
+    return {
+      options: parsed.options.map((opt) => ({
+        id: String(opt.id || "option_unknown"),
+        name: String(opt.name || "Option"),
+        description: String(opt.description || ""),
+        steps: Array.isArray(opt.steps) ? opt.steps.map((s) => String(s)) : [],
+        cost: {
+          downtime: String(opt.cost?.downtime || "unknown"),
+          downtime_seconds: Number(opt.cost?.downtime_seconds || 0),
+          resource_impact: String(opt.cost?.resource_impact || "Unknown"),
+          risk_level: String(opt.cost?.risk_level || "medium"),
+          execution_time: String(opt.cost?.execution_time || "unknown"),
+        },
+        pros: Array.isArray(opt.pros) ? opt.pros.map((p) => String(p)) : [],
+        cons: Array.isArray(opt.cons) ? opt.cons.map((c) => String(c)) : [],
+        confidence: Number(opt.confidence || 0.5),
+      })),
+      selected_option: String(parsed.selected_option || "option_a"),
+      selection_reason: String(parsed.selection_reason || "Best balance of risk and effectiveness."),
+      source: "gemini",
+    };
+  } catch {
+    return fallbackMultiOptions({ scenario: context.scenario, rootCause, affectedPods: affectedCount });
   }
 }
