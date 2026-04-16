@@ -1,10 +1,13 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
+import { execFileSync } from "node:child_process";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
 import { NgrokUrlSchema } from "@/lib/validation";
 import { rateLimit } from "@/lib/security/rate-limit";
 import { ingestLogs, queryLogs } from "@/lib/observability/logs";
 import { publishObservabilityEvent } from "@/lib/observability/events";
+
+export const runtime = "nodejs";
 
 const QuerySchema = z.object({
   endpoint: z.string().uuid().optional(),
@@ -53,6 +56,34 @@ function normalizeNgrokBase(input: string) {
   }
 
   return u.toString().replace(/\/+$/, "");
+}
+
+function kubectlLogs(params: {
+  pod: string;
+  namespace: string;
+  container?: string;
+  tail: number;
+}) {
+  const args = [
+    "logs",
+    params.pod,
+    "-n",
+    params.namespace,
+    "--tail",
+    String(params.tail),
+    "--timestamps=true",
+  ];
+
+  if (params.container) {
+    args.push("-c", params.container);
+  }
+
+  return execFileSync("kubectl", args, {
+    encoding: "utf8",
+    timeout: 8000,
+    stdio: ["ignore", "pipe", "pipe"],
+    windowsHide: true,
+  });
 }
 
 const CANDIDATE_PATHS = [
@@ -209,6 +240,54 @@ export async function GET(request: Request) {
         errors.push(e instanceof Error ? e.message : String(e));
       }
     }
+
+    // Fallback path: if ngrok endpoint does not expose logs, read directly via kubectl.
+    try {
+      const tail = Math.min(1000, Math.max(1, parsed.data.limit ?? 500));
+      const text = kubectlLogs({
+        pod: parsed.data.pod,
+        namespace: ns,
+        container: parsed.data.container,
+        tail,
+      });
+
+      const clean = (text || "").trim();
+      if (clean.length) {
+        if (parsed.data.endpoint) {
+          const lines = clean
+            .split(/\r?\n/)
+            .map((line) => line.trim())
+            .filter(Boolean)
+            .slice(-200);
+
+          if (lines.length) {
+            await ingestLogs(
+              lines.map((line) => ({
+                endpoint_id: parsed.data.endpoint,
+                labels: {
+                  namespace: ns,
+                  pod: parsed.data.pod ?? "unknown",
+                  container: parsed.data.container ?? "",
+                },
+                message: line,
+                source: "pod",
+                level: /error|fatal|panic/i.test(line)
+                  ? "error"
+                  : /warn/i.test(line)
+                    ? "warn"
+                    : "info",
+              })),
+            );
+          }
+        }
+
+        return NextResponse.json({ ok: true, logs: clean, source: "kubectl_fallback" });
+      }
+      errors.push("kubectl returned empty output");
+    } catch (e) {
+      errors.push(e instanceof Error ? e.message : String(e));
+    }
+
     return NextResponse.json(
       { error: "upstream_unavailable", details: errors.slice(-3) },
       { status: 502 },

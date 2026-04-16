@@ -133,6 +133,27 @@ class HealingAgentRunnerService {
     return this.status;
   }
 
+  resetSession() {
+    this.logs = [];
+    this.issueLifecycle.clear();
+    this.status = {
+      state: "idle",
+      totalLogs: 0,
+    };
+    this.emit({
+      type: "status",
+      payload: this.status,
+    });
+    this.emit({
+      type: "log",
+      payload: undefined as never,
+    });
+    this.emit({
+      type: "lifecycle",
+      payload: [],
+    });
+  }
+
   appendExternalLog(input: {
     issue_id: string;
     agent_name?: string;

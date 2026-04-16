@@ -114,6 +114,29 @@ export async function generateGeminiHealingSummary(
       candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
     };
 
+      // Capture token usage metadata
+      const usageMetadata = (data as any)?.usageMetadata || {};
+      const inputTokens = usageMetadata.promptTokenCount || 0;
+      const outputTokens = usageMetadata.candidatesTokenCount || 0;
+      const costUsd = (inputTokens / 1000000) * 0.075 + (outputTokens / 1000000) * 0.30;
+
+      // Record cost asynchronously
+      if (inputTokens > 0 || outputTokens > 0) {
+        fetch("/api/cost-tracking/record", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            stage: "summary",
+            input_tokens: inputTokens,
+            output_tokens: outputTokens,
+            total_tokens: inputTokens + outputTokens,
+            cost_usd: costUsd,
+            model: GEMINI_MODEL,
+            scenario: status.scenario,
+          }),
+        }).catch((e) => console.error("[CostTracking] Failed to record summary costs:", e));
+      }
+
     const text = data?.candidates?.[0]?.content?.parts?.map((p) => p.text || "").join("\n") || "";
     const parsed = parseJson<HealingSummary>(text);
     if (!parsed) return fallbackSummary(logs, status);

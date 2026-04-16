@@ -95,6 +95,16 @@ type HealingSummary = {
   }>;
 };
 
+type RemediationOption = {
+  id: string;
+  title: string;
+  summary: string;
+  advantage: string[];
+  tradeoff: string[];
+  score: number;
+  estimatedCost: string;
+};
+
 function formatTs(ts?: string) {
   if (!ts) return "-";
   const d = new Date(ts);
@@ -154,6 +164,7 @@ export default function HealingDashboardPage() {
   const [targetKind, setTargetKind] = useState<HealingTargetKind>("pod");
   const [targetLoading, setTargetLoading] = useState(false);
   const [targetError, setTargetError] = useState<string>("");
+  const [selectedRemediationId, setSelectedRemediationId] = useState<string>("");
   const eventSourceRef = useRef<EventSource | null>(null);
 
   useEffect(() => {
@@ -171,6 +182,9 @@ export default function HealingDashboardPage() {
       if (res.ok && data.ok && data.summary) {
         setSummary(data.summary);
       }
+    } catch {
+      // Keep UI functional even if summary endpoint is temporarily unavailable.
+      setSummary(null);
     } finally {
       setLoadingSummary(false);
     }
@@ -214,7 +228,7 @@ export default function HealingDashboardPage() {
                 cpu_usage: typeof pod.cpu_usage === "number" ? pod.cpu_usage : null,
                 memory_usage: typeof pod.memory_usage === "number" ? pod.memory_usage : null,
                 restart_count: typeof pod.restart_count === "number" ? pod.restart_count : 0,
-                kind: isDeployment ? "deployment" : "pod",
+                kind: (isDeployment ? "deployment" : "pod") as HealingTargetKind,
               };
             })
         : [];
@@ -253,27 +267,46 @@ export default function HealingDashboardPage() {
   }, [metricsUrl]);
 
   const fetchInitial = useCallback(async () => {
-    const [statusRes, logsRes] = await Promise.all([
-      fetch("/api/ai-agents/healing/status", { cache: "no-store" }),
-      fetch("/api/ai-agents/healing/logs", { cache: "no-store" }),
-    ]);
+    try {
+      const [statusRes, logsRes] = await Promise.all([
+        fetch("/api/ai-agents/healing/status", { cache: "no-store" }),
+        fetch("/api/ai-agents/healing/logs", { cache: "no-store" }),
+      ]);
 
-    const statusData = (await statusRes.json()) as {
-      ok: boolean;
-      status: AgentRunnerStatus;
-      lifecycle: IssueLifecycle[];
-    };
-    const logsData = (await logsRes.json()) as {
-      ok: boolean;
-      logs: StructuredHealingLog[];
-    };
+      const statusData = (await statusRes.json()) as {
+        ok: boolean;
+        status: AgentRunnerStatus;
+        lifecycle: IssueLifecycle[];
+      };
+      const logsData = (await logsRes.json()) as {
+        ok: boolean;
+        logs: StructuredHealingLog[];
+      };
 
-    if (statusData.ok) {
-      setStatus(statusData.status);
-      setLifecycle(statusData.lifecycle || []);
-    }
-    if (logsData.ok) {
-      setLogs(logsData.logs || []);
+      if (statusData.ok) {
+        setStatus(statusData.status);
+        setLifecycle(statusData.lifecycle || []);
+      }
+      if (logsData.ok) {
+        setLogs(logsData.logs || []);
+      }
+
+      const shouldClearCompletedRun =
+        statusData.ok &&
+        (statusData.status.state === "completed" || statusData.status.state === "failed") &&
+        (logsData.logs?.length || 0) > 0;
+
+      if (shouldClearCompletedRun) {
+        await fetch("/api/ai-agents/healing/reset", { method: "POST" }).catch(() => undefined);
+        setStatus({ state: "idle", totalLogs: 0 });
+        setLogs([]);
+        setLifecycle([]);
+        setSummary(null);
+        setSelectedRemediationId("");
+      }
+    } catch {
+      setStartError("Unable to load healing API right now. Ensure the app server is running, then refresh.");
+      setStatus((prev) => ({ ...prev, state: "idle", totalLogs: prev.totalLogs || 0 }));
     }
   }, []);
 
@@ -377,6 +410,7 @@ export default function HealingDashboardPage() {
           targetName,
           targetNamespace: selectedTarget.namespace,
           targetKind: effectiveTargetKind,
+          remediationPreference: selectedRemediation?.id || null,
         }),
       });
 
@@ -489,11 +523,70 @@ export default function HealingDashboardPage() {
     return targets.find((t) => `${t.namespace}/${t.kind}/${t.pod_name}` === selectedTargetId) || null;
   }, [targets, selectedTargetId]);
 
+  const hasFailureTargets = useMemo(() => {
+    return targets.some((t) => /crash|fail|pending|error|unhealthy|oom|backoff/i.test(t.status));
+  }, [targets]);
+
+  const selectedTargetHasFailure = useMemo(() => {
+    if (!selectedTarget) return false;
+    return /crash|fail|pending|error|unhealthy|oom|backoff/i.test(selectedTarget.status);
+  }, [selectedTarget]);
+
+  const shouldShowDecisionOptions =
+    selectedTargetHasFailure || hasFailureTargets || status.state === "running";
+
+  const remediationOptions = useMemo<RemediationOption[]>(() => {
+    const baseName = selectedTarget?.kind === "deployment" ? "deployment" : "pod";
+    const scaleUpScore = scenario === "high-cpu" ? 92 : 84;
+    const restartScore = scenario === "pod-crash" ? 89 : 77;
+    const dependencyScore = scenario === "service-unavailable" ? 90 : 74;
+
+    return [
+      {
+        id: "scale-replicas",
+        title: `Scale ${baseName} replicas`,
+        summary: "Increase replicas so traffic can move to a healthy instance while the bad one is isolated.",
+        advantage: ["Best fit when the service needs more capacity", "Keeps the app available while healing"],
+        tradeoff: ["Costs extra CPU/memory", "Does not fix the original crash cause directly"],
+        score: scaleUpScore,
+        estimatedCost: "Moderate resource cost, low disruption",
+      },
+      {
+        id: "restart-workload",
+        title: `Restart ${baseName}`,
+        summary: "Restart the affected workload so Kubernetes recreates it cleanly.",
+        advantage: ["Fastest remediation", "Simple and easy to explain in a demo"],
+        tradeoff: ["Brief downtime possible", "May just mask a deeper dependency problem"],
+        score: restartScore,
+        estimatedCost: "Low cost, short disruption window",
+      },
+      {
+        id: "dependency-first",
+        title: "Fix dependency first",
+        summary: "Check upstream service, then heal the root dependency before touching the target.",
+        advantage: ["Highest chance of fixing the real root cause", "Good for cascading failures"],
+        tradeoff: ["Slower than a direct restart", "Needs more investigation time"],
+        score: dependencyScore,
+        estimatedCost: "Higher analysis cost, lower repeat-failure risk",
+      },
+    ].sort((a, b) => b.score - a.score);
+  }, [scenario, selectedTarget?.kind]);
+
+  const bestRemediation = remediationOptions[0] || null;
+
   useEffect(() => {
     if (selectedTarget && targetKind !== selectedTarget.kind) {
       setTargetKind(selectedTarget.kind);
     }
   }, [selectedTarget, targetKind]);
+
+  useEffect(() => {
+    if (!selectedRemediationId && bestRemediation) {
+      setSelectedRemediationId(bestRemediation.id);
+    }
+  }, [bestRemediation, selectedRemediationId]);
+
+  const selectedRemediation = remediationOptions.find((option) => option.id === selectedRemediationId) || bestRemediation;
 
   return (
     <div className="space-y-4">
@@ -577,6 +670,96 @@ export default function HealingDashboardPage() {
           </div>
         </CardHeader>
       </Card>
+
+      {shouldShowDecisionOptions ? (
+      <Card>
+        <CardHeader className="flex flex-col gap-2 md:flex-row md:items-end md:justify-between">
+          <div>
+            <div className="text-xl font-bold tracking-tight text-[#1f2b33]">Healing decision options</div>
+            <div className="text-sm text-muted">
+              Three practical choices are scored here. Pick the one you want, then click Start Healing.
+            </div>
+          </div>
+          <div className="rounded-full bg-[#eef5ea] px-3 py-1 text-xs font-semibold text-[#4f6b3d]">
+            Recommended: {bestRemediation?.title || "-"} ({bestRemediation?.score ?? 0}/100)
+          </div>
+        </CardHeader>
+        <CardBody>
+          <div className="grid gap-3 lg:grid-cols-3">
+            {remediationOptions.map((option, index) => {
+              const isSelected = option.id === selectedRemediationId;
+              const isBest = option.id === bestRemediation?.id;
+              return (
+                <button
+                  key={option.id}
+                  type="button"
+                  onClick={() => setSelectedRemediationId(option.id)}
+                  className={`rounded-2xl border p-4 text-left transition ${
+                    isSelected
+                      ? "border-[#94b57b] bg-[#f3faec] shadow-sm"
+                      : "border-[#e6dbc9] bg-[#fffaf2] hover:border-[#c9b79f]"
+                  }`}
+                >
+                  <div className="flex items-start justify-between gap-3">
+                    <div>
+                      <div className="text-xs font-semibold uppercase tracking-wide text-muted">Option {index + 1}</div>
+                      <div className="mt-1 text-lg font-bold text-[#1f2b33]">{option.title}</div>
+                    </div>
+                    <div className="text-right">
+                      <div className="text-xs text-muted">Score</div>
+                      <div className="text-2xl font-bold text-[#2f5f45]">{option.score}</div>
+                    </div>
+                  </div>
+                  <div className="mt-3 text-sm text-[#4f5d68]">{option.summary}</div>
+                  <div className="mt-3 rounded-xl bg-white/80 p-3 text-xs text-[#4f5d68]">
+                    <div className="font-semibold text-[#1f2b33]">Advantages</div>
+                    <ul className="mt-1 space-y-1">
+                      {option.advantage.map((item) => (
+                        <li key={item}>• {item}</li>
+                      ))}
+                    </ul>
+                  </div>
+                  <div className="mt-3 text-xs text-[#4f5d68]">
+                    <span className="font-semibold text-[#1f2b33]">Tradeoff:</span> {option.tradeoff.join(" ")}
+                  </div>
+                  <div className="mt-3 flex items-center justify-between text-xs">
+                    <span className="rounded-full bg-[#f4efe6] px-2 py-1 text-[#5f513f]">{option.estimatedCost}</span>
+                    <span
+                      className={`rounded-full px-2 py-1 font-semibold ${
+                        isBest ? "bg-[#e8f5e8] text-[#3f6a3f]" : "bg-[#f3ece2] text-[#6d5a43]"
+                      }`}
+                    >
+                      {isBest ? "Best score" : isSelected ? "Chosen by SRE" : "Available"}
+                    </span>
+                  </div>
+                </button>
+              );
+            })}
+          </div>
+
+          {selectedRemediation ? (
+            <div className="mt-4 rounded-2xl border border-[#d9e7d0] bg-[#f7fbf3] p-4">
+              <div className="text-sm font-semibold text-[#2f5f45]">Selected path before heal</div>
+              <div className="mt-1 text-sm text-[#4f5d68]">
+                {selectedRemediation.title} - {selectedRemediation.summary}
+              </div>
+              <div className="mt-2 text-xs text-[#5b6872]">
+                The score is a guide only. You can still override it with your own judgment before pressing Start Healing.
+              </div>
+            </div>
+          ) : null}
+        </CardBody>
+      </Card>
+      ) : (
+        <Card>
+          <CardBody>
+            <div className="text-sm font-semibold text-[#1f2b33]">Remediation options waiting for failure signal</div>
+            <div className="mt-1 text-sm text-muted">
+              Options will appear automatically when a pod/deployment shows failure state (CrashLoopBackOff, Failed, Error, Pending) so you can select one, then click Start Healing.
+            </div>
+          </CardBody>
+        </Card>
+      )}
 
       <div className="grid gap-4 md:grid-cols-4">
         <Card>

@@ -109,7 +109,7 @@ export default function LogsPage() {
       const queryRes = await fetch(queryUrl.toString(), { cache: "no-store" });
       const queryData = (await queryRes.json()) as { error?: string; logs?: QueriedLogRow[] };
 
-      if (queryRes.ok && Array.isArray(queryData.logs)) {
+      if (queryRes.ok && Array.isArray(queryData.logs) && queryData.logs.length > 0) {
         const rendered = queryData.logs
           .slice()
           .reverse()

@@ -4,6 +4,8 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis, Legend } from "recharts";
 import { Card, CardBody, CardHeader } from "@/components/ui/card";
 import AdvancedObservabilityPanels from "@/components/dashboard/advanced-observability-panels";
+import { RemediationOptionsModal } from "@/components/dashboard/remediation-options-modal";
+import { DecisionAnalysisCard } from "@/components/dashboard/decision-analysis-card";
 import { cn } from "@/lib/utils";
 import { formatBytes, formatNumber } from "@/lib/format";
 import {
@@ -103,6 +105,31 @@ function canFailNamespace(namespace: string) {
   return !PROTECTED_NAMESPACES.has(namespace);
 }
 
+type RemediationOption = {
+  id: string;
+  name: string;
+  description: string;
+  steps: string[];
+  cost: {
+    downtime: string;
+    downtime_seconds: number;
+    resource_impact: string;
+    risk_level: string;
+    execution_time: string;
+  };
+  pros: string[];
+  cons: string[];
+  confidence: number;
+};
+
+type DecisionAnalysisData = {
+  options: RemediationOption[];
+  selected_option: string;
+  selection_reason: string;
+  root_cause: string;
+  affected_resources_count: number;
+};
+
 function podsToRows(endpointId: string, pods: UpstreamPod[], fetchedAt: string): SnapshotRow[] {
   return pods.map((p) => ({
     id: crypto.randomUUID(),
@@ -158,6 +185,9 @@ export default function DashboardOverviewPage() {
   const [failingAllPods, setFailingAllPods] = useState(false);
   const [failError, setFailError] = useState<string | null>(null);
   const [failMessage, setFailMessage] = useState<string | null>(null);
+  const [decisionAnalysis, setDecisionAnalysis] = useState<DecisionAnalysisData | null>(null);
+  const [showOptionsModal, setShowOptionsModal] = useState(false);
+  const [isHealingInProgress, setIsHealingInProgress] = useState(false);
 
   const poll = useCallback(async () => {
     try {
@@ -391,6 +421,65 @@ export default function DashboardOverviewPage() {
     }
   }, [failablePods, markPodAsFailed, poll, requestFailPod]);
 
+  const startHealing = useCallback(async () => {
+    setIsHealingInProgress(true);
+    setShowOptionsModal(true);
+    setDecisionAnalysis(null);
+    
+    try {
+      const response = await fetch("/api/self-heal", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          scenario: "pod-crash",
+          dryRun: false,
+          metricsUrl: selectedEp?.ngrok_url,
+          strictLive: false,
+        }),
+      });
+
+      const data = await response.json();
+      
+      if (data.ok) {
+        // Fetch decision analysis after a short delay to allow backend processing
+        setTimeout(async () => {
+          try {
+            const page = new URL(window.location.href);
+            const issueId = page.searchParams.get("issue_id") || (data.status?.activeIssueId || "unknown");
+            
+            const analysisRes = await fetch(
+              `/api/healing/decision-analysis?issue_id=${encodeURIComponent(issueId)}`
+            );
+            
+            if (analysisRes.ok) {
+              const analysisData = await analysisRes.json();
+              if (analysisData.ok && analysisData.data?.raw) {
+                setDecisionAnalysis({
+                  options: analysisData.data.raw.options || [],
+                  selected_option: analysisData.data.raw.selected_option || "",
+                  selection_reason: analysisData.data.raw.selection_reason || "",
+                  root_cause: analysisData.data.raw.root_cause || "unknown",
+                  affected_resources_count: analysisData.data.raw.affected_resources_count || 0,
+                });
+              }
+            }
+          } catch (err) {
+            console.error("Error fetching decision analysis:", err);
+          }
+        }, 2000);
+
+        void poll();
+      } else {
+        setShowOptionsModal(false);
+      }
+    } catch (error) {
+      console.error("Healing error:", error);
+      setShowOptionsModal(false);
+    } finally {
+      setIsHealingInProgress(false);
+    }
+  }, [selectedEp?.ngrok_url, poll]);
+
   useEffect(() => {
     const onEp = () => {
       setHistory([]);
@@ -623,13 +712,22 @@ export default function DashboardOverviewPage() {
                 Latest status per pod from upstream {loading ? "(refreshing…)" : ""}
               </div>
             </div>
-            <button
-              onClick={() => void failAllPods()}
-              disabled={failingAllPods || Boolean(failingPodKey) || !failablePods.length}
-              className="rounded-md border border-[#e3c7c7] bg-[#fff1f1] px-3 py-2 text-xs font-semibold text-[#9f3232] hover:bg-[#ffe6e6] disabled:cursor-not-allowed disabled:opacity-60"
-            >
-              {failingAllPods ? "Failing All..." : `Fail Supported Pods (${failablePods.length})`}
-            </button>
+            <div className="flex gap-2">
+              <button
+                onClick={() => void startHealing()}
+                disabled={isHealingInProgress || Boolean(failingPodKey) || failingAllPods}
+                className="rounded-md border border-[#c7d7e3] bg-[#e8f1f8] px-3 py-2 text-xs font-semibold text-[#2c5aa0] hover:bg-[#dce7f2] disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                {isHealingInProgress ? "Healing..." : "Start Healing"}
+              </button>
+              <button
+                onClick={() => void failAllPods()}
+                disabled={failingAllPods || Boolean(failingPodKey) || !failablePods.length}
+                className="rounded-md border border-[#e3c7c7] bg-[#fff1f1] px-3 py-2 text-xs font-semibold text-[#9f3232] hover:bg-[#ffe6e6] disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                {failingAllPods ? "Failing All..." : `Fail Supported Pods (${failablePods.length})`}
+              </button>
+            </div>
           </div>
           {failError ? <div className="text-xs font-medium text-danger">{failError}</div> : null}
           {failMessage ? <div className="text-xs font-medium text-ok">{failMessage}</div> : null}
@@ -703,7 +801,26 @@ export default function DashboardOverviewPage() {
         </CardBody>
       </Card>
 
+      {decisionAnalysis && (
+        <DecisionAnalysisCard
+          options={decisionAnalysis.options}
+          selectedOption={decisionAnalysis.selected_option}
+          selectionReason={decisionAnalysis.selection_reason}
+          rootCause={decisionAnalysis.root_cause}
+          affectedCount={decisionAnalysis.affected_resources_count}
+        />
+      )}
+
       <AdvancedObservabilityPanels endpointId={selectedEp.id} />
+
+      <RemediationOptionsModal
+        isOpen={showOptionsModal}
+        options={decisionAnalysis?.options || []}
+        selectedOption={decisionAnalysis?.selected_option || ""}
+        selectionReason={decisionAnalysis?.selection_reason || ""}
+        onClose={() => setShowOptionsModal(false)}
+        isLoading={isHealingInProgress}
+      />
     </div>
   );
 }
