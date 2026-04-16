@@ -387,9 +387,9 @@ export default function AlertsPage() {
           {costLoading ? (
             <Card>
               <CardBody>
-                <div className="text-center">
+                <div className="text-center py-8">
                   <div className="inline-block h-8 w-8 animate-spin rounded-full border-4 border-blue-500 border-t-transparent"></div>
-                  <p className="mt-4 text-slate-400">Loading cost data...</p>
+                  <p className="mt-4 text-slate-600">Loading cost data...</p>
                 </div>
               </CardBody>
             </Card>
@@ -399,38 +399,42 @@ export default function AlertsPage() {
               <div className="grid grid-cols-1 gap-4 md:grid-cols-4">
                 <Card>
                   <CardBody className="p-6">
-                    <div className="space-y-2">
-                      <p className="text-sm font-medium text-slate-400">Total Cost</p>
-                      <p className="text-2xl font-bold text-white">${(summary?.total_cost_usd || 0).toFixed(6)}</p>
-                      <p className="text-sm font-semibold text-slate-300">₹{(summary?.total_cost_inr || 0).toFixed(2)}</p>
+                    <div className="space-y-3">
+                      <p className="text-xs uppercase font-semibold tracking-[0.12em] text-[#7d8893]">Total Cost</p>
+                      <div className="space-y-1">
+                        <p className="text-2xl font-bold text-[#1f2b33]">${(summary?.total_cost_usd || 0).toFixed(6)}</p>
+                        <p className="text-sm font-semibold text-[#5a7d94]">₹{(summary?.total_cost_inr || 0).toFixed(2)}</p>
+                      </div>
                     </div>
                   </CardBody>
                 </Card>
 
                 <Card>
                   <CardBody className="p-6">
-                    <div className="space-y-2">
-                      <p className="text-sm font-medium text-slate-400">Total Tokens</p>
-                      <p className="text-3xl font-bold text-white">{(summary?.total_tokens || 0).toLocaleString()}</p>
+                    <div className="space-y-3">
+                      <p className="text-xs uppercase font-semibold tracking-[0.12em] text-[#7d8893]">Total Tokens</p>
+                      <p className="text-3xl font-bold text-[#1f2b33]">{(summary?.total_tokens || 0).toLocaleString()}</p>
                     </div>
                   </CardBody>
                 </Card>
 
                 <Card>
                   <CardBody className="p-6">
-                    <div className="space-y-2">
-                      <p className="text-sm font-medium text-slate-400">Healing Events</p>
-                      <p className="text-3xl font-bold text-white">{summary?.healing_events_count || 0}</p>
+                    <div className="space-y-3">
+                      <p className="text-xs uppercase font-semibold tracking-[0.12em] text-[#7d8893]">Healing Events</p>
+                      <p className="text-3xl font-bold text-[#1f2b33]">{summary?.healing_events_count || 0}</p>
                     </div>
                   </CardBody>
                 </Card>
 
                 <Card>
                   <CardBody className="p-6">
-                    <div className="space-y-2">
-                      <p className="text-sm font-medium text-slate-400">Cost/Heal</p>
-                      <p className="text-2xl font-bold text-white">${(summary?.cost_per_heal || 0).toFixed(6)}</p>
-                      <p className="text-sm font-semibold text-slate-300">₹{(summary?.cost_per_heal_inr || 0).toFixed(4)}</p>
+                    <div className="space-y-3">
+                      <p className="text-xs uppercase font-semibold tracking-[0.12em] text-[#7d8893]">Cost / Heal</p>
+                      <div className="space-y-1">
+                        <p className="text-2xl font-bold text-[#1f2b33]">${(summary?.cost_per_heal || 0).toFixed(6)}</p>
+                        <p className="text-sm font-semibold text-[#5a7d94]">₹{(summary?.cost_per_heal_inr || 0).toFixed(4)}</p>
+                      </div>
                     </div>
                   </CardBody>
                 </Card>
@@ -438,15 +442,15 @@ export default function AlertsPage() {
 
               {/* Monthly Projection */}
               <Card>
-                <CardBody className="bg-gradient-to-r from-green-900/20 to-emerald-900/20 p-6">
+                <CardBody className="bg-gradient-to-r from-emerald-50 to-green-50 border border-emerald-200 p-6">
                   <div className="flex items-center justify-between">
                     <div>
-                      <p className="font-medium text-green-400">📈 Monthly Projection (1000 events)</p>
-                      <p className="mt-1 text-sm text-green-300/80">Based on current usage patterns</p>
+                      <p className="font-semibold text-emerald-900">📈 Monthly Projection (1000 events)</p>
+                      <p className="mt-1 text-sm text-emerald-700/80">Based on current usage patterns</p>
                     </div>
                     <div className="text-right">
-                      <p className="text-2xl font-bold text-green-400">${(summary?.monthly_estimate || 0).toFixed(2)}</p>
-                      <p className="text-sm font-semibold text-green-300">₹{(summary?.monthly_estimate_inr || 0).toFixed(0)}</p>
+                      <p className="text-2xl font-bold text-emerald-700">${(summary?.monthly_estimate || 0).toFixed(2)}</p>
+                      <p className="text-sm font-semibold text-emerald-600">₹{(summary?.monthly_estimate_inr || 0).toFixed(0)}</p>
                     </div>
                   </div>
                 </CardBody>
@@ -456,18 +460,18 @@ export default function AlertsPage() {
               <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
                 <Card>
                   <CardHeader>
-                    <div className="text-lg font-semibold text-white">Cost Distribution</div>
+                    <div className="text-xl font-bold tracking-tight text-[#1f2b33]">Cost Distribution by Stage</div>
+                    <div className="text-sm text-muted">Breakdown of token consumption costs</div>
                   </CardHeader>
-                  <CardBody>
-                    <ResponsiveContainer width="100%" height={300}>
+                  <CardBody className="h-72">
+                    <ResponsiveContainer width="100%" height="100%">
                       <BarChart data={chartData}>
-                        <CartesianGrid strokeDasharray="3 3" stroke="#374151" />
-                        <XAxis dataKey="name" angle={-45} textAnchor="end" height={80} stroke="#9ca3af" />
-                        <YAxis stroke="#9ca3af" />
+                        <CartesianGrid strokeDasharray="3 3" stroke="rgba(90,107,118,0.15)" />
+                        <XAxis dataKey="name" angle={-45} textAnchor="end" height={80} tick={{ fill: "#6f7a84", fontSize: 12 }} />
+                        <YAxis tick={{ fill: "#6f7a84", fontSize: 12 }} />
                         <Tooltip
                           formatter={(value) => `$${(value as number).toFixed(6)}`}
-                          contentStyle={{ backgroundColor: "#1e293b", border: "1px solid #475569" }}
-                          labelStyle={{ color: "#e2e8f0" }}
+                          contentStyle={{ backgroundColor: "#fff9f0", border: "1px solid #e7ddcd", color: "#2f3a42", fontSize: 12 }}
                         />
                         <Bar dataKey="cost" fill="#3b82f6" radius={[8, 8, 0, 0]} />
                       </BarChart>
@@ -477,10 +481,11 @@ export default function AlertsPage() {
 
                 <Card>
                   <CardHeader>
-                    <div className="text-lg font-semibold text-white">Cost Contribution %</div>
+                    <div className="text-xl font-bold tracking-tight text-[#1f2b33]">Cost Contribution %</div>
+                    <div className="text-sm text-muted">Relative cost distribution across stages</div>
                   </CardHeader>
-                  <CardBody>
-                    <ResponsiveContainer width="100%" height={300}>
+                  <CardBody className="h-72">
+                    <ResponsiveContainer width="100%" height="100%">
                       <PieChart>
                         <Pie
                           data={pieData}
@@ -498,8 +503,7 @@ export default function AlertsPage() {
                         </Pie>
                         <Tooltip
                           formatter={(value) => `${(value as number).toFixed(1)}%`}
-                          contentStyle={{ backgroundColor: "#1e293b", border: "1px solid #475569" }}
-                          labelStyle={{ color: "#e2e8f0" }}
+                          contentStyle={{ backgroundColor: "#fff9f0", border: "1px solid #e7ddcd", color: "#2f3a42", fontSize: 12 }}
                         />
                       </PieChart>
                     </ResponsiveContainer>
@@ -510,33 +514,37 @@ export default function AlertsPage() {
               {/* Stage Breakdown Table */}
               <Card>
                 <CardHeader>
-                  <div className="text-lg font-semibold text-white">Stage-wise Breakdown</div>
+                  <div className="text-xl font-bold tracking-tight text-[#1f2b33]">Stage-wise Cost Breakdown</div>
+                  <div className="text-sm text-muted">Detailed per-stage token and cost analysis with USD and INR</div>
                 </CardHeader>
                 <CardBody>
                   <div className="overflow-x-auto">
                     <table className="w-full text-sm">
                       <thead>
-                        <tr className="border-b border-slate-700">
-                          <th className="px-4 py-3 text-left font-semibold text-slate-300">Stage</th>
-                          <th className="px-4 py-3 text-right font-semibold text-slate-300">Total Tokens</th>
-                          <th className="px-4 py-3 text-right font-semibold text-slate-300">Cost USD</th>
-                          <th className="px-4 py-3 text-right font-semibold text-slate-300">% of Total</th>
+                        <tr className="border-b border-[#ede3d3]">
+                          <th className="px-4 py-3 text-left font-semibold text-[#5a6873]">Stage</th>
+                          <th className="px-4 py-3 text-right font-semibold text-[#5a6873]">Total Tokens</th>
+                          <th className="px-4 py-3 text-right font-semibold text-[#5a6873]">Cost USD</th>
+                          <th className="px-4 py-3 text-right font-semibold text-[#5a6873]">Cost INR</th>
+                          <th className="px-4 py-3 text-right font-semibold text-[#5a6873]">% of Total</th>
                         </tr>
                       </thead>
                       <tbody>
                         {stages.map((stage, idx) => (
-                          <tr key={idx} className="border-b border-slate-700/50 hover:bg-slate-700/20">
-                            <td className="px-4 py-3 font-medium text-white">{stage.name}</td>
-                            <td className="px-4 py-3 text-right text-slate-300">{stage.total_tokens.toLocaleString()}</td>
-                            <td className="px-4 py-3 text-right font-medium text-green-400">${stage.cost_usd.toFixed(6)}</td>
-                            <td className="px-4 py-3 text-right text-slate-300">{stage.cost_percentage.toFixed(1)}%</td>
+                          <tr key={idx} className="border-b border-[#f0e7d9] hover:bg-[#fffbf5]">
+                            <td className="px-4 py-3 font-semibold text-[#27343d]">{stage.name}</td>
+                            <td className="px-4 py-3 text-right text-[#4f5d68]">{stage.total_tokens.toLocaleString()}</td>
+                            <td className="px-4 py-3 text-right font-medium text-[#3b82f6]">${stage.cost_usd.toFixed(6)}</td>
+                            <td className="px-4 py-3 text-right font-medium text-[#059669]">₹{(stage.cost_usd * (summary?.exchange_rate || 93.44)).toFixed(2)}</td>
+                            <td className="px-4 py-3 text-right text-[#4f5d68]">{stage.cost_percentage.toFixed(1)}%</td>
                           </tr>
                         ))}
-                        <tr className="border-t border-slate-700 bg-slate-700/30 font-semibold">
-                          <td className="px-4 py-3 text-white">TOTAL</td>
-                          <td className="px-4 py-3 text-right text-white">-</td>
-                          <td className="px-4 py-3 text-right text-green-400">${(summary?.total_cost_usd || 0).toFixed(6)}</td>
-                          <td className="px-4 py-3 text-right text-white">100%</td>
+                        <tr className="border-t border-[#ede3d3] bg-[#fffbf5] font-semibold">
+                          <td className="px-4 py-3 text-[#1f2b33]">TOTAL</td>
+                          <td className="px-4 py-3 text-right text-[#1f2b33]">-</td>
+                          <td className="px-4 py-3 text-right text-[#3b82f6]">${(summary?.total_cost_usd || 0).toFixed(6)}</td>
+                          <td className="px-4 py-3 text-right text-[#059669]">₹{(summary?.total_cost_inr || 0).toFixed(2)}</td>
+                          <td className="px-4 py-3 text-right text-[#1f2b33]">100%</td>
                         </tr>
                       </tbody>
                     </table>
