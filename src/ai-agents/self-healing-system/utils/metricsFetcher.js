@@ -365,13 +365,14 @@ class MetricsFetcher {
     }
 
     return {
-      name: this.normalizeWorkloadName(pod.name || pod.podName || pod.id || 'unknown'),
+      name: this.normalizeWorkloadName(pod.name || pod.pod_name || pod.podName || pod.id || 'unknown'),
       namespace: pod.namespace || 'default',
       status: pod.status || pod.phase || pod.state || 'Unknown',
       phase: pod.phase || pod.status || 'Unknown',
-      cpu: this.parseMetric(pod.cpu || pod.cpuUsage),
-      memory: this.parseMetric(pod.memory || pod.memoryUsage),
-      restarts: parseInt(pod.restarts || pod.restartCount) || 0,
+      reason: pod.reason || pod.statusReason || pod.waiting_reason || '',
+      cpu: this.parseMetric(pod.cpu || pod.cpu_usage || pod.cpuUsage),
+      memory: this.parseMetric(pod.memory || pod.memory_usage || pod.memoryUsage),
+      restarts: parseInt(pod.restarts || pod.restart_count || pod.restartCount) || 0,
       ready: pod.ready !== undefined ? pod.ready : true,
       labels: pod.labels || pod.metadata?.labels || {},
       env: env,

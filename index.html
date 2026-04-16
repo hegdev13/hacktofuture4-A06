@@ -1,0 +1,234 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>SRE Decision Studio - Kubernetes Observability</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=IBM+Plex+Mono:wght@400;500;700&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <div class="backdrop"></div>
+
+    <!-- Navigation Tabs -->
+    <nav class="nav-tabs">
+      <button class="tab-btn active" data-tab="pipeline">SRE Pipeline</button>
+      <button class="tab-btn" data-tab="metrics">Live Metrics & Pods</button>
+    </nav>
+
+    <main class="layout">
+      <!-- Tab 1: SRE Decision Pipeline -->
+      <section id="pipeline-tab" class="tab-content active">
+        <section class="hero reveal">
+          <p class="kicker">Kubernetes Incident Intelligence</p>
+          <h1>SRE Decision Studio</h1>
+          <p class="subtitle">
+            Inspect exactly how each stage works: Observer -> Root Cause -> Decider -> Execution.
+          </p>
+          <div class="model-strip">
+            <div class="model-card">
+              <span class="label">Primary LLM</span>
+              <strong>GPT-5.3-Codex</strong>
+              <small>Used only in fallback reasoning if confidence is low.</small>
+            </div>
+            <div class="model-card">
+              <span class="label">Deterministic Engines</span>
+              <strong>Rulebook + Regex + Simulated Classifier</strong>
+              <small>Default path to minimize cost and reduce random behavior.</small>
+            </div>
+          </div>
+        </section>
+
+        <section class="grid reveal delay-1">
+          <article class="panel input-panel">
+            <div class="panel-head">
+              <h2>Incident Input</h2>
+              <button id="runBtn">Run Pipeline</button>
+            </div>
+            <textarea id="incidentInput" spellcheck="false"></textarea>
+          </article>
+
+          <article class="panel result-panel">
+            <div class="panel-head">
+              <h2>Final Output</h2>
+              <span id="decisionBadge" class="badge idle">Waiting</span>
+            </div>
+            <pre id="finalOutput"></pre>
+          </article>
+        </section>
+
+        <section class="agents reveal delay-2">
+          <article class="agent observer">
+            <h3>Observer Agent</h3>
+            <p>Collects logs, metrics, traces, and deployment signals.</p>
+            <ul id="observerList"></ul>
+          </article>
+
+          <article class="agent root-cause">
+            <h3>Root Cause Agent</h3>
+            <p>Runs strict Step 1 and Step 2 checks before anything else.</p>
+            <ul id="rootCauseList"></ul>
+          </article>
+
+          <article class="agent decider">
+            <h3>Decider Agent</h3>
+            <p>Computes impact-confidence-cost score and picks best action.</p>
+            <ul id="deciderList"></ul>
+          </article>
+
+          <article class="agent execution">
+            <h3>Execution Agent</h3>
+            <p>Emits action plan and expected blast radius summary.</p>
+            <ul id="executionList"></ul>
+          </article>
+        </section>
+      </section>
+
+      <!-- Tab 2: Live Metrics & Pods -->
+      <section id="metrics-tab" class="tab-content">
+        <!-- Live Cluster Status -->
+        <section class="hero reveal">
+          <p class="kicker">Real-time Observability</p>
+          <h1>Cluster Health Dashboard</h1>
+          <p class="subtitle">
+            Live metrics from your Kubernetes cluster. Pods, nodes, and resource usage.
+          </p>
+          <div class="connection-status">
+            <span class="status-indicator" id="connectionStatus"></span>
+            <span id="connectionText">Connecting...</span>
+            <button id="refreshMetricsBtn" class="refresh-btn">Refresh Now</button>
+          </div>
+        </section>
+
+        <!-- Cluster Overview Stats -->
+        <section class="grid reveal delay-1">
+          <article class="panel stats-panel">
+            <div class="panel-head">
+              <h2>Cluster Overview</h2>
+              <span class="badge" id="clusterStatusBadge">Loading...</span>
+            </div>
+            <div class="stats-grid" id="clusterStats">
+              <div class="stat-item">
+                <span class="stat-value" id="totalNodes">-</span>
+                <span class="stat-label">Nodes</span>
+              </div>
+              <div class="stat-item">
+                <span class="stat-value" id="totalPods">-</span>
+                <span class="stat-label">Total Pods</span>
+              </div>
+              <div class="stat-item healthy">
+                <span class="stat-value" id="runningPods">-</span>
+                <span class="stat-label">Running</span>
+              </div>
+              <div class="stat-item warning">
+                <span class="stat-value" id="failedPods">-</span>
+                <span class="stat-label">Failed</span>
+              </div>
+            </div>
+          </article>
+
+          <article class="panel stats-panel">
+            <div class="panel-head">
+              <h2>Resource Usage</h2>
+              <span class="badge idle">Live</span>
+            </div>
+            <div class="resource-bars" id="resourceBars">
+              <div class="resource-item">
+                <div class="resource-label">
+                  <span>CPU</span>
+                  <span id="cpuValue">-</span>
+                </div>
+                <div class="resource-bar">
+                  <div class="resource-fill" id="cpuBar"></div>
+                </div>
+              </div>
+              <div class="resource-item">
+                <div class="resource-label">
+                  <span>Memory</span>
+                  <span id="memoryValue">-</span>
+                </div>
+                <div class="resource-bar">
+                  <div class="resource-fill" id="memoryBar"></div>
+                </div>
+              </div>
+              <div class="resource-item">
+                <div class="resource-label">
+                  <span>Storage</span>
+                  <span id="storageValue">-</span>
+                </div>
+                <div class="resource-bar">
+                  <div class="resource-fill" id="storageBar"></div>
+                </div>
+              </div>
+            </div>
+          </article>
+        </section>
+
+        <!-- Nodes Section -->
+        <section class="grid reveal delay-2">
+          <article class="panel nodes-panel">
+            <div class="panel-head">
+              <h2>Nodes</h2>
+              <span class="badge idle" id="nodesCount">0 nodes</span>
+            </div>
+            <div class="nodes-list" id="nodesList">
+              <p class="loading-text">Loading nodes...</p>
+            </div>
+          </article>
+        </section>
+
+        <!-- Pods Section -->
+        <section class="grid reveal delay-3">
+          <article class="panel pods-panel">
+            <div class="panel-head">
+              <h2>Pods & Containers</h2>
+              <div class="panel-actions">
+                <input type="text" id="podFilter" placeholder="Filter pods..." class="filter-input">
+                <span class="badge" id="podsCount">0 pods</span>
+              </div>
+            </div>
+            <div class="pods-grid" id="podsGrid">
+              <p class="loading-text">Loading pods...</p>
+            </div>
+          </article>
+        </section>
+
+        <!-- Alerts Section -->
+        <section class="grid reveal delay-4">
+          <article class="panel alerts-panel">
+            <div class="panel-head">
+              <h2>Active Alerts</h2>
+              <span class="badge" id="alertsCount">0 alerts</span>
+            </div>
+            <div class="alerts-list" id="alertsList">
+              <p class="loading-text">Loading alerts...</p>
+            </div>
+          </article>
+        </section>
+
+        <!-- SRE Agent Control Panel -->
+        <section class="grid reveal delay-5">
+          <article class="panel sre-panel">
+            <div class="panel-head">
+              <h2>🤖 SRE Agent Control</h2>
+              <div class="panel-actions">
+                <button id="autoHealBtn" class="btn-auto-heal">🤖 Enable Auto-Heal</button>
+                <button id="resetAllBtn" class="btn-reset">🔄 Reset All</button>
+              </div>
+            </div>
+            <div id="sreAnalysisPanel" class="sre-analysis-container">
+              <p class="loading-text">Waiting for issues to analyze...</p>
+            </div>
+          </article>
+        </section>
+      </section>
+    </main>
+
+    <script src="app.js"></script>
+  </body>
+</html>

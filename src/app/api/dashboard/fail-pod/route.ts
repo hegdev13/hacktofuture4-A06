@@ -4,6 +4,16 @@ import { z } from "zod";
 
 export const runtime = "nodejs";
 
+const PROTECTED_NAMESPACES = new Set([
+  "kube-system",
+  "kube-public",
+  "kube-node-lease",
+  "local-path-storage",
+  "ingress-nginx",
+  "cert-manager",
+  "monitoring",
+]);
+
 const BodySchema = z.object({
   podName: z.string().min(1),
   namespace: z.string().min(1).default("default"),
@@ -39,6 +49,11 @@ function parseOwner(stdout: string): { kind: string; name: string } | null {
     return null;
   }
   return { kind, name };
+}
+
+function isNotFound(stderr: string) {
+  const s = stderr.toLowerCase();
+  return s.includes("notfound") || s.includes("not found");
 }
 
 function queryOwner(namespace: string, resourceType: string, resourceName: string) {
@@ -99,13 +114,34 @@ export async function POST(request: Request) {
   }
 
   const { podName, namespace } = parsed.data;
-  if (namespace !== "default") {
+  if (PROTECTED_NAMESPACES.has(namespace)) {
     return NextResponse.json(
       {
         ok: false,
-        error: "only_default_namespace_supported",
+        error: "protected_namespace_not_supported",
       },
       { status: 400 },
+    );
+  }
+
+  const podCheck = runKubectl(["get", "pod", podName, "-n", namespace, "-o", "name"]);
+  if (!podCheck.ok) {
+    if (isNotFound(podCheck.stderr)) {
+      return NextResponse.json({
+        ok: true,
+        action: "already_missing",
+        namespace,
+        podName,
+        message: `Pod ${namespace}/${podName} is already missing.`,
+      });
+    }
+
+    return NextResponse.json(
+      {
+        ok: false,
+        error: podCheck.stderr || "failed_to_query_pod",
+      },
+      { status: 500 },
     );
   }
 
@@ -141,10 +177,33 @@ export async function POST(request: Request) {
     });
   }
 
+  const deleteRes = runKubectl([
+    "delete",
+    "pod",
+    podName,
+    "-n",
+    namespace,
+    "--grace-period=0",
+    "--force",
+  ]);
+
+  if (deleteRes.ok || isNotFound(deleteRes.stderr)) {
+    return NextResponse.json({
+      ok: true,
+      action: deleteRes.ok ? "deleted_pod" : "already_missing",
+      namespace,
+      podName,
+      message: deleteRes.ok
+        ? `Deleted pod ${namespace}/${podName}.`
+        : `Pod ${namespace}/${podName} is already missing.`,
+      output: deleteRes.stdout,
+    });
+  }
+
   return NextResponse.json(
     {
       ok: false,
-      error: "unsupported_workload_for_scale_to_zero",
+      error: deleteRes.stderr || "unsupported_workload_for_scale_to_zero",
     },
     { status: 409 },
   );

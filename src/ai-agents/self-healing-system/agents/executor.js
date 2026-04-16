@@ -113,6 +113,24 @@ class ExecutionerAgent {
     // First issue in chain gives context
     const primaryIssue = failureChain[0] || '';
     const primaryReason = rcaOutput.chainDetails?.[0]?.health?.reason || '';
+    const primaryIssueLower = String(primaryIssue || '').toLowerCase();
+    const primaryReasonLower = String(primaryReason || '').toLowerCase();
+
+    if (
+      primaryIssueLower.includes('image_pull') ||
+      primaryIssueLower.includes('imagepull') ||
+      primaryReasonLower.includes('imagepull') ||
+      primaryReasonLower.includes('errimagepull') ||
+      primaryReasonLower.includes('invalidimage')
+    ) {
+      strategy = {
+        type: 'rollback',
+        target: this.getDeploymentName(rootCause, clusterState),
+        namespace: this.getNamespace(rootCause, clusterState),
+        priority: 0,
+      };
+      return strategy;
+    }
 
     // Strategy selection logic
     let strategy = {
@@ -121,6 +139,27 @@ class ExecutionerAgent {
       namespace: this.getNamespace(rootCause, clusterState),
       priority: 1,
     };
+
+    const deploymentForRoot = this.getDeploymentName(rootCause, clusterState);
+    const rootNamespace = this.getNamespace(rootCause, clusterState);
+    const siblingPods = (clusterState.pods || []).filter(
+      (p) => this.getDeploymentName(p.name, clusterState) === deploymentForRoot && (p.namespace || 'default') === rootNamespace,
+    );
+    const hasHealthySibling = siblingPods.some((p) => String(p.status || p.phase || '').toLowerCase() === 'running');
+    const hasUnhealthySibling = siblingPods.some((p) => {
+      const s = String(p.status || p.phase || '').toLowerCase();
+      return s.includes('failed') || s.includes('pending') || s.includes('backoff') || s.includes('crash') || s.includes('error');
+    });
+
+    if (manualTargetKind === 'pod' && hasHealthySibling && hasUnhealthySibling) {
+      strategy = {
+        type: 'rollback',
+        target: deploymentForRoot,
+        namespace: rootNamespace,
+        priority: 0,
+      };
+      return strategy;
+    }
 
     if (manualTargetKind === 'deployment' || rootCauseType === 'deployment') {
       strategy = {

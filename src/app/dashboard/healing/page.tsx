@@ -20,6 +20,12 @@ type HealingTarget = {
   kind: HealingTargetKind;
 };
 
+type DeploymentsResponse = {
+  ok?: boolean;
+  error?: string;
+  deployments?: HealingTarget[];
+};
+
 type StructuredHealingLog = {
   id: string;
   timestamp: string;
@@ -31,6 +37,24 @@ type StructuredHealingLog = {
   status: HealingLogStatus;
   confidence?: number;
   reasoning?: string;
+  raw?: Record<string, unknown>;
+};
+
+type LlmCallRow = {
+  key: string;
+  timestamp: string;
+  issueId: string;
+  task: string;
+  service: string;
+  issue: string;
+  decision: string;
+  confidence: number | null;
+  inputTokens: number;
+  outputTokens: number;
+  totalTokens: number;
+  costUsd: number;
+  model: string;
+  source: string;
 };
 
 type IssueLifecycle = {
@@ -164,17 +188,21 @@ export default function HealingDashboardPage() {
     setTargetLoading(true);
     setTargetError("");
     try {
-      const url = new URL("/api/dashboard/pods", window.location.origin);
-      url.searchParams.set("ngrok_url", sourceUrl);
+      const podsUrl = new URL("/api/dashboard/pods", window.location.origin);
+      podsUrl.searchParams.set("ngrok_url", sourceUrl);
 
-      const res = await fetch(url.toString(), { cache: "no-store" });
-      const data = (await res.json()) as { ok?: boolean; error?: string; pods?: HealingTarget[] };
-      if (!res.ok) {
-        throw new Error(data.error || `Failed to load live pods (${res.status})`);
+      const [podsRes, deployRes] = await Promise.all([
+        fetch(podsUrl.toString(), { cache: "no-store" }),
+        fetch("/api/dashboard/deployments", { cache: "no-store" }),
+      ]);
+
+      const podsData = (await podsRes.json()) as { ok?: boolean; error?: string; pods?: HealingTarget[] };
+      if (!podsRes.ok) {
+        throw new Error(podsData.error || `Failed to load live pods (${podsRes.status})`);
       }
 
-      const normalized = Array.isArray(data.pods)
-        ? data.pods
+      const normalizedPods = Array.isArray(podsData.pods)
+        ? podsData.pods
             .map((pod) => {
               const rawName = String(pod.pod_name || "").trim();
               const deploymentMatch = rawName.match(/^(.*)\s+\(deployment\)$/i);
@@ -189,12 +217,24 @@ export default function HealingDashboardPage() {
                 kind: isDeployment ? "deployment" : "pod",
               };
             })
-            .sort((a, b) => {
-              const aRisk = /crash|fail|pending|error/i.test(a.status) ? 0 : 1;
-              const bRisk = /crash|fail|pending|error/i.test(b.status) ? 0 : 1;
-              return aRisk - bRisk || a.namespace.localeCompare(b.namespace) || a.pod_name.localeCompare(b.pod_name);
-            })
         : [];
+
+      const deployData = (await deployRes.json().catch(() => ({}))) as DeploymentsResponse;
+      const normalizedDeployments = deployRes.ok && Array.isArray(deployData.deployments) ? deployData.deployments : [];
+
+      const combinedMap = new Map<string, HealingTarget>();
+      for (const target of normalizedDeployments) {
+        combinedMap.set(`${target.namespace}/${target.kind}/${target.pod_name}`, target);
+      }
+      for (const target of normalizedPods) {
+        combinedMap.set(`${target.namespace}/${target.kind}/${target.pod_name}`, target);
+      }
+
+      const normalized = Array.from(combinedMap.values()).sort((a, b) => {
+        const aRisk = /crash|fail|pending|error/i.test(a.status) ? 0 : 1;
+        const bRisk = /crash|fail|pending|error/i.test(b.status) ? 0 : 1;
+        return aRisk - bRisk || a.namespace.localeCompare(b.namespace) || a.pod_name.localeCompare(b.pod_name);
+      });
 
       setTargets(normalized);
       setSelectedTargetId((prev) => {
@@ -377,6 +417,74 @@ export default function HealingDashboardPage() {
     return [...logs].reverse().find((l) => l.reasoning || typeof l.confidence === "number");
   }, [logs]);
 
+  const llmCallRows = useMemo(() => {
+    const rows: LlmCallRow[] = [];
+
+    for (const log of logs) {
+      if (log.agent_name !== "GeminiKnowledgeBase") continue;
+
+      const plan = (log.raw as { plan?: unknown } | undefined)?.plan as
+        | {
+            source?: string;
+            assessments?: Array<{
+              task?: string;
+              service?: string;
+              issue?: string;
+              decision?: string;
+              confidence?: number;
+              metadata?: {
+                estimated_input_tokens?: number;
+                estimated_output_tokens?: number;
+                cost_usd?: number;
+                model?: string;
+              };
+            }>;
+          }
+        | undefined;
+
+      const assessments = Array.isArray(plan?.assessments) ? plan.assessments : [];
+      for (let idx = 0; idx < assessments.length; idx += 1) {
+        const item = assessments[idx] || {};
+        const inputTokens = Number(item.metadata?.estimated_input_tokens || 0);
+        const outputTokens = Number(item.metadata?.estimated_output_tokens || 0);
+        const costUsd = Number(item.metadata?.cost_usd || 0);
+
+        rows.push({
+          key: `${log.id}-${idx}`,
+          timestamp: log.timestamp,
+          issueId: log.issue_id,
+          task: String(item.task || "unknown"),
+          service: String(item.service || "unknown"),
+          issue: String(item.issue || "unknown"),
+          decision: String(item.decision || "observe"),
+          confidence: typeof item.confidence === "number" ? item.confidence : null,
+          inputTokens,
+          outputTokens,
+          totalTokens: inputTokens + outputTokens,
+          costUsd,
+          model: String(item.metadata?.model || "unknown"),
+          source: String(plan?.source || "unknown"),
+        });
+      }
+    }
+
+    return rows.sort((a, b) => Date.parse(b.timestamp) - Date.parse(a.timestamp));
+  }, [logs]);
+
+  const llmTotals = useMemo(() => {
+    return llmCallRows.reduce(
+      (acc, row) => {
+        acc.calls += 1;
+        acc.inputTokens += row.inputTokens;
+        acc.outputTokens += row.outputTokens;
+        acc.totalTokens += row.totalTokens;
+        acc.costUsd += row.costUsd;
+        return acc;
+      },
+      { calls: 0, inputTokens: 0, outputTokens: 0, totalTokens: 0, costUsd: 0 },
+    );
+  }, [llmCallRows]);
+
   const selectedTarget = useMemo(() => {
     return targets.find((t) => `${t.namespace}/${t.kind}/${t.pod_name}` === selectedTargetId) || null;
   }, [targets, selectedTargetId]);
@@ -418,7 +526,7 @@ export default function HealingDashboardPage() {
               className="min-w-[280px] rounded-lg border border-[#dfd4c2] bg-white px-3 py-2 text-sm"
               disabled={targetLoading || targets.length === 0}
             >
-              <option value="">{targetLoading ? "Loading live /pods list..." : "Select a pod from live /pods list"}</option>
+              <option value="">{targetLoading ? "Loading live pod/deployment targets..." : "Select a pod or deployment"}</option>
               {targets.map((target) => (
                 <option key={`${target.namespace}/${target.kind}/${target.pod_name}`} value={`${target.namespace}/${target.kind}/${target.pod_name}`}>
                   {target.namespace}/{target.pod_name} · {target.kind} · {target.status}
@@ -669,6 +777,87 @@ export default function HealingDashboardPage() {
           </CardBody>
         </Card>
       </div>
+
+      <Card>
+        <CardHeader>
+          <div className="flex items-center gap-2 text-lg font-semibold text-[#1f2b33]">
+            <BrainCircuit className="h-5 w-5" />
+            LLM Token + Cost Telemetry
+          </div>
+          <div className="text-sm text-muted">
+            Real-time Gemini call accounting captured during self-heal runs.
+          </div>
+        </CardHeader>
+        <CardBody>
+          <div className="mb-3 grid gap-2 md:grid-cols-5">
+            <div className="rounded-lg border border-[#e7ddcd] bg-[#fff8ee] px-3 py-2 text-sm">
+              <div className="text-xs text-muted">Calls</div>
+              <div className="font-semibold text-[#1f2b33]">{llmTotals.calls}</div>
+            </div>
+            <div className="rounded-lg border border-[#e7ddcd] bg-[#fff8ee] px-3 py-2 text-sm">
+              <div className="text-xs text-muted">Input tokens</div>
+              <div className="font-semibold text-[#1f2b33]">{llmTotals.inputTokens}</div>
+            </div>
+            <div className="rounded-lg border border-[#e7ddcd] bg-[#fff8ee] px-3 py-2 text-sm">
+              <div className="text-xs text-muted">Output tokens</div>
+              <div className="font-semibold text-[#1f2b33]">{llmTotals.outputTokens}</div>
+            </div>
+            <div className="rounded-lg border border-[#e7ddcd] bg-[#fff8ee] px-3 py-2 text-sm">
+              <div className="text-xs text-muted">Total tokens</div>
+              <div className="font-semibold text-[#1f2b33]">{llmTotals.totalTokens}</div>
+            </div>
+            <div className="rounded-lg border border-[#e7ddcd] bg-[#fff8ee] px-3 py-2 text-sm">
+              <div className="text-xs text-muted">Estimated cost (USD)</div>
+              <div className="font-semibold text-[#1f2b33]">${llmTotals.costUsd.toFixed(6)}</div>
+            </div>
+          </div>
+
+          <div className="max-h-[320px] overflow-auto rounded-xl border border-[#e9dece] bg-[#fff8ee]">
+            <table className="w-full text-left text-sm">
+              <thead className="sticky top-0 bg-[#f6edde] text-xs uppercase tracking-wider text-muted">
+                <tr>
+                  <th className="px-3 py-2">Time</th>
+                  <th className="px-3 py-2">Task</th>
+                  <th className="px-3 py-2">Service</th>
+                  <th className="px-3 py-2">Decision</th>
+                  <th className="px-3 py-2">Confidence</th>
+                  <th className="px-3 py-2">Input</th>
+                  <th className="px-3 py-2">Output</th>
+                  <th className="px-3 py-2">Total</th>
+                  <th className="px-3 py-2">Cost</th>
+                  <th className="px-3 py-2">Model</th>
+                </tr>
+              </thead>
+              <tbody>
+                {llmCallRows.length === 0 ? (
+                  <tr>
+                    <td className="px-3 py-3 text-muted" colSpan={10}>
+                      No LLM calls captured yet. Click Start Healing to populate this table in real time.
+                    </td>
+                  </tr>
+                ) : (
+                  llmCallRows.map((row) => (
+                    <tr key={row.key} className="border-t border-[#efe4d5] align-top">
+                      <td className="px-3 py-2 text-xs text-[#4f5d68]">{formatTs(row.timestamp)}</td>
+                      <td className="px-3 py-2">{row.task}</td>
+                      <td className="px-3 py-2 text-[#4f5d68]">{row.service}</td>
+                      <td className="px-3 py-2 text-[#1f2b33]">{row.decision}</td>
+                      <td className="px-3 py-2 text-[#4f5d68]">
+                        {typeof row.confidence === "number" ? `${Math.round(row.confidence * 100)}%` : "-"}
+                      </td>
+                      <td className="px-3 py-2 text-[#4f5d68]">{row.inputTokens}</td>
+                      <td className="px-3 py-2 text-[#4f5d68]">{row.outputTokens}</td>
+                      <td className="px-3 py-2 text-[#4f5d68]">{row.totalTokens}</td>
+                      <td className="px-3 py-2 text-[#1f2b33]">${row.costUsd.toFixed(6)}</td>
+                      <td className="px-3 py-2 text-xs text-[#4f5d68]">{row.model}</td>
+                    </tr>
+                  ))
+                )}
+              </tbody>
+            </table>
+          </div>
+        </CardBody>
+      </Card>
 
       <Card>
         <CardHeader>

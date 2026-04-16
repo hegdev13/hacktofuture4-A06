@@ -4,6 +4,19 @@ import { createSupabaseServerClient } from "@/lib/supabase/server";
 import { CreateEndpointSchema } from "@/lib/validation";
 import { rateLimit } from "@/lib/security/rate-limit";
 
+type LocalEndpoint = {
+  id: string;
+  name: string;
+  ngrok_url: string;
+  created_at: string;
+};
+
+const localEndpoints: LocalEndpoint[] = [];
+
+function hasSupabaseEnv() {
+  return Boolean(process.env.NEXT_PUBLIC_SUPABASE_URL && process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY);
+}
+
 const DeleteQuerySchema = z.object({
   id: z.string().uuid(),
 });
@@ -23,6 +36,13 @@ export async function GET() {
   });
   if (!rl.ok) {
     return NextResponse.json({ error: "rate_limited" }, { status: 429 });
+  }
+
+  if (!hasSupabaseEnv()) {
+    return NextResponse.json({
+      endpoints: localEndpoints,
+      mode: "local-dev",
+    });
   }
 
   const supabase = await createSupabaseServerClient();
@@ -57,6 +77,26 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: "rate_limited" }, { status: 429 });
   }
 
+  const body = await request.json().catch(() => null);
+  const parsed = CreateEndpointSchema.safeParse(body);
+  if (!parsed.success) {
+    return NextResponse.json(
+      { error: "invalid_request", details: parsed.error.flatten() },
+      { status: 400 },
+    );
+  }
+
+  if (!hasSupabaseEnv()) {
+    const endpoint: LocalEndpoint = {
+      id: crypto.randomUUID(),
+      name: parsed.data.name,
+      ngrok_url: parsed.data.ngrok_url,
+      created_at: new Date().toISOString(),
+    };
+    localEndpoints.unshift(endpoint);
+    return NextResponse.json({ endpoint, mode: "local-dev" });
+  }
+
   const supabase = await createSupabaseServerClient();
   const {
     data: { user },
@@ -65,15 +105,6 @@ export async function POST(request: Request) {
 
   if (userErr || !user) {
     return NextResponse.json({ error: "unauthorized" }, { status: 401 });
-  }
-
-  const body = await request.json().catch(() => null);
-  const parsed = CreateEndpointSchema.safeParse(body);
-  if (!parsed.success) {
-    return NextResponse.json(
-      { error: "invalid_request", details: parsed.error.flatten() },
-      { status: 400 },
-    );
   }
 
   const { data, error } = await supabase
@@ -107,6 +138,14 @@ export async function DELETE(request: Request) {
   const parsed = DeleteQuerySchema.safeParse({ id: url.searchParams.get("id") });
   if (!parsed.success) {
     return NextResponse.json({ error: "invalid_request" }, { status: 400 });
+  }
+
+  if (!hasSupabaseEnv()) {
+    const idx = localEndpoints.findIndex((ep) => ep.id === parsed.data.id);
+    if (idx !== -1) {
+      localEndpoints.splice(idx, 1);
+    }
+    return NextResponse.json({ ok: true, mode: "local-dev" });
   }
 
   const supabase = await createSupabaseServerClient();

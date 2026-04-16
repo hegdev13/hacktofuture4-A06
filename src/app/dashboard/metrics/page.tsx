@@ -1,8 +1,24 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
-import { Bar, BarChart, CartesianGrid, Pie, PieChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
+import {
+  Area,
+  AreaChart,
+  Bar,
+  BarChart,
+  CartesianGrid,
+  Legend,
+  Line,
+  LineChart,
+  Pie,
+  PieChart,
+  ResponsiveContainer,
+  Tooltip,
+  XAxis,
+  YAxis,
+} from "recharts";
 import { useSelectedEndpointId } from "@/components/dashboard/use-endpoint";
+import AdvancedObservabilityPanels from "@/components/dashboard/advanced-observability-panels";
 import { Card, CardBody, CardHeader } from "@/components/ui/card";
 import { formatBytes, formatNumber } from "@/lib/format";
 import { readSelectedEndpoint } from "@/lib/endpoints-client";
@@ -28,6 +44,16 @@ type UpstreamPod = {
   restart_count?: number | null;
 };
 
+type TrendPoint = {
+  tsLabel: string;
+  running: number;
+  pending: number;
+  failed: number;
+  avgCpu: number;
+  avgMem: number;
+  totalRestarts: number;
+};
+
 function podsToRows(endpointId: string, pods: UpstreamPod[], fetchedAt: string): SnapshotRow[] {
   return pods.map((p) => ({
     id: crypto.randomUUID(),
@@ -45,6 +71,7 @@ function podsToRows(endpointId: string, pods: UpstreamPod[], fetchedAt: string):
 export default function MetricsPage() {
   const endpointId = useSelectedEndpointId();
   const [rows, setRows] = useState<SnapshotRow[]>([]);
+  const [trend, setTrend] = useState<TrendPoint[]>([]);
   const [fetchError, setFetchError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -73,7 +100,51 @@ export default function MetricsPage() {
         };
         if (!res.ok) throw new Error(data.error || `Request failed (${res.status})`);
         if (!Array.isArray(data.pods)) throw new Error("Invalid response: missing pods");
-        setRows(podsToRows(selected.id, data.pods, data.fetched_at ?? new Date().toISOString()).slice(0, 800));
+        const mapped = podsToRows(selected.id, data.pods, data.fetched_at ?? new Date().toISOString()).slice(0, 800);
+        setRows(mapped);
+
+        const snapshot = mapped.reduce(
+          (acc, r) => {
+            const s = r.status.toLowerCase();
+            if (s.includes("running")) acc.running += 1;
+            else if (s.includes("pending")) acc.pending += 1;
+            else if (s.includes("crashloop") || s.includes("error") || s.includes("failed")) acc.failed += 1;
+
+            if (typeof r.cpu_usage === "number") {
+              acc.cpuSum += r.cpu_usage;
+              acc.cpuCount += 1;
+            }
+            if (typeof r.memory_usage === "number") {
+              acc.memSum += r.memory_usage;
+              acc.memCount += 1;
+            }
+
+            acc.totalRestarts += r.restart_count;
+            return acc;
+          },
+          {
+            running: 0,
+            pending: 0,
+            failed: 0,
+            cpuSum: 0,
+            cpuCount: 0,
+            memSum: 0,
+            memCount: 0,
+            totalRestarts: 0,
+          },
+        );
+
+        const point: TrendPoint = {
+          tsLabel: new Date().toISOString().slice(11, 19),
+          running: snapshot.running,
+          pending: snapshot.pending,
+          failed: snapshot.failed,
+          avgCpu: snapshot.cpuCount ? snapshot.cpuSum / snapshot.cpuCount : 0,
+          avgMem: snapshot.memCount ? snapshot.memSum / snapshot.memCount : 0,
+          totalRestarts: snapshot.totalRestarts,
+        };
+
+        setTrend((prev) => [...prev.slice(-59), point]);
         setFetchError(null);
       } catch (e) {
         setFetchError(e instanceof Error ? e.message : String(e));
@@ -124,6 +195,44 @@ export default function MetricsPage() {
         pod: r.pod_name.length > 20 ? `${r.pod_name.slice(0, 20)}...` : r.pod_name,
         restarts: r.restart_count,
       }));
+  }, [latestByPod]);
+
+  const namespaceSeries = useMemo(() => {
+    const map = new Map<string, { namespace: string; running: number; failed: number; pending: number; restarts: number }>();
+    for (const r of latestByPod) {
+      const cur = map.get(r.namespace) ?? {
+        namespace: r.namespace,
+        running: 0,
+        failed: 0,
+        pending: 0,
+        restarts: 0,
+      };
+      const s = r.status.toLowerCase();
+      if (s.includes("running")) cur.running += 1;
+      else if (s.includes("pending")) cur.pending += 1;
+      else if (s.includes("crashloop") || s.includes("error") || s.includes("failed")) cur.failed += 1;
+      cur.restarts += r.restart_count;
+      map.set(r.namespace, cur);
+    }
+    return Array.from(map.values())
+      .sort((a, b) => b.running + b.pending + b.failed - (a.running + a.pending + a.failed))
+      .slice(0, 10);
+  }, [latestByPod]);
+
+  const liveStats = useMemo(() => {
+    const total = latestByPod.length;
+    let failed = 0;
+    let pending = 0;
+    let running = 0;
+    let restarts = 0;
+    for (const r of latestByPod) {
+      const s = r.status.toLowerCase();
+      if (s.includes("running")) running += 1;
+      else if (s.includes("pending")) pending += 1;
+      else if (s.includes("crashloop") || s.includes("error") || s.includes("failed")) failed += 1;
+      restarts += r.restart_count;
+    }
+    return { total, running, pending, failed, restarts };
   }, [latestByPod]);
 
   if (!endpointId) {
@@ -203,6 +312,131 @@ export default function MetricsPage() {
           </CardBody>
         </Card>
       </div>
+
+      <div className="grid gap-4 lg:grid-cols-4">
+        <Card>
+          <CardHeader>
+            <div className="text-xs uppercase tracking-widest text-muted">Total Pods</div>
+          </CardHeader>
+          <CardBody>
+            <div className="text-3xl font-bold text-[#1f2b33]">{liveStats.total}</div>
+          </CardBody>
+        </Card>
+        <Card>
+          <CardHeader>
+            <div className="text-xs uppercase tracking-widest text-muted">Running</div>
+          </CardHeader>
+          <CardBody>
+            <div className="text-3xl font-bold text-ok">{liveStats.running}</div>
+          </CardBody>
+        </Card>
+        <Card>
+          <CardHeader>
+            <div className="text-xs uppercase tracking-widest text-muted">Pending</div>
+          </CardHeader>
+          <CardBody>
+            <div className="text-3xl font-bold text-accent">{liveStats.pending}</div>
+          </CardBody>
+        </Card>
+        <Card>
+          <CardHeader>
+            <div className="text-xs uppercase tracking-widest text-muted">Failed</div>
+          </CardHeader>
+          <CardBody>
+            <div className="text-3xl font-bold text-danger">{liveStats.failed}</div>
+          </CardBody>
+        </Card>
+      </div>
+
+      <div className="grid gap-4 lg:grid-cols-2">
+        <Card>
+          <CardHeader>
+            <div className="text-2xl font-bold tracking-tight text-[#1f2b33]">Pod State Trend</div>
+            <div className="text-sm text-muted">Live running/pending/failed over time.</div>
+          </CardHeader>
+          <CardBody className="h-72">
+            {trend.length ? (
+              <ResponsiveContainer width="100%" height="100%">
+                <AreaChart data={trend} margin={{ left: 10, right: 10, top: 8, bottom: 8 }}>
+                  <defs>
+                    <linearGradient id="runningFill" x1="0" y1="0" x2="0" y2="1">
+                      <stop offset="5%" stopColor="#5a9b7d" stopOpacity={0.35} />
+                      <stop offset="95%" stopColor="#5a9b7d" stopOpacity={0.02} />
+                    </linearGradient>
+                    <linearGradient id="failedFill" x1="0" y1="0" x2="0" y2="1">
+                      <stop offset="5%" stopColor="#ca5a58" stopOpacity={0.35} />
+                      <stop offset="95%" stopColor="#ca5a58" stopOpacity={0.02} />
+                    </linearGradient>
+                  </defs>
+                  <CartesianGrid strokeDasharray="3 3" stroke="rgba(90,107,118,0.15)" />
+                  <XAxis dataKey="tsLabel" tick={{ fill: "#6f7a84", fontSize: 11 }} />
+                  <YAxis tick={{ fill: "#6f7a84", fontSize: 11 }} allowDecimals={false} />
+                  <Tooltip />
+                  <Legend />
+                  <Area type="monotone" dataKey="running" stroke="#5a9b7d" fill="url(#runningFill)" name="Running" />
+                  <Area type="monotone" dataKey="pending" stroke="#db8a52" fill="#db8a5222" name="Pending" />
+                  <Area type="monotone" dataKey="failed" stroke="#ca5a58" fill="url(#failedFill)" name="Failed" />
+                </AreaChart>
+              </ResponsiveContainer>
+            ) : (
+              <div className="text-sm text-muted">No trend points yet.</div>
+            )}
+          </CardBody>
+        </Card>
+
+        <Card>
+          <CardHeader>
+            <div className="text-2xl font-bold tracking-tight text-[#1f2b33]">Resource + Restart Trend</div>
+            <div className="text-sm text-muted">Average CPU, memory, and total restarts.</div>
+          </CardHeader>
+          <CardBody className="h-72">
+            {trend.length ? (
+              <ResponsiveContainer width="100%" height="100%">
+                <LineChart data={trend} margin={{ left: 10, right: 10, top: 8, bottom: 8 }}>
+                  <CartesianGrid strokeDasharray="3 3" stroke="rgba(90,107,118,0.15)" />
+                  <XAxis dataKey="tsLabel" tick={{ fill: "#6f7a84", fontSize: 11 }} />
+                  <YAxis yAxisId="left" tick={{ fill: "#6f7a84", fontSize: 11 }} />
+                  <YAxis yAxisId="right" orientation="right" tick={{ fill: "#6f7a84", fontSize: 11 }} allowDecimals={false} />
+                  <Tooltip />
+                  <Legend />
+                  <Line yAxisId="left" type="monotone" dataKey="avgCpu" stroke="#4e8f9b" dot={false} name="Avg CPU" strokeWidth={2} />
+                  <Line yAxisId="left" type="monotone" dataKey="avgMem" stroke="#8a97a1" dot={false} name="Avg Memory" strokeWidth={2} />
+                  <Line yAxisId="right" type="monotone" dataKey="totalRestarts" stroke="#ca5a58" dot={false} name="Total Restarts" strokeWidth={2} />
+                </LineChart>
+              </ResponsiveContainer>
+            ) : (
+              <div className="text-sm text-muted">No resource trend points yet.</div>
+            )}
+          </CardBody>
+        </Card>
+      </div>
+
+      <Card>
+        <CardHeader>
+          <div className="text-2xl font-bold tracking-tight text-[#1f2b33]">Namespace Health Grid</div>
+          <div className="text-sm text-muted">Compare namespace load and failures at a glance.</div>
+        </CardHeader>
+        <CardBody className="h-72">
+          {namespaceSeries.length ? (
+            <ResponsiveContainer width="100%" height="100%">
+              <BarChart data={namespaceSeries} margin={{ left: 10, right: 10, top: 8, bottom: 8 }}>
+                <CartesianGrid strokeDasharray="3 3" stroke="rgba(90,107,118,0.15)" />
+                <XAxis dataKey="namespace" tick={{ fill: "#6f7a84", fontSize: 11 }} />
+                <YAxis tick={{ fill: "#6f7a84", fontSize: 11 }} allowDecimals={false} />
+                <Tooltip />
+                <Legend />
+                <Bar dataKey="running" stackId="a" fill="#5a9b7d" name="Running" />
+                <Bar dataKey="pending" stackId="a" fill="#db8a52" name="Pending" />
+                <Bar dataKey="failed" stackId="a" fill="#ca5a58" name="Failed" />
+              </BarChart>
+            </ResponsiveContainer>
+          ) : (
+            <div className="text-sm text-muted">No namespace metrics yet.</div>
+          )}
+        </CardBody>
+      </Card>
+
+      <AdvancedObservabilityPanels endpointId={endpointId} />
 
       <Card>
         <CardHeader>

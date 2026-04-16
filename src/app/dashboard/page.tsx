@@ -89,6 +89,20 @@ type TimelineResponse = {
   events?: TimelineEventRow[];
 };
 
+const PROTECTED_NAMESPACES = new Set([
+  "kube-system",
+  "kube-public",
+  "kube-node-lease",
+  "local-path-storage",
+  "ingress-nginx",
+  "cert-manager",
+  "monitoring",
+]);
+
+function canFailNamespace(namespace: string) {
+  return !PROTECTED_NAMESPACES.has(namespace);
+}
+
 function podsToRows(endpointId: string, pods: UpstreamPod[], fetchedAt: string): SnapshotRow[] {
   return pods.map((p) => ({
     id: crypto.randomUUID(),
@@ -131,6 +145,7 @@ function summarizePods(pods: UpstreamPod[]) {
 
 export default function DashboardOverviewPage() {
   const [rows, setRows] = useState<SnapshotRow[]>([]);
+  const [stickyFailedRows, setStickyFailedRows] = useState<Record<string, SnapshotRow>>({});
   const [history, setHistory] = useState<PollHistoryPoint[]>([]);
   const [summaryLatest, setSummaryLatest] = useState<MetricsSummaryPoint | null>(null);
   const [activeAlertCount, setActiveAlertCount] = useState(0);
@@ -181,7 +196,17 @@ export default function DashboardOverviewPage() {
         memory_usage: p.memory_usage ?? null,
         restart_count: p.restart_count ?? 0,
       }));
-      setRows(podsToRows(sel.id, normalized, fetchedAt));
+        setRows(podsToRows(sel.id, normalized, fetchedAt));
+        setStickyFailedRows((prev) => {
+          const liveKeys = new Set(normalized.map((p) => `${p.namespace ?? "default"}/${p.pod_name}`));
+          const next = { ...prev };
+          for (const key of Object.keys(next)) {
+            if (liveKeys.has(key)) {
+              delete next[key];
+          }
+          }
+          return next;
+        });
 
       const [summaryRes, alertsRes, eventsRes] = await Promise.all([
         fetch(`/api/metrics/summary?endpoint=${encodeURIComponent(sel.id)}`, { cache: "no-store" }),
@@ -244,10 +269,15 @@ export default function DashboardOverviewPage() {
       const key = `${r.namespace}/${r.pod_name}`;
       if (!map.has(key)) map.set(key, r);
     }
+    for (const [key, failedRow] of Object.entries(stickyFailedRows)) {
+      if (!map.has(key)) {
+        map.set(key, failedRow);
+      }
+    }
     return Array.from(map.values()).sort((a, b) => a.pod_name.localeCompare(b.pod_name));
-  }, [rows]);
+  }, [rows, stickyFailedRows]);
 
-  const failablePods = useMemo(() => latestByPod.filter((r) => r.namespace === "default"), [latestByPod]);
+  const failablePods = useMemo(() => latestByPod.filter((r) => canFailNamespace(r.namespace)), [latestByPod]);
 
   const requestFailPod = useCallback(async (podName: string, namespace: string) => {
     const res = await fetch("/api/dashboard/fail-pod", {
@@ -262,16 +292,49 @@ export default function DashboardOverviewPage() {
       action?: string;
       targetKind?: string;
       targetName?: string;
+        podName?: string;
     };
 
     if (!res.ok || !data.ok) {
       throw new Error(data.error || `Failed to fail pod (${res.status})`);
     }
 
-    const action = data.action === "scaled_to_zero" ? "scaled to 0" : "skipped";
+      const action =
+        data.action === "scaled_to_zero"
+          ? "scaled to 0"
+          : data.action === "deleted_pod"
+            ? "pod deleted"
+            : data.action === "already_missing"
+              ? "already failed"
+              : "skipped";
     const resource = data.targetKind && data.targetName ? `${data.targetKind}/${data.targetName}` : podName;
     return { action, resource };
   }, []);
+
+  const markPodAsFailed = useCallback(
+    (podName: string, namespace: string) => {
+      const key = `${namespace}/${podName}`;
+      const existing = latestByPod.find((r) => r.pod_name === podName && r.namespace === namespace);
+      const endpointId = selectedEp?.id ?? "local";
+      const now = new Date().toISOString();
+
+      setStickyFailedRows((prev) => ({
+        ...prev,
+        [key]: {
+          id: existing?.id ?? crypto.randomUUID(),
+          endpoint_id: existing?.endpoint_id ?? endpointId,
+          pod_name: podName,
+          namespace,
+          status: "Failed",
+          cpu_usage: existing?.cpu_usage ?? null,
+          memory_usage: existing?.memory_usage ?? null,
+          restart_count: existing?.restart_count ?? 0,
+          timestamp: now,
+        },
+      }));
+    },
+    [latestByPod, selectedEp],
+  );
 
   const failPod = useCallback(
     async (podName: string, namespace: string) => {
@@ -281,6 +344,7 @@ export default function DashboardOverviewPage() {
       setFailingPodKey(key);
       try {
         const result = await requestFailPod(podName, namespace);
+        markPodAsFailed(podName, namespace);
         setFailMessage(`Failed target: ${namespace}/${result.resource} (${result.action}).`);
       } catch (e) {
         setFailError(e instanceof Error ? e.message : String(e));
@@ -289,12 +353,12 @@ export default function DashboardOverviewPage() {
         void poll();
       }
     },
-    [poll, requestFailPod],
+    [markPodAsFailed, poll, requestFailPod],
   );
 
   const failAllPods = useCallback(async () => {
     if (!failablePods.length) {
-      setFailError("No default-namespace pods available to fail.");
+      setFailError("No supported namespace pods available to fail.");
       return;
     }
 
@@ -308,6 +372,7 @@ export default function DashboardOverviewPage() {
       for (const row of failablePods) {
         try {
           await requestFailPod(row.pod_name, row.namespace);
+          markPodAsFailed(row.pod_name, row.namespace);
           success += 1;
         } catch {
           failed += 1;
@@ -324,7 +389,7 @@ export default function DashboardOverviewPage() {
       setFailingPodKey(null);
       void poll();
     }
-  }, [failablePods, poll, requestFailPod]);
+  }, [failablePods, markPodAsFailed, poll, requestFailPod]);
 
   useEffect(() => {
     const onEp = () => {
@@ -344,17 +409,6 @@ export default function DashboardOverviewPage() {
   }, [poll]);
 
   const cluster = useMemo(() => {
-    if (summaryLatest) {
-      return {
-        totalPods: summaryLatest.pod_running + summaryLatest.pod_failed + summaryLatest.pod_pending,
-        running: summaryLatest.pod_running,
-        failed: summaryLatest.pod_failed,
-        pending: summaryLatest.pod_pending,
-        avgCpu: summaryLatest.avg_cpu,
-        avgMem: summaryLatest.avg_memory,
-      };
-    }
-
     const totalPods = latestByPod.length;
     let running = 0;
     let failed = 0;
@@ -377,7 +431,7 @@ export default function DashboardOverviewPage() {
         memCount += 1;
       }
     }
-    return {
+    const live = {
       totalPods,
       running,
       failed,
@@ -385,6 +439,18 @@ export default function DashboardOverviewPage() {
       avgCpu: cpuCount ? cpuSum / cpuCount : null,
       avgMem: memCount ? memSum / memCount : null,
     };
+
+    // Summary rollups can lag behind the latest polled pod snapshot.
+    // Keep counts sourced from live pods; use summary only as a fallback for averages.
+    if (summaryLatest) {
+      return {
+        ...live,
+        avgCpu: summaryLatest.avg_cpu ?? live.avgCpu,
+        avgMem: summaryLatest.avg_memory ?? live.avgMem,
+      };
+    }
+
+    return live;
   }, [latestByPod]);
 
   const hasResourceMetrics = useMemo(
@@ -562,7 +628,7 @@ export default function DashboardOverviewPage() {
               disabled={failingAllPods || Boolean(failingPodKey) || !failablePods.length}
               className="rounded-md border border-[#e3c7c7] bg-[#fff1f1] px-3 py-2 text-xs font-semibold text-[#9f3232] hover:bg-[#ffe6e6] disabled:cursor-not-allowed disabled:opacity-60"
             >
-              {failingAllPods ? "Failing All..." : `Fail Default Pods (${failablePods.length})`}
+              {failingAllPods ? "Failing All..." : `Fail Supported Pods (${failablePods.length})`}
             </button>
           </div>
           {failError ? <div className="text-xs font-medium text-danger">{failError}</div> : null}
@@ -590,7 +656,12 @@ export default function DashboardOverviewPage() {
                     <td className="py-2">
                       <button
                         onClick={() => void failPod(r.pod_name, r.namespace)}
-                        disabled={Boolean(failingPodKey) || failingAllPods || r.namespace !== "default"}
+                        disabled={
+                          Boolean(failingPodKey) ||
+                          failingAllPods ||
+                          !canFailNamespace(r.namespace) ||
+                          r.status.toLowerCase().includes("failed")
+                        }
                         className="rounded-md border border-[#e3c7c7] bg-[#fff6f6] px-2 py-1 text-xs font-semibold text-[#9f3232] hover:bg-[#ffe9e9] disabled:cursor-not-allowed disabled:opacity-60"
                       >
                         {failingPodKey === `${r.namespace}/${r.pod_name}` ? "Failing..." : "Fail Pod"}

@@ -131,6 +131,7 @@ class SelfHealingSystem {
     let finalResult = null;
     const manualTarget = this.getManualTarget(options);
     let detection = null;
+    let manualTargetedIssue = null;
 
     logger.info('Starting validation loop...');
 
@@ -232,8 +233,8 @@ class SelfHealingSystem {
           break;
         }
 
-        const targetedIssue = this.buildManualTargetIssue(manualPod, manualTarget);
-        if (!targetedIssue) {
+        manualTargetedIssue = this.buildManualTargetIssue(manualPod, manualTarget);
+        if (!manualTargetedIssue) {
           logger.timelineEvent('success', `Selected target ${manualTarget.namespace}/${manualTarget.name} is already healthy`);
           finalResult = {
             success: true,
@@ -251,21 +252,21 @@ class SelfHealingSystem {
         this.setAgentStatus('detector', 'issues-confirmed', {
           step: 'manual-target',
           confirmed: 1,
-          confidence: targetedIssue.confidence,
+          confidence: manualTargetedIssue.confidence,
         });
 
         detection = {
           hasIssues: true,
-          confirmedIssues: [targetedIssue],
+          confirmedIssues: [manualTargetedIssue],
           categorizedIssues: {
-            bySeverity: { high: targetedIssue.severity === 'high' ? [targetedIssue] : [], medium: targetedIssue.severity === 'medium' ? [targetedIssue] : [], low: targetedIssue.severity === 'low' ? [targetedIssue] : [] },
-            byType: { [targetedIssue.type]: [targetedIssue] },
-            byResource: { [targetedIssue.target]: [targetedIssue] },
-            byNamespace: { [targetedIssue.namespace || 'default']: [targetedIssue] },
+            bySeverity: { high: manualTargetedIssue.severity === 'high' ? [manualTargetedIssue] : [], medium: manualTargetedIssue.severity === 'medium' ? [manualTargetedIssue] : [], low: manualTargetedIssue.severity === 'low' ? [manualTargetedIssue] : [] },
+            byType: { [manualTargetedIssue.type]: [manualTargetedIssue] },
+            byResource: { [manualTargetedIssue.target]: [manualTargetedIssue] },
+            byNamespace: { [manualTargetedIssue.namespace || 'default']: [manualTargetedIssue] },
           },
           failureGroups: [],
           patterns: [],
-          confidence: targetedIssue.confidence,
+          confidence: manualTargetedIssue.confidence,
           summary: `Manual target selected: ${manualTarget.namespace}/${manualTarget.name}`,
           timestamp: new Date().toISOString(),
         };
@@ -336,6 +337,11 @@ class SelfHealingSystem {
       };
 
       const rcaOutput = rca.performRCA(stateForRCA, detectedIssues);
+      if (manualTarget && manualTargetedIssue) {
+        rcaOutput.rootCause = manualTargetedIssue.target || manualTarget.name;
+        rcaOutput.rootCauseType = manualTarget.kind;
+        rcaOutput.manualTargetKind = manualTarget.kind;
+      }
       if (manualTarget?.kind === 'deployment') {
         rcaOutput.rootCauseType = 'deployment';
         rcaOutput.manualTargetKind = 'deployment';
@@ -887,9 +893,30 @@ class SelfHealingSystem {
       return match || null;
     }
 
-    return pods.find(
+    const exactMatch = pods.find(
       (pod) => this.normalizeWorkloadName(pod.name) === manualTarget.name && (pod.namespace || 'default') === manualTarget.namespace,
     ) || null;
+
+    if (exactMatch) {
+      return exactMatch;
+    }
+
+    // Pod names can change after restart/rollout; follow by workload prefix.
+    const workloadName = this.getDeploymentNameFromPodName(manualTarget.name);
+    const candidates = pods.filter(
+      (pod) => (pod.namespace || 'default') === manualTarget.namespace && this.getDeploymentNameFromPodName(pod.name) === workloadName,
+    );
+
+    if (candidates.length === 0) {
+      return null;
+    }
+
+    const unhealthy = candidates.find((pod) => {
+      const status = String(pod.status || pod.phase || '').toLowerCase();
+      return status.includes('failed') || status.includes('pending') || status.includes('crash') || status.includes('backoff') || pod.ready === false;
+    });
+
+    return unhealthy || candidates[0] || null;
   }
 
   /**
@@ -897,6 +924,7 @@ class SelfHealingSystem {
    */
   buildManualTargetIssue(pod, manualTarget) {
     const status = String(pod.status || pod.phase || '').toLowerCase();
+    const reason = String(pod.reason || pod.statusReason || '').toLowerCase();
     const cpu = Number(pod.cpu || 0);
     const memory = Number(pod.memory || 0);
     const restarts = Number(pod.restarts || 0);
@@ -904,16 +932,27 @@ class SelfHealingSystem {
 
     let issue = null;
 
-    if (status.includes('crash') || status.includes('backoff') || status === 'failed') {
+    if (reason.includes('imagepull') || reason.includes('errimagepull') || reason.includes('invalidimage')) {
+      issue = {
+        pod: pod.name,
+        namespace: pod.namespace || manualTarget.namespace,
+        target: manualTarget.kind === 'deployment' ? this.getDeploymentNameFromPodName(pod.name) : pod.name,
+        type: 'image_pull_error',
+        problem: `Targeted workload has image pull error (${pod.reason || 'unknown'})`,
+        severity: 'high',
+        metric: 'status',
+        details: { phase: pod.status || pod.phase, reason: pod.reason || null, targetKind: manualTarget.kind },
+      };
+    } else if (status.includes('crash') || status.includes('backoff') || status === 'failed') {
       issue = {
         pod: pod.name,
         namespace: pod.namespace || manualTarget.namespace,
         target: manualTarget.kind === 'deployment' ? this.getDeploymentNameFromPodName(pod.name) : pod.name,
         type: 'crash_loop',
-        problem: `Targeted workload is in ${pod.status || pod.phase} state`,
+        problem: `Targeted workload is in ${pod.status || pod.phase} state${pod.reason ? ` (${pod.reason})` : ''}`,
         severity: 'high',
         metric: 'status',
-        details: { phase: pod.status || pod.phase, targetKind: manualTarget.kind },
+        details: { phase: pod.status || pod.phase, reason: pod.reason || null, targetKind: manualTarget.kind },
       };
     } else if (status === 'pending') {
       issue = {
@@ -921,10 +960,10 @@ class SelfHealingSystem {
         namespace: pod.namespace || manualTarget.namespace,
         target: manualTarget.kind === 'deployment' ? this.getDeploymentNameFromPodName(pod.name) : pod.name,
         type: 'pod_pending',
-        problem: 'Targeted workload is pending',
+        problem: `Targeted workload is pending${pod.reason ? ` (${pod.reason})` : ''}`,
         severity: 'medium',
         metric: 'status',
-        details: { phase: pod.status || pod.phase, targetKind: manualTarget.kind },
+        details: { phase: pod.status || pod.phase, reason: pod.reason || null, targetKind: manualTarget.kind },
       };
     } else if (restarts >= config.severity.thresholds.restarts.critical) {
       issue = {
