@@ -158,6 +158,9 @@ export default function HealingDashboardPage() {
       if (res.ok && data.ok && data.summary) {
         setSummary(data.summary);
       }
+    } catch {
+      // Keep UI functional even if summary endpoint is temporarily unavailable.
+      setSummary(null);
     } finally {
       setLoadingSummary(false);
     }
@@ -197,7 +200,7 @@ export default function HealingDashboardPage() {
                 cpu_usage: typeof pod.cpu_usage === "number" ? pod.cpu_usage : null,
                 memory_usage: typeof pod.memory_usage === "number" ? pod.memory_usage : null,
                 restart_count: typeof pod.restart_count === "number" ? pod.restart_count : 0,
-                kind: isDeployment ? "deployment" : "pod",
+                kind: (isDeployment ? "deployment" : "pod") as HealingTargetKind,
               };
             })
             .sort((a, b) => {
@@ -224,27 +227,46 @@ export default function HealingDashboardPage() {
   }, [metricsUrl]);
 
   const fetchInitial = useCallback(async () => {
-    const [statusRes, logsRes] = await Promise.all([
-      fetch("/api/ai-agents/healing/status", { cache: "no-store" }),
-      fetch("/api/ai-agents/healing/logs", { cache: "no-store" }),
-    ]);
+    try {
+      const [statusRes, logsRes] = await Promise.all([
+        fetch("/api/ai-agents/healing/status", { cache: "no-store" }),
+        fetch("/api/ai-agents/healing/logs", { cache: "no-store" }),
+      ]);
 
-    const statusData = (await statusRes.json()) as {
-      ok: boolean;
-      status: AgentRunnerStatus;
-      lifecycle: IssueLifecycle[];
-    };
-    const logsData = (await logsRes.json()) as {
-      ok: boolean;
-      logs: StructuredHealingLog[];
-    };
+      const statusData = (await statusRes.json()) as {
+        ok: boolean;
+        status: AgentRunnerStatus;
+        lifecycle: IssueLifecycle[];
+      };
+      const logsData = (await logsRes.json()) as {
+        ok: boolean;
+        logs: StructuredHealingLog[];
+      };
 
-    if (statusData.ok) {
-      setStatus(statusData.status);
-      setLifecycle(statusData.lifecycle || []);
-    }
-    if (logsData.ok) {
-      setLogs(logsData.logs || []);
+      if (statusData.ok) {
+        setStatus(statusData.status);
+        setLifecycle(statusData.lifecycle || []);
+      }
+      if (logsData.ok) {
+        setLogs(logsData.logs || []);
+      }
+
+      const shouldClearCompletedRun =
+        statusData.ok &&
+        (statusData.status.state === "completed" || statusData.status.state === "failed") &&
+        (logsData.logs?.length || 0) > 0;
+
+      if (shouldClearCompletedRun) {
+        await fetch("/api/ai-agents/healing/reset", { method: "POST" }).catch(() => undefined);
+        setStatus({ state: "idle", totalLogs: 0 });
+        setLogs([]);
+        setLifecycle([]);
+        setSummary(null);
+        setSelectedRemediationId("");
+      }
+    } catch {
+      setStartError("Unable to load healing API right now. Ensure the app server is running, then refresh.");
+      setStatus((prev) => ({ ...prev, state: "idle", totalLogs: prev.totalLogs || 0 }));
     }
   }, []);
 
@@ -393,6 +415,18 @@ export default function HealingDashboardPage() {
     return targets.find((t) => `${t.namespace}/${t.kind}/${t.pod_name}` === selectedTargetId) || null;
   }, [targets, selectedTargetId]);
 
+  const hasFailureTargets = useMemo(() => {
+    return targets.some((t) => /crash|fail|pending|error|unhealthy|oom|backoff/i.test(t.status));
+  }, [targets]);
+
+  const selectedTargetHasFailure = useMemo(() => {
+    if (!selectedTarget) return false;
+    return /crash|fail|pending|error|unhealthy|oom|backoff/i.test(selectedTarget.status);
+  }, [selectedTarget]);
+
+  const shouldShowDecisionOptions =
+    selectedTargetHasFailure || hasFailureTargets || status.state === "running";
+
   const remediationOptions = useMemo<RemediationOption[]>(() => {
     const baseName = selectedTarget?.kind === "deployment" ? "deployment" : "pod";
     const scaleUpScore = scenario === "high-cpu" ? 92 : 84;
@@ -529,6 +563,7 @@ export default function HealingDashboardPage() {
         </CardHeader>
       </Card>
 
+      {shouldShowDecisionOptions ? (
       <Card>
         <CardHeader className="flex flex-col gap-2 md:flex-row md:items-end md:justify-between">
           <div>
@@ -607,6 +642,16 @@ export default function HealingDashboardPage() {
           ) : null}
         </CardBody>
       </Card>
+      ) : (
+        <Card>
+          <CardBody>
+            <div className="text-sm font-semibold text-[#1f2b33]">Remediation options waiting for failure signal</div>
+            <div className="mt-1 text-sm text-muted">
+              Options will appear automatically when a pod/deployment shows failure state (CrashLoopBackOff, Failed, Error, Pending) so you can select one, then click Start Healing.
+            </div>
+          </CardBody>
+        </Card>
+      )}
 
       <div className="grid gap-4 md:grid-cols-4">
         <Card>
