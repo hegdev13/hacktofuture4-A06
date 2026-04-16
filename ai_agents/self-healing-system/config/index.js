@@ -41,7 +41,7 @@ const config = {
 
   // Execution Configuration
   execution: {
-    dryRun: true, // Set to false to enable real K8s operations
+    dryRun: false, // Set to false to enable real K8s operations
     timeoutMs: 30000,
     strategies: [
       'restart_pod',

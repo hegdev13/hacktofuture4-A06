@@ -4,6 +4,7 @@
  * Analyze → Detect → RCA → Fix → Re-check (max 3 retries)
  */
 
+const { execSync } = require('child_process');
 const config = require('./config');
 const logger = require('./utils/logger');
 const metricsFetcher = require('./utils/metricsFetcher');
@@ -277,10 +278,13 @@ class SelfHealingSystem {
         logger.debug('Fetching real-time metrics...');
         const metrics = await metricsFetcher.fetchMetrics();
         
-        // Broadcast raw metrics to dashboard
-        this.setMetricsData(metrics);
+        // Enrich with deployment data from kubectl
+        const enrichedMetrics = await this.enrichWithDeployments(metrics);
         
-        return adapter.normalize(metrics);
+        // Broadcast raw metrics to dashboard
+        this.setMetricsData(enrichedMetrics);
+        
+        return adapter.normalize(enrichedMetrics);
       } catch (error) {
         logger.warn('Failed to fetch real metrics:', error.message);
         logger.warn('Falling back to mock data...');
@@ -289,6 +293,58 @@ class SelfHealingSystem {
 
     // Fallback to mock data
     return this.getMockClusterState();
+  }
+
+  /**
+   * Enrich cluster state with deployment information from kubectl
+   */
+  async enrichWithDeployments(clusterState) {
+    try {
+      logger.debug('Fetching deployment information from kubectl...');
+      const deploymentData = this.fetchDeploymentsFromKubectl();
+      
+      return {
+        ...clusterState,
+        deployments: deploymentData,
+      };
+    } catch (error) {
+      logger.warn('Failed to fetch deployments from kubectl:', error.message);
+      return clusterState; // Return as-is if kubectl fails
+    }
+  }
+
+  /**
+   * Fetch deployments from kubectl
+   */
+  fetchDeploymentsFromKubectl() {
+    try {
+      const cmd = 'kubectl get deployments -A -o json';
+      logger.debug(`Executing: ${cmd}`);
+      
+      const output = execSync(cmd, { encoding: 'utf-8' });
+      const data = JSON.parse(output);
+      
+      // Transform kubectl JSON to our format
+      const deployments = (data.items || []).map(dep => ({
+        name: dep.metadata.name,
+        namespace: dep.metadata.namespace,
+        replicas: dep.spec.replicas || 0,
+        desiredReplicas: dep.spec.replicas || 0,
+        readyReplicas: dep.status.readyReplicas || 0,
+        availableReplicas: dep.status.availableReplicas || 0,
+        updatedReplicas: dep.status.updatedReplicas || 0,
+        status: dep.status.conditions ? 'running' : 'unknown',
+        selector: dep.spec.selector?.matchLabels || {},
+        labels: dep.metadata.labels || {},
+        conditions: dep.status.conditions || [],
+      }));
+      
+      logger.debug(`Fetched ${deployments.length} deployments from kubectl`);
+      return deployments;
+    } catch (error) {
+      logger.error('Error fetching deployments from kubectl:', error.message);
+      throw error;
+    }
   }
 
   /**

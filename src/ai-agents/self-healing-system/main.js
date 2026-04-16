@@ -168,43 +168,6 @@ class SelfHealingSystem {
       }
 
       if (manualTarget) {
-        const manualPod = this.resolveManualTargetPod(currentState, manualTarget);
-        if (!manualPod) {
-          logger.warn(`Selected target not found: ${manualTarget.namespace}/${manualTarget.name}`);
-          finalResult = {
-            success: false,
-            attempts,
-            finalHealth: 'unhealthy',
-            issuesFound: analysis.issues.length,
-            fixesApplied: 0,
-            error: `Selected target ${manualTarget.namespace}/${manualTarget.name} was not found in live cluster state`,
-            timeline: logger.getTimeline(),
-          };
-          break;
-        }
-
-        const targetedIssue = this.buildManualTargetIssue(manualPod, manualTarget);
-        if (!targetedIssue) {
-          logger.timelineEvent('success', `Selected target ${manualTarget.namespace}/${manualTarget.name} is already healthy`);
-          finalResult = {
-            success: true,
-            attempts: attempts - 1,
-            finalHealth: 'healthy',
-            issuesFound: analysis.issues.length,
-            fixesApplied: 0,
-            target: manualTarget,
-            timeline: logger.getTimeline(),
-          };
-          break;
-        }
-
-        logger.timelineEvent('issue', `Prioritizing selected workload ${manualTarget.namespace}/${manualTarget.name}`);
-        this.setAgentStatus('detector', 'issues-confirmed', {
-          step: 'manual-target',
-          confirmed: 1,
-          confidence: targetedIssue.confidence,
-        });
-
         if (manualTarget.kind === 'deployment') {
           logger.timelineEvent('fix', `Executing explicit deployment restart for ${manualTarget.namespace}/${manualTarget.name}`);
           this.setAgentStatus('executor', 'running', {
@@ -254,7 +217,44 @@ class SelfHealingSystem {
           break;
         }
 
-        const detection = {
+        const manualPod = this.resolveManualTargetPod(currentState, manualTarget);
+        if (!manualPod) {
+          logger.warn(`Selected target not found: ${manualTarget.namespace}/${manualTarget.name}`);
+          finalResult = {
+            success: false,
+            attempts,
+            finalHealth: 'unhealthy',
+            issuesFound: analysis.issues.length,
+            fixesApplied: 0,
+            error: `Selected target ${manualTarget.namespace}/${manualTarget.name} was not found in live cluster state`,
+            timeline: logger.getTimeline(),
+          };
+          break;
+        }
+
+        const targetedIssue = this.buildManualTargetIssue(manualPod, manualTarget);
+        if (!targetedIssue) {
+          logger.timelineEvent('success', `Selected target ${manualTarget.namespace}/${manualTarget.name} is already healthy`);
+          finalResult = {
+            success: true,
+            attempts: attempts - 1,
+            finalHealth: 'healthy',
+            issuesFound: analysis.issues.length,
+            fixesApplied: 0,
+            target: manualTarget,
+            timeline: logger.getTimeline(),
+          };
+          break;
+        }
+
+        logger.timelineEvent('issue', `Prioritizing selected workload ${manualTarget.namespace}/${manualTarget.name}`);
+        this.setAgentStatus('detector', 'issues-confirmed', {
+          step: 'manual-target',
+          confirmed: 1,
+          confidence: targetedIssue.confidence,
+        });
+
+        detection = {
           hasIssues: true,
           confirmedIssues: [targetedIssue],
           categorizedIssues: {

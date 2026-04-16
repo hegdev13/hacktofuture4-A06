@@ -24,6 +24,7 @@ class ObserverAgent {
     const pods = clusterState.pods || [];
     const nodes = clusterState.nodes || [];
     const metrics = clusterState.metrics || {};
+    const deployments = clusterState.deployments || [];
 
     // Analyze pods
     for (const pod of pods) {
@@ -36,6 +37,17 @@ class ObserverAgent {
       const nodeIssues = this.analyzeNode(node, clusterState);
       issues.push(...nodeIssues);
     }
+
+    // Analyze deployments for missing/scaled-down
+    for (const deployment of deployments) {
+      const depIssues = this.analyzeDeployment(deployment, pods);
+      issues.push(...depIssues);
+    }
+
+    // Check for missing common deployments (frontend, backend, etc.)
+    // by looking for pods with expected labels
+    const missingDepIssues = this.detectMissingDeployments(pods, clusterState);
+    issues.push(...missingDepIssues);
 
     // Analyze system-wide metrics
     const systemIssues = this.analyzeSystemMetrics(metrics, clusterState);
@@ -464,6 +476,87 @@ class ObserverAgent {
     }
 
     return cascading;
+  }
+
+  /**
+   * Analyze deployment health
+   */
+  analyzeDeployment(deployment, pods) {
+    const issues = [];
+    const name = deployment.name || '';
+    const namespace = deployment.namespace || 'default';
+    const desiredReplicas = deployment.replicas || deployment.desiredReplicas || 0;
+    const readyReplicas = deployment.readyReplicas || 0;
+
+    // Check if deployment is scaled to 0
+    if (desiredReplicas === 0 && readyReplicas === 0) {
+      issues.push({
+        target: name,
+        namespace,
+        type: 'deployment_scaled_down',
+        problem: `Deployment ${namespace}/${name} is scaled to 0 replicas`,
+        severity: 'high',
+        metric: 'replicas',
+        details: { desired: desiredReplicas, ready: readyReplicas },
+      });
+    }
+    // Check if desired replicas don't match ready replicas
+    else if (desiredReplicas > readyReplicas) {
+      issues.push({
+        target: name,
+        namespace,
+        type: 'deployment_not_ready',
+        problem: `Deployment ${namespace}/${name} has ${readyReplicas}/${desiredReplicas} ready replicas`,
+        severity: desiredReplicas - readyReplicas > 2 ? 'high' : 'medium',
+        metric: 'replica_mismatch',
+        details: { desired: desiredReplicas, ready: readyReplicas },
+      });
+    }
+
+    return issues;
+  }
+
+  /**
+   * Detect missing deployments by looking for pods with expected labels
+   */
+  detectMissingDeployments(pods, clusterState) {
+    const issues = [];
+    
+    // List of critical deployments to monitor
+    const criticalDeployments = [
+      { name: 'frontend', label: 'app', value: 'frontend', namespace: 'default' },
+      { name: 'backend', label: 'app', value: 'backend', namespace: 'default' },
+      { name: 'api', label: 'app', value: 'api', namespace: 'default' },
+      { name: 'database', label: 'app', value: 'database', namespace: 'default' },
+    ];
+
+    for (const expectedDep of criticalDeployments) {
+      // Check if we have pods with this label
+      const matchingPods = pods.filter(p => {
+        const labels = p.labels || {};
+        return labels[expectedDep.label] === expectedDep.value &&
+               p.namespace === expectedDep.namespace;
+      });
+
+      // If no pods found for a critical deployment, it's an issue
+      if (matchingPods.length === 0) {
+        logger.debug(`No pods found for ${expectedDep.namespace}/${expectedDep.name}`);
+        // Only report if this looks like a deliberate deployment (not a optional service)
+        if (['frontend', 'backend', 'api'].includes(expectedDep.name)) {
+          issues.push({
+            target: expectedDep.name,
+            namespace: expectedDep.namespace,
+            type: 'missing_deployment',
+            problem: `No running pods for deployment ${expectedDep.namespace}/${expectedDep.name}`,
+            severity: expectedDep.name === 'frontend' ? 'high' : 'medium',
+            metric: 'pod_count',
+            details: { expected: 'at least 1', actual: 0, labelSelector: `${expectedDep.label}=${expectedDep.value}` },
+          });
+        }
+      }
+    }
+
+    return issues;
   }
 
   /**

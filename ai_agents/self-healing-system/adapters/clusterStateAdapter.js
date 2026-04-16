@@ -27,6 +27,7 @@ class ClusterStateAdapter {
       nodes: this.normalizeNodes(clusterState.nodes),
       pods: this.normalizePods(clusterState.pods),
       services: this.normalizeServices(clusterState.services),
+      deployments: this.normalizeDeployments(clusterState.deployments),
       metrics: this.normalizeMetrics(clusterState.metrics),
       logs: this.normalizeLogs(clusterState.logs),
       events: this.normalizeEvents(clusterState.events),
@@ -119,6 +120,28 @@ class ClusterStateAdapter {
       labels: this.getObject(service, 'labels', {}),
       endpoints: this.getArray(service, 'endpoints', []),
       ...this.getAdditionalFields(service, ['name', 'namespace', 'type', 'clusterIP', 'externalIPs', 'ports', 'selector', 'labels', 'endpoints']),
+    }));
+  }
+
+  /**
+   * Normalize deployments array
+   */
+  normalizeDeployments(deployments) {
+    if (!Array.isArray(deployments)) return [];
+
+    return deployments.map(deployment => ({
+      name: this.getString(deployment, 'name', 'unknown-deployment'),
+      namespace: this.getString(deployment, 'namespace', this.defaults.namespace),
+      replicas: this.getNumber(deployment, 'replicas', 0),
+      desiredReplicas: this.getNumber(deployment, 'desiredReplicas', deployment.replicas || 0),
+      readyReplicas: this.getNumber(deployment, 'readyReplicas', 0),
+      availableReplicas: this.getNumber(deployment, 'availableReplicas', 0),
+      updatedReplicas: this.getNumber(deployment, 'updatedReplicas', 0),
+      status: this.getString(deployment, 'status', 'unknown'),
+      selector: this.getObject(deployment, 'selector', {}),
+      labels: this.getObject(deployment, 'labels', {}),
+      conditions: this.getArray(deployment, 'conditions', []),
+      ...this.getAdditionalFields(deployment, ['name', 'namespace', 'replicas', 'desiredReplicas', 'readyReplicas', 'availableReplicas', 'updatedReplicas', 'status', 'selector', 'labels', 'conditions']),
     }));
   }
 
