@@ -1,564 +1,582 @@
 /**
- * RCA Agent (Root Cause Analysis)
- * Builds dependency graphs and traces failure chains
+ * RCA Agent (Root Cause Analysis + orchestration report lifecycle)
+ * - Runs only for trigger-worthy issues
+ * - Uses dependency graph + runtime signals
+ * - Maintains persistent rca_report.json history
  */
 
+const fs = require('fs');
+const path = require('path');
 const config = require('../config');
 const logger = require('../utils/logger');
 
 class RCAAgent {
   constructor() {
-    this.dependencyKeys = config.rca.dependencyKeys;
-    this.maxDepth = config.rca.maxChainDepth;
+    this.maxDepth = config.rca.maxChainDepth || 5;
+    this.severityThreshold = config.observer?.severityTriggerScore || 70;
+    this.reportPath = path.join(__dirname, '..', 'rca_report.json');
   }
 
-  /**
-   * Perform root cause analysis
-   */
   performRCA(clusterState, detectedIssues) {
-    logger.timelineEvent('rca', `Starting RCA for ${detectedIssues.length} issue(s)`);
+    logger.timelineEvent('rca', `Starting RCA for ${detectedIssues?.length || 0} issue(s)`);
 
-    if (!detectedIssues || detectedIssues.length === 0) {
-      return {
-        rootCause: null,
+    const triggerCheck = this.shouldRunRCA(clusterState, detectedIssues || []);
+    if (!triggerCheck.triggered) {
+      const graph = this.buildDependencyGraph(clusterState || {});
+      const nodeSignals = this.buildNodeSignals(clusterState || {}, detectedIssues || [], graph);
+      const reportUpdate = this.updatePersistentReport([], graph, nodeSignals);
+
+      const output = {
+        action: reportUpdate.action,
+        issues: reportUpdate.issues,
+        rootCause: reportUpdate.issues[0]?.rootCause || null,
+        rootCauseType: 'none',
         failureChain: [],
-        confidence: 0,
-        reasoning: 'No issues to analyze',
+        confidence: reportUpdate.issues[0] ? Math.round((reportUpdate.issues[0].confidence || 0) * 100) : 0,
+        confidenceScore: reportUpdate.issues[0]?.confidence || 0,
+        reasoning: reportUpdate.action === 'RESOLVE' ? 'Active issue resolved and report updated' : triggerCheck.reason,
+        chainDetails: [],
+        affectedResources: [],
+      };
+
+      logger.timelineEvent('rca', 'RCA skipped', {
+        reason: triggerCheck.reason,
+        action: reportUpdate.action,
+      });
+      return output;
+    }
+
+    const graph = this.buildDependencyGraph(clusterState || {});
+    const nodeSignals = this.buildNodeSignals(clusterState || {}, detectedIssues || [], graph);
+
+    const roots = this.findRootCauses(graph, nodeSignals);
+    const rootIssues = roots.map((rootName) =>
+      this.composeIssueRecord(rootName, graph, nodeSignals, clusterState || {})
+    );
+
+    const reportUpdate = this.updatePersistentReport(rootIssues, graph, nodeSignals);
+
+    const primary = reportUpdate.issues.find((i) => i.status === 'ACTIVE') || reportUpdate.issues[0] || null;
+    const chainDetails = primary ? this.buildChainDetails(primary, nodeSignals) : [];
+
+    const output = {
+      action: reportUpdate.action,
+      issues: reportUpdate.issues,
+      rootCause: primary?.rootCause || null,
+      rootCauseType: primary ? 'pod' : 'none',
+      failureChain: primary?.failureChain || [],
+      confidence: primary ? Math.round((primary.confidence || 0) * 100) : 0,
+      confidenceScore: primary?.confidence || 0,
+      reasoning: primary?.reasoning || reportUpdate.reason,
+      chainDetails,
+      affectedResources: chainDetails,
+      graph: this.exportGraph(graph),
+      reportPath: this.reportPath,
+    };
+
+    logger.timelineEvent('rca', 'RCA completed', {
+      action: output.action,
+      rootCause: output.rootCause,
+      confidence: output.confidence,
+      issueCount: output.issues.length,
+    });
+
+    return output;
+  }
+
+  shouldRunRCA(clusterState, detectedIssues) {
+    if (!Array.isArray(detectedIssues) || detectedIssues.length === 0) {
+      return { triggered: false, reason: 'No detected issues' };
+    }
+
+    const nonFlapping = detectedIssues.filter((i) => !i.isFlapping);
+    if (nonFlapping.length === 0) {
+      return { triggered: false, reason: 'All issues appear flapping/unstable (spike filtered)' };
+    }
+
+    const hasSelfIssue = nonFlapping.some((issue) => {
+      const sev = String(issue.severity || '').toLowerCase();
+      const metric = String(issue.metric || '').toLowerCase();
+      const problem = String(issue.problem || '').toLowerCase();
+      return sev === 'high' || metric.includes('restart') || metric.includes('status') || problem.includes('crash');
+    });
+
+    if (!hasSelfIssue) {
+      return { triggered: false, reason: 'No direct selfIssue-like failures detected' };
+    }
+
+    const severityScore = nonFlapping.reduce((score, issue) => {
+      const sev = String(issue.severity || '').toLowerCase();
+      if (sev === 'high') return score + 35;
+      if (sev === 'medium') return score + 20;
+      return score + 10;
+    }, 0);
+
+    if (severityScore < this.severityThreshold) {
+      return {
+        triggered: false,
+        reason: `Severity score ${severityScore} below threshold ${this.severityThreshold}`,
       };
     }
 
-    // Build dependency graph
-    const dependencyGraph = this.buildDependencyGraph(clusterState);
-
-    // Analyze each issue
-    const results = [];
-    for (const issue of detectedIssues) {
-      const analysis = this.analyzeIssue(issue, dependencyGraph, clusterState);
-      results.push(analysis);
-    }
-
-    // Prioritize by confidence and severity
-    results.sort((a, b) => b.confidence - a.confidence);
-
-    const primary = results[0];
-
-    // Include the dependency graph for visualization
-    const graphExport = this.exportGraph(dependencyGraph);
-
-    logger.timelineEvent('rca', 'RCA completed', {
-      rootCause: primary.rootCause,
-      confidence: primary.confidence,
-    });
-
-    return {
-      ...primary,
-      graph: graphExport,
-      allResults: results,
-    };
+    return { triggered: true, reason: 'Trigger conditions satisfied (selfIssue + sustained + severity)' };
   }
 
-  /**
-   * Build dynamic dependency graph from cluster state
-   */
   buildDependencyGraph(clusterState) {
     const graph = {
-      nodes: new Map(),
-      edges: new Map(),
-      services: new Map(),
+      nodes: new Set(),
+      // A -> B means A depends on B
+      dependencies: new Map(),
+      dependents: new Map(),
     };
 
     const pods = clusterState.pods || [];
-    const services = clusterState.services || [];
 
-    // Add all pods as nodes
     for (const pod of pods) {
-      graph.nodes.set(pod.name, {
-        name: pod.name,
-        namespace: pod.namespace,
-        type: 'pod',
-        status: pod.status || pod.phase,
-        labels: pod.labels || {},
-        dependencies: [],
-      });
+      const name = String(pod.name || '').trim();
+      if (!name) continue;
+      graph.nodes.add(name);
+      if (!graph.dependencies.has(name)) graph.dependencies.set(name, new Set());
+      if (!graph.dependents.has(name)) graph.dependents.set(name, new Set());
     }
 
-    // Add services as nodes
-    for (const svc of services) {
-      graph.services.set(svc.name, {
-        name: svc.name,
-        namespace: svc.namespace,
-        type: 'service',
-        endpoints: svc.endpoints || [],
-        selector: svc.selector || {},
-      });
-    }
-
-    // Build edges from dependencies
     for (const pod of pods) {
-      const deps = pod.dependencies || [];
-      const podNode = graph.nodes.get(pod.name);
+      const name = String(pod.name || '').trim();
+      if (!name) continue;
 
-      if (!podNode) continue;
-
+      const deps = Array.isArray(pod.dependencies) ? pod.dependencies : [];
       for (const dep of deps) {
-        const depNode = this.resolveDependency(dep, clusterState);
-        if (depNode) {
-          podNode.dependencies.push({
-            type: dep.type,
-            name: dep.name,
-            target: dep.target,
-            source: dep.source,
-            resolvedTo: depNode.name,
-          });
+        const target = String(dep?.resolvedTo || dep?.target || dep?.name || '').trim();
+        if (!target) continue;
 
-          // Add edge
-          const edgeKey = `${pod.name}->${depNode.name}`;
-          graph.edges.set(edgeKey, {
-            from: pod.name,
-            to: depNode.name,
-            type: dep.type,
-          });
-        }
+        graph.nodes.add(target);
+        if (!graph.dependencies.has(target)) graph.dependencies.set(target, new Set());
+        if (!graph.dependents.has(target)) graph.dependents.set(target, new Set());
+
+        graph.dependencies.get(name).add(target);
+        graph.dependents.get(target).add(name);
       }
     }
-
-    // Infer database relationships
-    this.inferDatabaseRelationships(graph, pods);
-
-    // Infer additional relationships from labels
-    this.inferRelationships(graph, pods);
 
     return graph;
   }
 
-  /**
-   * Infer database dependencies from naming patterns
-   */
-  inferDatabaseRelationships(graph, pods) {
-    const dbPods = pods.filter(p => {
-      const name = (p.name || '').toLowerCase();
-      return name.includes('db') || name.includes('postgres') || name.includes('redis') ||
-             name.includes('mongo') || name.includes('mysql') || name.includes('elasticsearch');
-    });
-
-    const appPods = pods.filter(p => {
-      const name = (p.name || '').toLowerCase();
-      return name.includes('api') || name.includes('app') || name.includes('web') ||
-             name.includes('service') || name.includes('backend') || name.includes('worker');
-    });
-
-    for (const appPod of appPods) {
-      const node = graph.nodes.get(appPod.name);
-      if (!node) continue;
-
-      for (const dbPod of dbPods) {
-        // Check if in same namespace
-        if (appPod.namespace === dbPod.namespace || appPod.namespace === 'default') {
-          const alreadyHasDep = node.dependencies.some(d =>
-            d.resolvedTo === dbPod.name || d.target?.includes(dbPod.name)
-          );
-
-          if (!alreadyHasDep) {
-            node.dependencies.push({
-              type: 'inferred-database',
-              name: 'database',
-              target: dbPod.name,
-              source: 'inferred',
-              resolvedTo: dbPod.name,
-            });
-
-            const edgeKey = `${appPod.name}->${dbPod.name}`;
-            graph.edges.set(edgeKey, {
-              from: appPod.name,
-              to: dbPod.name,
-              type: 'inferred-database',
-            });
-          }
-        }
-      }
-    }
-  }
-
-  /**
-   * Resolve dependency to actual pod/service
-   */
-  resolveDependency(dep, clusterState) {
-    const target = dep.target;
-
-    // Try to find by hostname pattern
+  buildNodeSignals(clusterState, detectedIssues, graph) {
     const pods = clusterState.pods || [];
-    const services = clusterState.services || [];
+    const issuesByTarget = new Map();
 
-    // Check if target matches a service
-    for (const svc of services) {
-      if (target.includes(svc.name) || svc.clusterIP === target) {
-        return { name: svc.name, type: 'service' };
-      }
+    for (const issue of detectedIssues) {
+      const target = String(issue.target || issue.pod || issue.node || '').trim();
+      if (!target) continue;
+      if (!issuesByTarget.has(target)) issuesByTarget.set(target, []);
+      issuesByTarget.get(target).push(issue);
     }
 
-    // Check if target matches a pod
-    for (const pod of pods) {
-      if (target.includes(pod.name)) {
-        return { name: pod.name, type: 'pod' };
-      }
+    const signals = new Map();
 
-      // Check by labels
-      const labels = pod.labels || {};
-      for (const [key, value] of Object.entries(labels)) {
-        if (target.includes(value)) {
-          return { name: pod.name, type: 'pod' };
+    for (const pod of pods) {
+      const name = String(pod.name || '').trim();
+      if (!name) continue;
+
+      const status = String(pod.status || pod.phase || '').toLowerCase();
+      const readiness = pod.ready === true;
+      const restarts = Number(pod.restarts || pod.restartCount || 0);
+      const cpu = Number(pod.cpu || 0);
+      const memory = Number(pod.memory || 0);
+      const latency = Number(pod.latency || 0);
+      const errorRate = Number(pod.errorRate || 0);
+      const events = Array.isArray(pod.events) ? pod.events.map((e) => String(e)) : [];
+      const logs = Array.isArray(pod.logs)
+        ? pod.logs.map((l) => (typeof l === 'string' ? l : String(l?.message || '')))
+        : [];
+
+      const issueList = issuesByTarget.get(name) || [];
+      const hasHighIssue = issueList.some((i) => String(i.severity || '').toLowerCase() === 'high');
+      const hasDependencyIssue = issueList.some((i) => String(i.type || '').includes('dependency'));
+
+      const selfIssue =
+        status.includes('failed') ||
+        status.includes('crash') ||
+        status.includes('backoff') ||
+        status.includes('error') ||
+        !readiness ||
+        restarts > (config.observer?.thresholds?.restartCount || 3) ||
+        hasHighIssue;
+
+      signals.set(name, {
+        name,
+        selfIssue,
+        dependencyIssue: hasDependencyIssue,
+        status,
+        readiness,
+        metrics: { cpu, memory, latency, errorRate, restartCount: restarts },
+        events,
+        logs,
+        timestamp: clusterState.timestamp || new Date().toISOString(),
+      });
+    }
+
+    // Mark dependencyIssue transitively from root self-issues.
+    for (const [name, sig] of signals.entries()) {
+      if (!sig.selfIssue) continue;
+      const queue = [...(this.toArraySet(this.getDependents(name, graph)))];
+      const seen = new Set(queue);
+
+      while (queue.length) {
+        const dep = queue.shift();
+        const depSig = signals.get(dep);
+        if (depSig && !depSig.selfIssue) depSig.dependencyIssue = true;
+
+        for (const next of this.toArraySet(this.getDependents(dep, graph))) {
+          if (seen.has(next)) continue;
+          seen.add(next);
+          queue.push(next);
         }
       }
     }
 
-    // Return unresolved reference
-    return { name: target, type: 'external', unresolved: true };
+    return signals;
   }
 
-  /**
-   * Infer relationships from labels and naming
-   */
-  inferRelationships(graph, pods) {
-    // Group pods by app label
-    const byApp = new Map();
-    for (const pod of pods) {
-      const app = pod.labels?.app || pod.labels?.['app.kubernetes.io/name'];
-      if (app) {
-        if (!byApp.has(app)) byApp.set(app, []);
-        byApp.get(app).push(pod.name);
-      }
-    }
-
-    // Create implicit edges within same app (version dependency)
-    for (const [app, podNames] of byApp) {
-      if (podNames.length > 1) {
-        // These pods likely depend on each other
-        for (let i = 0; i < podNames.length; i++) {
-          const node = graph.nodes.get(podNames[i]);
-          if (node) {
-            for (let j = 0; j < podNames.length; j++) {
-              if (i !== j) {
-                node.dependencies.push({
-                  type: 'co-located',
-                  target: podNames[j],
-                  implicit: true,
-                });
-              }
-            }
-          }
-        }
-      }
-    }
-
-    // Infer database dependencies from naming
-    for (const pod of pods) {
-      const name = pod.name.toLowerCase();
-      const node = graph.nodes.get(pod.name);
-      if (!node) continue;
-
-      if (name.includes('api') || name.includes('web') || name.includes('app')) {
-        // Look for database pods
-        for (const otherPod of pods) {
-          const otherName = otherPod.name.toLowerCase();
-          if (otherName.includes('db') || otherName.includes('postgres') || otherName.includes('redis')) {
-            // Infer dependency
-            const alreadyHasDep = node.dependencies.some(
-              d => d.resolvedTo === otherPod.name
-            );
-            if (!alreadyHasDep) {
-              node.dependencies.push({
-                type: 'inferred-db',
-                target: otherPod.name,
-                implicit: true,
-              });
-
-              const edgeKey = `${pod.name}->${otherPod.name}`;
-              graph.edges.set(edgeKey, {
-                from: pod.name,
-                to: otherPod.name,
-                type: 'inferred',
-              });
-            }
-          }
-        }
-      }
-    }
+  toArraySet(value) {
+    if (!value) return [];
+    if (Array.isArray(value)) return value;
+    if (value instanceof Set) return Array.from(value);
+    return [];
   }
 
-  /**
-   * Analyze a single issue
-   */
-  analyzeIssue(issue, dependencyGraph, clusterState) {
-    const target = issue.target;
-    const startNode = dependencyGraph.nodes.get(target);
+  getDependencies(nodeName, graph) {
+    return graph.dependencies.get(nodeName) || new Set();
+  }
 
-    if (!startNode) {
-      return {
-        rootCause: target,
-        failureChain: [issue.problem],
-        confidence: 50,
-        reasoning: 'Could not trace dependencies - treating as isolated issue',
-        dependencies: [],
-      };
+  getDependents(nodeName, graph) {
+    return graph.dependents.get(nodeName) || new Set();
+  }
+
+  findRootCauses(graph, nodeSignals) {
+    const roots = [];
+
+    for (const [name, sig] of nodeSignals.entries()) {
+      if (!sig.selfIssue) continue;
+
+      const deps = this.getDependencies(name, graph);
+      const hasFailingDependency = Array.from(deps).some((depName) => {
+        const depSig = nodeSignals.get(depName);
+        return depSig?.selfIssue === true;
+      });
+
+      if (!hasFailingDependency) roots.push(name);
     }
 
-    // Trace failure chain
-    const chain = this.traceFailureChain(startNode, dependencyGraph, clusterState);
+    roots.sort((a, b) => a.localeCompare(b));
+    return roots;
+  }
 
-    // Determine root cause
-    const rootCause = this.identifyRootCause(chain, issue, clusterState);
+  composeIssueRecord(rootName, graph, nodeSignals, clusterState) {
+    const affectedNodes = this.collectAffectedNodes(rootName, graph, nodeSignals);
+    const failureChain = this.buildFailureChain(rootName, affectedNodes, graph);
+    const dependencyDepth = failureChain.length;
 
-    // Build reasoning
-    const reasoning = this.buildReasoning(rootCause, chain, issue);
+    const rootSignal = nodeSignals.get(rootName) || {
+      events: [],
+      logs: [],
+      metrics: {},
+      timestamp: clusterState.timestamp || new Date().toISOString(),
+    };
 
-    // Calculate confidence
-    const confidence = this.calculateConfidence(chain, rootCause, issue);
+    const failureType = this.detectFailureType(rootSignal);
+    const severity = this.estimateSeverity(rootName, affectedNodes);
+    const confidence = this.calculateConfidence(rootSignal, affectedNodes.length, graph, rootName);
+    const timestamp = rootSignal.timestamp || new Date().toISOString();
 
     return {
-      rootCause: rootCause.name,
-      rootCauseType: rootCause.type,
-      failureChain: chain.map(c => c.description),
+      id: null,
+      status: 'ACTIVE',
+      rootCause: rootName,
+      failureChain,
+      affectedNodes,
+      dependencyDepth,
+      failureType,
+      severity,
+      timestamp,
+      resolvedAt: null,
       confidence,
-      reasoning,
-      chainDetails: chain,
-      affectedResources: this.getAffectedResources(chain),
+      reasoning: this.buildReasoning(rootName, failureType, affectedNodes),
     };
   }
 
-  /**
-   * Trace failure chain through dependencies
-   * Uses BFS to trace the dependency chain and identify all affected resources
-   */
-  traceFailureChain(startNode, graph, clusterState) {
-    const chain = [];
-    const visited = new Set();
-    const queue = [{ node: startNode, depth: 0, path: [] }];
+  collectAffectedNodes(rootName, graph, nodeSignals) {
+    const affected = new Set();
+    const queue = [...Array.from(this.getDependents(rootName, graph))];
+    const seen = new Set(queue);
 
-    // First, trace UPSTREAM to find root cause (what this node depends on)
-    while (queue.length > 0) {
-      const { node, depth, path } = queue.shift();
+    while (queue.length) {
+      const current = queue.shift();
+      const sig = nodeSignals.get(current);
+      if (sig && (sig.dependencyIssue || sig.selfIssue)) {
+        affected.add(current);
+      }
 
-      if (depth > this.maxDepth) continue;
-      if (visited.has(node.name)) continue;
-      visited.add(node.name);
-
-      // Check if this node is unhealthy
-      const health = this.checkNodeHealth(node, clusterState);
-
-      const step = {
-        name: node.name,
-        type: node.type,
-        depth,
-        health,
-        dependencies: node.dependencies.length,
-        path: [...path],
-        description: health.healthy
-          ? `${node.name} is healthy`
-          : `${node.name}: ${health.reason}`,
-      };
-
-      chain.push(step);
-
-      // Always trace dependencies to find root cause
-      // Root cause is at the deepest level of failed dependencies
-      for (const dep of node.dependencies) {
-        const depNode = graph.nodes.get(dep.resolvedTo) ||
-                       graph.nodes.get(dep.target);
-        if (depNode && !visited.has(depNode.name)) {
-          queue.push({
-            node: depNode,
-            depth: depth + 1,
-            path: [...path, node.name],
-          });
-        }
+      for (const next of this.getDependents(current, graph)) {
+        if (seen.has(next)) continue;
+        seen.add(next);
+        queue.push(next);
       }
     }
 
-    // Sort by depth ascending (root cause first), then by health
-    return chain.sort((a, b) => {
-      // Primary sort: depth (ascending - root cause at top)
-      if (a.depth !== b.depth) {
-        return a.depth - b.depth;
+    return Array.from(affected).sort((a, b) => a.localeCompare(b));
+  }
+
+  buildFailureChain(rootName, affectedNodes, graph) {
+    if (affectedNodes.length === 0) return [rootName];
+
+    // Build chain downstream -> ... -> root by taking longest dependent path.
+    const candidate = new Set(affectedNodes);
+    const distances = new Map([[rootName, 0]]);
+    const parent = new Map();
+    const queue = [rootName];
+
+    while (queue.length) {
+      const cur = queue.shift();
+      for (const dep of this.getDependents(cur, graph)) {
+        if (!candidate.has(dep)) continue;
+        if (distances.has(dep)) continue;
+        distances.set(dep, (distances.get(cur) || 0) + 1);
+        parent.set(dep, cur);
+        queue.push(dep);
       }
-      // Secondary sort: unhealthy first
-      if (a.health.healthy !== b.health.healthy) {
-        return a.health.healthy ? 1 : -1;
+    }
+
+    let farthest = rootName;
+    let bestDistance = -1;
+    for (const [name, d] of distances.entries()) {
+      if (d > bestDistance || (d === bestDistance && name.localeCompare(farthest) < 0)) {
+        bestDistance = d;
+        farthest = name;
       }
-      return 0;
+    }
+
+    const chain = [farthest];
+    let cursor = farthest;
+    while (parent.has(cursor)) {
+      cursor = parent.get(cursor);
+      chain.push(cursor);
+    }
+
+    if (chain[chain.length - 1] !== rootName) chain.push(rootName);
+    return chain;
+  }
+
+  detectFailureType(signal) {
+    const text = [...(signal.events || []), ...(signal.logs || [])].join(' ').toLowerCase();
+
+    if (text.includes('crashloopbackoff') || signal.status.includes('crash') || signal.status.includes('backoff')) {
+      return 'CrashLoop';
+    }
+    if (text.includes('oomkilled') || text.includes('out of memory')) {
+      return 'Memory';
+    }
+    if ((signal.metrics?.latency || 0) >= 1000) {
+      return 'Latency';
+    }
+    if (
+      text.includes('connection refused') ||
+      text.includes('failed to connect') ||
+      text.includes('timeout') ||
+      text.includes('dial tcp')
+    ) {
+      return 'DependencyFailure';
+    }
+
+    return 'Unknown';
+  }
+
+  estimateSeverity(rootCause, affectedNodes) {
+    const core = /db|database|redis|postgres|mysql|mongo|storage|auth/i.test(rootCause);
+    if (core || affectedNodes.length >= 4) return 'CRITICAL';
+    if (affectedNodes.length >= 2) return 'HIGH';
+    if (affectedNodes.length === 1) return 'MEDIUM';
+    return 'LOW';
+  }
+
+  calculateConfidence(signal, affectedCount, graph, rootName) {
+    let score = 0.5;
+    const text = [...(signal.events || []), ...(signal.logs || [])].join(' ').toLowerCase();
+
+    if (signal.selfIssue) score += 0.15;
+    if ((signal.metrics?.restartCount || 0) > 0) score += 0.05;
+    if ((signal.metrics?.errorRate || 0) > (config.observer?.thresholds?.errorRate || 5)) score += 0.08;
+    if (text.includes('error') || text.includes('failed') || text.includes('backoff') || text.includes('oom')) score += 0.12;
+    if (affectedCount > 0) score += Math.min(0.1, affectedCount * 0.03);
+    if (this.getDependents(rootName, graph).size > 0) score += 0.05;
+
+    return Math.max(0, Math.min(1, Math.round(score * 100) / 100));
+  }
+
+  buildReasoning(rootCause, failureType, affectedNodes) {
+    if (affectedNodes.length === 0) {
+      return `${rootCause} has direct self-failure signals (${failureType}) with no downstream impacted nodes.`;
+    }
+
+    return `${rootCause} is a direct failure (${failureType}) and cascades to ${affectedNodes.join(', ')} via dependency graph relationships.`;
+  }
+
+  loadReport() {
+    try {
+      if (!fs.existsSync(this.reportPath)) {
+        return { issues: [] };
+      }
+
+      const content = fs.readFileSync(this.reportPath, 'utf8');
+      const parsed = JSON.parse(content);
+      if (!parsed || !Array.isArray(parsed.issues)) return { issues: [] };
+      return parsed;
+    } catch (error) {
+      logger.warn(`Failed to read RCA report: ${error.message}`);
+      return { issues: [] };
+    }
+  }
+
+  saveReport(report) {
+    try {
+      fs.writeFileSync(this.reportPath, JSON.stringify(report, null, 2), 'utf8');
+    } catch (error) {
+      logger.warn(`Failed to write RCA report: ${error.message}`);
+    }
+  }
+
+  nextIssueId(report) {
+    const ids = report.issues
+      .map((i) => String(i.id || '').replace('issue-', ''))
+      .map((n) => Number(n))
+      .filter((n) => Number.isFinite(n));
+
+    const next = ids.length ? Math.max(...ids) + 1 : 1;
+    return `issue-${String(next).padStart(3, '0')}`;
+  }
+
+  updatePersistentReport(currentIssues, graph, nodeSignals) {
+    const report = this.loadReport();
+    const touched = [];
+    let hasAppend = false;
+    let hasUpdate = false;
+    let hasResolve = false;
+
+    const activeByRoot = new Map();
+    for (const item of report.issues) {
+      if (item.status === 'ACTIVE') activeByRoot.set(item.rootCause, item);
+    }
+
+    for (const issue of currentIssues) {
+      const existing = activeByRoot.get(issue.rootCause);
+      if (existing) {
+        existing.timestamp = issue.timestamp;
+        existing.confidence = issue.confidence;
+        existing.severity = issue.severity;
+        existing.failureType = issue.failureType;
+        existing.failureChain = issue.failureChain;
+        existing.affectedNodes = issue.affectedNodes;
+        existing.dependencyDepth = issue.dependencyDepth;
+        existing.reasoning = issue.reasoning;
+        touched.push(existing);
+        hasUpdate = true;
+      } else {
+        issue.id = this.nextIssueId(report);
+        report.issues.push(issue);
+        touched.push(issue);
+        hasAppend = true;
+      }
+    }
+
+    // Resolve stale active issues that are now fully healthy downstream.
+    for (const item of report.issues) {
+      if (item.status !== 'ACTIVE') continue;
+      if (currentIssues.some((ci) => ci.rootCause === item.rootCause)) continue;
+
+      const rootSignal = nodeSignals.get(item.rootCause);
+      const rootHealthy = !rootSignal || rootSignal.selfIssue === false;
+      const depsHealthy = this.areDependentsHealthy(item.rootCause, graph, nodeSignals);
+
+      if (rootHealthy && depsHealthy) {
+        item.status = 'RESOLVED';
+        item.resolvedAt = new Date().toISOString();
+        touched.push(item);
+        hasResolve = true;
+      }
+    }
+
+    this.saveReport(report);
+
+    const action = hasAppend
+      ? 'APPEND'
+      : hasUpdate
+      ? 'UPDATE'
+      : hasResolve
+      ? 'RESOLVE'
+      : 'NO_ACTION';
+
+    logger.info(`RCA report update: action=${action}, touchedIssues=${touched.length}, reportPath=${this.reportPath}`);
+
+    return {
+      action,
+      issues: touched,
+      reason: action === 'NO_ACTION' ? 'No issue lifecycle changes required' : 'RCA report updated',
+    };
+  }
+
+  areDependentsHealthy(rootName, graph, nodeSignals) {
+    const queue = [...Array.from(this.getDependents(rootName, graph))];
+    const seen = new Set(queue);
+
+    while (queue.length) {
+      const current = queue.shift();
+      const sig = nodeSignals.get(current);
+      if (sig && (sig.selfIssue || sig.dependencyIssue)) {
+        return false;
+      }
+
+      for (const next of this.getDependents(current, graph)) {
+        if (seen.has(next)) continue;
+        seen.add(next);
+        queue.push(next);
+      }
+    }
+
+    return true;
+  }
+
+  buildChainDetails(issue, nodeSignals) {
+    const chain = Array.isArray(issue.failureChain) ? issue.failureChain : [];
+    return chain.map((name, idx) => {
+      const sig = nodeSignals.get(name);
+      return {
+        name,
+        type: 'pod',
+        depth: idx,
+        health: {
+          healthy: !(sig?.selfIssue || sig?.dependencyIssue),
+          reason: sig?.selfIssue
+            ? 'selfIssue=true'
+            : sig?.dependencyIssue
+            ? 'dependencyIssue=true'
+            : 'healthy',
+        },
+      };
     });
   }
 
-  /**
-   * Check health of a node
-   */
-  checkNodeHealth(node, clusterState) {
-    const pods = clusterState.pods || [];
-    const pod = pods.find(p => p.name === node.name);
+  exportGraph(graph) {
+    const nodes = Array.from(graph.nodes).map((name) => ({ name }));
+    const edges = [];
 
-    if (!pod) {
-      return { healthy: false, reason: 'Pod not found in cluster state' };
+    for (const [from, deps] of graph.dependencies.entries()) {
+      for (const to of deps) {
+        edges.push({ from, to, type: 'dependency' });
+      }
     }
 
-    const phase = (pod.phase || pod.status || '').toLowerCase();
-
-    if (['failed', 'error', 'crashloopbackoff'].includes(phase)) {
-      return { healthy: false, reason: `Pod in ${phase} state` };
-    }
-
-    if (phase === 'pending') {
-      return { healthy: false, reason: 'Pod stuck pending' };
-    }
-
-    if (pod.restarts >= config.severity.thresholds.restarts.critical) {
-      return { healthy: false, reason: `Excessive restarts (${pod.restarts})` };
-    }
-
-    if (pod.cpu > config.severity.thresholds.cpu.critical) {
-      return { healthy: false, reason: `Critical CPU usage (${pod.cpu}%)` };
-    }
-
-    if (pod.memory > config.severity.thresholds.memory.critical) {
-      return { healthy: false, reason: `Critical memory usage (${pod.memory}%)` };
-    }
-
-    return { healthy: true, reason: 'All checks passed' };
-  }
-
-  /**
-   * Identify root cause from chain
-   * Root cause is the deepest failed dependency in the chain
-   * (the one at the highest depth that is unhealthy)
-   */
-  identifyRootCause(chain, issue, clusterState) {
-    // Filter to only unhealthy nodes
-    const unhealthy = chain.filter(c => !c.health.healthy);
-
-    if (unhealthy.length > 0) {
-      // Sort by depth descending (deepest first) to find the root cause
-      // The root cause is typically the deepest failed dependency
-      unhealthy.sort((a, b) => b.depth - a.depth);
-
-      // Get the deepest unhealthy node (the actual root cause)
-      const rootCause = unhealthy[0];
-
-      return {
-        name: rootCause.name,
-        type: rootCause.type,
-        depth: rootCause.depth,
-        reason: rootCause.health.reason,
-        health: rootCause.health,
-      };
-    }
-
-    // If all healthy, the issue is likely the reported pod itself
-    return {
-      name: issue.target,
-      type: 'direct',
-      depth: 0,
-      reason: issue.problem,
-      health: { healthy: false, reason: issue.problem },
-    };
-  }
-
-  /**
-   * Build human-readable reasoning
-   */
-  buildReasoning(rootCause, chain, issue) {
-    const parts = [];
-
-    parts.push(`Detected issue: ${issue.problem} in ${issue.target}`);
-
-    if (chain.length > 1) {
-      parts.push(`Traced ${chain.length - 1} dependency level(s)`);
-    }
-
-    if (rootCause.depth > 0) {
-      parts.push(`Root cause identified as ${rootCause.name} (dependency level ${rootCause.depth}): ${rootCause.reason}`);
-      parts.push(`The failure cascaded from ${rootCause.name} to affect ${issue.target}`);
-    } else if (rootCause.name !== issue.target) {
-      parts.push(`Root cause identified as ${rootCause.name}: ${rootCause.reason}`);
-      parts.push(`This is an independent failure affecting ${issue.target}`);
-    } else {
-      parts.push(`Root cause is the reported resource itself: ${rootCause.reason}`);
-      parts.push(`No dependency failures detected - this is a direct issue with ${issue.target}`);
-    }
-
-    // Add affected resources info
-    const affectedCount = chain.filter(c => !c.health.healthy).length;
-    if (affectedCount > 1) {
-      parts.push(`Found ${affectedCount} affected resources in the failure chain`);
-    }
-
-    return parts.join('. ');
-  }
-
-  /**
-   * Calculate confidence score
-   */
-  calculateConfidence(chain, rootCause, issue) {
-    let confidence = 60; // Base confidence (increased from 50)
-
-    // Higher confidence if we found deeper dependencies with actual root cause
-    if (rootCause.depth > 0) {
-      confidence += Math.min(25, rootCause.depth * 8);
-    }
-
-    // Higher confidence if root cause is different from the reported issue
-    // (shows we actually traced dependencies)
-    if (rootCause.name !== issue.target) {
-      confidence += 15;
-    }
-
-    // Higher confidence if chain has multiple unhealthy nodes
-    const unhealthyCount = chain.filter(c => !c.health.healthy).length;
-    if (unhealthyCount > 1) {
-      confidence += Math.min(15, (unhealthyCount - 1) * 5);
-    }
-
-    // Lower confidence if chain is too short (may have missed dependencies)
-    if (chain.length <= 1) {
-      confidence -= 15;
-    }
-
-    // Higher confidence for clear error patterns
-    if (issue.metric === 'restarts' || issue.metric === 'oom') {
-      confidence += 10;
-    }
-
-    // Higher confidence for crash loops
-    if (issue.metric === 'restarts' && issue.severity === 'high') {
-      confidence += 5;
-    }
-
-    // Lower confidence if the root cause is healthy (shouldn't happen often)
-    if (rootCause.health?.healthy) {
-      confidence -= 25;
-    }
-
-    return Math.min(100, Math.max(0, confidence));
-  }
-
-  /**
-   * Get all affected resources from chain
-   */
-  getAffectedResources(chain) {
-    return chain.map(c => ({
-      name: c.name,
-      type: c.type,
-      health: c.health,
-    }));
-  }
-
-  /**
-   * Export dependency graph for visualization
-   */
-  exportGraph(dependencyGraph) {
-    return {
-      nodes: Array.from(dependencyGraph.nodes.values()),
-      edges: Array.from(dependencyGraph.edges.values()),
-    };
+    return { nodes, edges };
   }
 }
 
-// Export singleton
 module.exports = new RCAAgent();

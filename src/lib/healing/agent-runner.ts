@@ -2,7 +2,7 @@ import "server-only";
 
 import crypto from "node:crypto";
 import path from "node:path";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import type {
   AgentRunnerStatus,
   HealingEventType,
@@ -27,12 +27,33 @@ type StartOptions = {
   targetName?: string;
   targetNamespace?: string;
   targetKind?: "pod" | "deployment";
+  remediationId?: string;
   remediationPreference?: "restart-workload" | "scale-replicas" | "dependency-first" | "custom-command";
   customCommand?: string;
 };
 
+type RollbackSnapshot = {
+  capturedAt: string;
+  issueId: string;
+  targetName: string;
+  targetNamespace: string;
+  targetKind: "pod" | "deployment";
+  deploymentName: string;
+  deploymentManifest: {
+    apiVersion: string;
+    kind: string;
+    metadata: {
+      name: string;
+      namespace: string;
+      labels?: Record<string, string>;
+      annotations?: Record<string, string>;
+    };
+    spec: Record<string, unknown>;
+  };
+};
+
 class HealingAgentRunnerService {
-  readonly version = "2026-04-17-custom-remediation-v1";
+  readonly version = "2026-04-17-custom-remediation-v6";
   private logs: StructuredHealingLog[] = [];
   private listeners = new Set<(event: StreamEvent) => void>();
   private issueLifecycle = new Map<string, IssueLifecycle>();
@@ -40,6 +61,7 @@ class HealingAgentRunnerService {
     state: "idle",
     totalLogs: 0,
   };
+  private rollbackSnapshot: RollbackSnapshot | null = null;
   private runPromise: Promise<void> | null = null;
 
   startHealing(options: StartOptions = {}) {
@@ -53,6 +75,7 @@ class HealingAgentRunnerService {
 
     this.logs = [];
     this.issueLifecycle.clear();
+    this.rollbackSnapshot = null;
     this.status = {
       state: "running",
       startedAt,
@@ -79,6 +102,8 @@ class HealingAgentRunnerService {
       action_taken: options.targetName ? "Prioritizing explicit workload target" : "Fetching live cluster metrics",
       status: "IN_PROGRESS",
     });
+
+    this.captureRollbackSnapshot(options, issueId);
 
     this.runPromise = (async () => {
       try {
@@ -139,6 +164,7 @@ class HealingAgentRunnerService {
   resetSession() {
     this.logs = [];
     this.issueLifecycle.clear();
+    this.rollbackSnapshot = null;
     this.status = {
       state: "idle",
       totalLogs: 0,
@@ -215,6 +241,10 @@ class HealingAgentRunnerService {
       const tb = b.detected_at || b.analysis_started_at || b.fix_applied_at || b.resolved_at || "";
       return ta.localeCompare(tb);
     });
+  }
+
+  getRollbackSnapshot() {
+    return this.rollbackSnapshot;
   }
 
   subscribe(listener: (event: StreamEvent) => void) {
@@ -351,8 +381,9 @@ class HealingAgentRunnerService {
   }
 
   private runHealingProcess(issueId: string, options: StartOptions) {
-    if (options.remediationPreference === "custom-command" && options.customCommand?.trim()) {
-      return this.runCustomCommand(issueId, options.customCommand.trim());
+    const customSelected = options.remediationId === "custom-command" || options.remediationPreference === "custom-command";
+    if (customSelected && options.customCommand?.trim()) {
+      return this.runCustomCommand(issueId, options.customCommand.trim(), options);
     }
 
     const scriptPath = path.resolve(process.cwd(), "src", "ai-agents", "self-healing-system", "main.js");
@@ -371,6 +402,7 @@ class HealingAgentRunnerService {
           MANUAL_TARGET_NAME: options.targetName || "",
           MANUAL_TARGET_NAMESPACE: options.targetNamespace || "default",
           MANUAL_TARGET_KIND: options.targetKind || "pod",
+          REMEDIATION_ID: options.remediationId || "",
           REMEDIATION_PREFERENCE: options.remediationPreference || "",
           LOG_LEVEL: process.env.LOG_LEVEL || "info",
         },
@@ -399,14 +431,16 @@ class HealingAgentRunnerService {
     });
   }
 
-  private runCustomCommand(issueId: string, command: string) {
+  private runCustomCommand(issueId: string, command: string, options: StartOptions) {
     return new Promise<void>((resolve, reject) => {
       this.appendLog({
         agent_name: "ExecutionerAgent",
         event_type: "FIXING",
         issue_id: issueId,
         description: `Executing custom healing command: ${command}`,
-        action_taken: "Running SRE custom command",
+        action_taken: options.remediationId
+          ? `Running SRE custom command from ${options.remediationId}`
+          : "Running SRE custom command",
         status: "IN_PROGRESS",
       });
 
@@ -432,14 +466,37 @@ class HealingAgentRunnerService {
 
       child.on("close", (code) => {
         if (code === 0) {
+          const verification = this.verifyTargetHealth(options);
+
           this.appendLog({
             agent_name: "ExecutionerAgent",
             event_type: "ANALYZING",
             issue_id: issueId,
-            description: "Custom command executed. Healing outcome must be verified from live status.",
-            action_taken: "Execution completed (no automatic health verification)",
+            description: verification.verified
+              ? "Custom command executed and target health verified."
+              : `Custom command executed, but target not verified healthy: ${verification.reason}`,
+            action_taken: verification.verified
+              ? "Execution completed with post-command health verification"
+              : "Execution completed; awaiting healthy target state",
             status: "IN_PROGRESS",
           });
+
+          if (verification.verified) {
+            this.appendLog({
+              agent_name: "Orchestrator",
+              event_type: "RESOLVED",
+              issue_id: issueId,
+              description: "Custom command completed successfully and target is healthy.",
+              action_taken: "Marked as resolved after health verification",
+              status: "SUCCESS",
+              raw: {
+                command,
+                verification,
+                stdout: stdout.trim().slice(0, 4000),
+              },
+            });
+          }
+
           resolve();
           return;
         }
@@ -448,6 +505,209 @@ class HealingAgentRunnerService {
         reject(new Error(`Custom command failed: ${details}`));
       });
     });
+  }
+
+  private verifyTargetHealth(options: StartOptions): { verified: boolean; reason: string } {
+    const targetName = (options.targetName || "").trim();
+    const targetNamespace = (options.targetNamespace || "default").trim() || "default";
+    const targetKind = options.targetKind || "pod";
+
+    if (!targetName) {
+      return { verified: false, reason: "No target name provided for verification" };
+    }
+
+    try {
+      if (targetKind === "deployment") {
+        const result = spawnSync(
+          "kubectl",
+          ["rollout", "status", `deployment/${targetName}`, "-n", targetNamespace, "--timeout=90s"],
+          { cwd: process.cwd(), encoding: "utf8" },
+        );
+
+        if (result.status !== 0) {
+          return {
+            verified: false,
+            reason: (result.stderr || result.stdout || "deployment rollout did not become healthy").trim(),
+          };
+        }
+
+        const depState = spawnSync(
+          "kubectl",
+          ["get", "deployment", targetName, "-n", targetNamespace, "-o", "json"],
+          { cwd: process.cwd(), encoding: "utf8" },
+        );
+
+        if (depState.status !== 0 || !depState.stdout) {
+          return {
+            verified: false,
+            reason: (depState.stderr || depState.stdout || "unable to read deployment state").trim(),
+          };
+        }
+
+        const dep = JSON.parse(depState.stdout) as {
+          spec?: { replicas?: number };
+          status?: { replicas?: number; availableReplicas?: number };
+        };
+
+        const desired = Number(dep?.spec?.replicas ?? dep?.status?.replicas ?? 0);
+        const available = Number(dep?.status?.availableReplicas ?? 0);
+
+        if (desired <= 0) {
+          return {
+            verified: false,
+            reason: "Deployment is at 0 replicas, so workload is not actively healed",
+          };
+        }
+
+        if (available <= 0) {
+          return {
+            verified: false,
+            reason: `Deployment has desired=${desired} but available=${available}`,
+          };
+        }
+
+        if (available < desired) {
+          return {
+            verified: false,
+            reason: `Deployment not fully available yet (${available}/${desired})`,
+          };
+        }
+
+        return { verified: true, reason: `Deployment healthy (${available}/${desired} available)` };
+
+      }
+
+      const podResult = spawnSync("kubectl", ["get", "pod", targetName, "-n", targetNamespace, "-o", "json"], {
+        cwd: process.cwd(),
+        encoding: "utf8",
+      });
+
+      if (podResult.status !== 0 || !podResult.stdout) {
+        return {
+          verified: false,
+          reason: (podResult.stderr || podResult.stdout || "unable to read pod state").trim(),
+        };
+      }
+
+      const pod = JSON.parse(podResult.stdout) as {
+        status?: {
+          phase?: string;
+          conditions?: Array<{ type?: string; status?: string }>;
+        };
+      };
+
+      const phase = String(pod.status?.phase || "").toLowerCase();
+      const ready = Array.isArray(pod.status?.conditions)
+        ? pod.status?.conditions.some((cond) => cond.type === "Ready" && cond.status === "True")
+        : false;
+
+      if (phase === "running" && ready) {
+        return { verified: true, reason: "Pod is running and ready" };
+      }
+
+      return {
+        verified: false,
+        reason: `Pod not ready (phase=${phase || "unknown"})`,
+      };
+    } catch (error) {
+      return {
+        verified: false,
+        reason: error instanceof Error ? error.message : String(error),
+      };
+    }
+  }
+
+  private resolveDeploymentName(targetName: string, targetKind: "pod" | "deployment") {
+    if (targetKind === "deployment") {
+      return targetName;
+    }
+
+    const parts = targetName.split("-");
+    if (parts.length >= 3) {
+      return parts.slice(0, -2).join("-");
+    }
+    if (parts.length >= 2) {
+      return parts.slice(0, -1).join("-");
+    }
+    return targetName;
+  }
+
+  private captureRollbackSnapshot(options: StartOptions, issueId: string) {
+    const targetName = (options.targetName || "").trim();
+    if (!targetName) {
+      return;
+    }
+
+    const targetNamespace = (options.targetNamespace || "default").trim() || "default";
+    const targetKind = (options.targetKind || "pod") as "pod" | "deployment";
+    const deploymentName = this.resolveDeploymentName(targetName, targetKind);
+
+    const depResult = spawnSync(
+      "kubectl",
+      ["get", "deployment", deploymentName, "-n", targetNamespace, "-o", "json"],
+      { cwd: process.cwd(), encoding: "utf8" },
+    );
+
+    if (depResult.status !== 0 || !depResult.stdout) {
+      this.appendLog({
+        agent_name: "ObserverAgent",
+        event_type: "ANALYZING",
+        issue_id: issueId,
+        description: `Pre-heal snapshot unavailable for ${targetNamespace}/${deploymentName}: ${(depResult.stderr || depResult.stdout || "deployment not found").trim()}`,
+        action_taken: "Continuing without deployment snapshot rollback baseline",
+        status: "IN_PROGRESS",
+      });
+      return;
+    }
+
+    try {
+      const parsed = JSON.parse(depResult.stdout) as {
+        apiVersion?: string;
+        kind?: string;
+        metadata?: {
+          name?: string;
+          namespace?: string;
+          labels?: Record<string, string>;
+          annotations?: Record<string, string>;
+        };
+        spec?: Record<string, unknown>;
+      };
+
+      if (!parsed.spec || !parsed.metadata?.name) {
+        return;
+      }
+
+      this.rollbackSnapshot = {
+        capturedAt: new Date().toISOString(),
+        issueId,
+        targetName,
+        targetNamespace,
+        targetKind,
+        deploymentName,
+        deploymentManifest: {
+          apiVersion: parsed.apiVersion || "apps/v1",
+          kind: parsed.kind || "Deployment",
+          metadata: {
+            name: parsed.metadata.name,
+            namespace: parsed.metadata.namespace || targetNamespace,
+            labels: parsed.metadata.labels,
+            annotations: parsed.metadata.annotations,
+          },
+          spec: parsed.spec,
+        },
+      };
+
+      this.appendLog({
+        agent_name: "ObserverAgent",
+        event_type: "ANALYZING",
+        issue_id: issueId,
+        description: `Pre-heal deployment snapshot captured for ${targetNamespace}/${deploymentName}.`,
+        action_taken: "Stored rollback baseline before remediation",
+        status: "IN_PROGRESS",
+      });
+    } catch {
+      // Snapshot capture is best effort; healing continues without rollback baseline.
+    }
   }
 
   private ingestProcessLines(raw: string, issueId: string, isStderr: boolean) {
@@ -564,7 +824,7 @@ declare global {
   var __healingRunnerService: HealingAgentRunnerService | undefined;
 }
 
-if (!globalThis.__healingRunnerService || globalThis.__healingRunnerService.version !== "2026-04-17-custom-remediation-v1") {
+if (!globalThis.__healingRunnerService || globalThis.__healingRunnerService.version !== "2026-04-17-custom-remediation-v6") {
   globalThis.__healingRunnerService = new HealingAgentRunnerService();
 }
 

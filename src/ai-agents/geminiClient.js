@@ -1,4 +1,6 @@
-const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-1.5-flash";
+import { estimateCostUsd } from "@/lib/cost/tokuin-pricing";
+
+const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.0-flash";
 
 function fallbackRecommendation({ scenario, metricsUrl }) {
   return {
@@ -84,14 +86,18 @@ function fallbackMultiOptions({ scenario, rootCause, affectedPods }) {
     selected_option: "option_b",
     selection_reason: "Rolling restart provides best balance of speed, reliability, and zero-downtime deployment.",
     source: "fallback",
+    reason: "gemini_error",
   };
 }
 
 export async function getGeminiHealingPlan(context) {
-  const apiKey = process.env.GEMINI_API_KEY;
+  const apiKey = process.env.GEMINI_API_KEY || process.env.GOOGLE_GENERATIVE_AI_API_KEY;
   if (!apiKey) {
+    console.log("[GEMINI][HEALING] No API key found. Returning fallback recommendation.");
     return fallbackRecommendation(context);
   }
+  
+  console.log("[GEMINI][HEALING] API key found. Generating healing plan via Gemini...");
 
   const prompt = [
     "You are a Kubernetes SRE assistant.",
@@ -152,7 +158,7 @@ export async function getGeminiHealingPlan(context) {
           input_tokens: inputTokens,
           output_tokens: outputTokens,
           total_tokens: inputTokens + outputTokens,
-          cost_usd: (inputTokens / 1000000) * 0.075 + (outputTokens / 1000000) * 0.30,
+          cost_usd: estimateCostUsd(inputTokens, outputTokens, GEMINI_MODEL),
           model: GEMINI_MODEL,
           scenario: context.scenario,
         }),
@@ -169,7 +175,7 @@ export async function getGeminiHealingPlan(context) {
       usageMetadata: {
         inputTokens,
         outputTokens,
-        cost: (inputTokens / 1000000) * 0.075 + (outputTokens / 1000000) * 0.30,
+        cost: estimateCostUsd(inputTokens, outputTokens, GEMINI_MODEL),
       },
     };
   } catch {
@@ -182,16 +188,22 @@ export async function getGeminiHealingPlan(context) {
  * Returns 3 options with pros/cons and selected best option
  */
 export async function getRemediationOptions(context) {
-  const apiKey = process.env.GEMINI_API_KEY;
+  const apiKey = process.env.GEMINI_API_KEY || process.env.GOOGLE_GENERATIVE_AI_API_KEY;
   const { rootCause, failureChain, affectedCount = 0 } = context;
 
   if (!apiKey) {
-    return fallbackMultiOptions({
-      scenario: context.scenario,
-      rootCause: rootCause || "unknown-pod",
-      affectedPods: affectedCount,
-    });
+    console.log("[GEMINI][REMEDIATION] No API key found. Returning fallback options.");
+    return {
+      ...fallbackMultiOptions({
+        scenario: context.scenario,
+        rootCause: rootCause || "unknown-pod",
+        affectedPods: affectedCount,
+      }),
+      reason: "no_api_key",
+    };
   }
+
+  console.log("[GEMINI][REMEDIATION] API key found. Generating options via Gemini...");
 
   const prompt = [
     "You are a Kubernetes SRE expert. Generate exactly 3 remediation strategies as JSON.",
@@ -221,26 +233,56 @@ export async function getRemediationOptions(context) {
     "Generate practical Kubernetes recovery strategies ONLY.",
   ].join("\n");
 
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(GEMINI_MODEL)}:generateContent?key=${encodeURIComponent(apiKey)}`;
-
   try {
-    const response = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        contents: [{ role: "user", parts: [{ text: prompt }] }],
-        generationConfig: {
-          temperature: 0.3,
-          topP: 0.9,
-          maxOutputTokens: 1500,
-        },
-      }),
-      cache: "no-store",
-    });
+    const requestWithModel = async (modelName) => {
+      const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(modelName)}:generateContent?key=${encodeURIComponent(apiKey)}`;
+      const response = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          contents: [{ role: "user", parts: [{ text: prompt }] }],
+          generationConfig: {
+            temperature: 0.3,
+            topP: 0.9,
+            maxOutputTokens: 1500,
+          },
+        }),
+        cache: "no-store",
+      });
+
+      return response;
+    };
+
+    let modelUsed = GEMINI_MODEL;
+    let response = await requestWithModel(modelUsed);
+
+    // Some projects still configure a retired model; auto-retry with a stable fallback.
+    if (!response.ok && response.status === 404 && modelUsed !== "gemini-2.0-flash") {
+      const notFoundText = await response.text();
+      console.warn(`[GEMINI][REMEDIATION] Model ${modelUsed} unavailable. Retrying with gemini-2.0-flash. Details: ${notFoundText}`);
+      modelUsed = "gemini-2.0-flash";
+      response = await requestWithModel(modelUsed);
+    }
 
     if (!response.ok) {
+      const errorText = await response.text();
+      console.error(`[GEMINI][REMEDIATION] API Error ${response.status}: ${errorText}`);
+      if (response.status === 429) {
+        return {
+          ...fallbackMultiOptions({ scenario: context.scenario, rootCause, affectedPods: affectedCount }),
+          reason: "quota_exceeded",
+        };
+      }
+      if (response.status === 404) {
+        return {
+          ...fallbackMultiOptions({ scenario: context.scenario, rootCause, affectedPods: affectedCount }),
+          reason: "model_unavailable",
+        };
+      }
       return fallbackMultiOptions({ scenario: context.scenario, rootCause, affectedPods: affectedCount });
     }
+
+    console.log(`[GEMINI][REMEDIATION] Using model: ${modelUsed}`);
 
     const data = await response.json();
     const text =
@@ -250,16 +292,26 @@ export async function getRemediationOptions(context) {
         .trim() || "";
 
     if (!text) {
+      console.error("[GEMINI][REMEDIATION] No text generated. Response:", JSON.stringify(data, null, 2));
       return fallbackMultiOptions({ scenario: context.scenario, rootCause, affectedPods: affectedCount });
     }
 
     const cleaned = text.replace(/^```json\s*/i, "").replace(/```$/i, "").trim();
-    const parsed = JSON.parse(cleaned);
+    let parsed;
+    try {
+      parsed = JSON.parse(cleaned);
+    } catch (parseErr) {
+      console.error("[GEMINI][REMEDIATION] JSON parse error:", parseErr.message, "Text:", cleaned.substring(0, 200));
+      return fallbackMultiOptions({ scenario: context.scenario, rootCause, affectedPods: affectedCount });
+    }
 
     // Validate structure
     if (!Array.isArray(parsed.options) || parsed.options.length < 3) {
+      console.error("[GEMINI][REMEDIATION] Invalid response structure. Options count:", parsed.options?.length);
       return fallbackMultiOptions({ scenario: context.scenario, rootCause, affectedPods: affectedCount });
     }
+
+    console.log("[GEMINI][REMEDIATION] Successfully generated 3+ options via Gemini");
 
       // Capture token usage metadata
       const usageMetadata = data?.usageMetadata || {};
@@ -276,8 +328,8 @@ export async function getRemediationOptions(context) {
             input_tokens: inputTokens,
             output_tokens: outputTokens,
             total_tokens: inputTokens + outputTokens,
-            cost_usd: (inputTokens / 1000000) * 0.075 + (outputTokens / 1000000) * 0.30,
-            model: GEMINI_MODEL,
+            cost_usd: estimateCostUsd(inputTokens, outputTokens, modelUsed),
+            model: modelUsed,
             scenario: context.scenario,
           }),
         }).catch((e) => console.error("[CostTracking] Failed to record options costs:", e));
@@ -306,10 +358,11 @@ export async function getRemediationOptions(context) {
       usageMetadata: {
         inputTokens,
         outputTokens,
-        cost: (inputTokens / 1000000) * 0.075 + (outputTokens / 1000000) * 0.30,
+        cost: estimateCostUsd(inputTokens, outputTokens, modelUsed),
       },
     };
-  } catch {
+  } catch (error) {
+    console.error("[GEMINI][REMEDIATION] Unhandled error:", error);
     return fallbackMultiOptions({ scenario: context.scenario, rootCause, affectedPods: affectedCount });
   }
 }

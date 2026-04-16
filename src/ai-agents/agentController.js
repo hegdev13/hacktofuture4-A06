@@ -9,6 +9,7 @@ export async function triggerSelfHeal(input = {}) {
     targetName: input.targetName,
     targetNamespace: input.targetNamespace,
     targetKind: input.targetKind,
+    remediationId: input.remediationId,
     remediationPreference: input.remediationPreference,
     customCommand: input.customCommand,
   });

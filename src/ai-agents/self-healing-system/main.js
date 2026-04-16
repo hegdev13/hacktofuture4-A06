@@ -315,6 +315,30 @@ class SelfHealingSystem {
         break;
       }
 
+      // Observer gate after detection: skip RCA and execution when trigger is false.
+      if (!manualTarget && analysis.rcaDecision && analysis.rcaDecision.triggerRCA === false) {
+        logger.info(`Observer gate reason: ${analysis.rcaDecision.reason}`);
+        logger.timelineEvent('analysis', `RCA gate closed by Observer: ${analysis.rcaDecision.reason}`);
+
+        if (attempts < this.maxRetries) {
+          await this.sleep(this.retryDelayMs);
+          currentState = await this.getClusterState();
+          detection = null;
+          continue;
+        }
+
+        finalResult = {
+          success: true,
+          attempts,
+          finalHealth: analysis.healthy ? 'healthy' : 'monitoring',
+          issuesFound: analysis.issues.length,
+          fixesApplied: 0,
+          rcaDecision: analysis.rcaDecision,
+          timeline: logger.getTimeline(),
+        };
+        break;
+      }
+
       // Step 3: RCA - Root Cause Analysis
       this.setAgentStatus('rca', 'running', { step: 'analyzing' });
       const detectedIssues = detection.confirmedIssues.map(issue => ({
@@ -336,10 +360,41 @@ class SelfHealingSystem {
       };
 
       const rcaOutput = rca.performRCA(stateForRCA, detectedIssues);
+
+      if (rcaOutput.action === 'NO_ACTION' || !rcaOutput.rootCause) {
+        this.setAgentStatus('rca', 'skipped', {
+          step: 'complete',
+          reason: rcaOutput.reasoning || 'RCA trigger conditions not satisfied',
+        });
+
+        logger.info(`Observer gate reason: ${analysis?.rcaDecision?.reason || 'n/a'}`);
+        logger.info(`RCA action: ${rcaOutput.action || 'NO_ACTION'}`);
+        logger.timelineEvent('rca', `RCA skipped: ${rcaOutput.reasoning || 'no action'}`);
+
+        if (attempts < this.maxRetries) {
+          await this.sleep(this.retryDelayMs);
+          currentState = await this.getClusterState();
+          detection = null;
+          continue;
+        }
+
+        finalResult = {
+          success: true,
+          attempts,
+          finalHealth: analysis.healthy ? 'healthy' : 'monitoring',
+          issuesFound: analysis.issues.length,
+          fixesApplied: 0,
+          timeline: logger.getTimeline(),
+        };
+        break;
+      }
+
       if (manualTarget?.kind === 'deployment') {
         rcaOutput.rootCauseType = 'deployment';
         rcaOutput.manualTargetKind = 'deployment';
       }
+      logger.info(`Observer gate reason: ${analysis?.rcaDecision?.reason || 'manual-target override'}`);
+      logger.info(`RCA action: ${rcaOutput.action || 'ANALYZE'} | rootCause: ${rcaOutput.rootCause || 'none'}`);
       this.setAgentStatus('rca', 'success', {
         step: 'complete',
         rootCause: rcaOutput.rootCause,

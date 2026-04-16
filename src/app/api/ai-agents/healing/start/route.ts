@@ -25,6 +25,7 @@ export async function POST(request: Request) {
     targetName?: string;
     targetNamespace?: string;
     targetKind?: HealingTargetKind;
+    remediationId?: string;
     remediationPreference?: "restart-workload" | "scale-replicas" | "dependency-first" | "custom-command";
     customCommand?: string;
   };

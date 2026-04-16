@@ -1,172 +1,184 @@
-import { NextResponse } from 'next/server';
+import { NextRequest, NextResponse } from "next/server";
+
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const observer = require("../../../../ai-agents/self-healing-system/agents/observer");
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const rca = require("../../../../ai-agents/self-healing-system/agents/rca");
+
+type PodLike = {
+  name?: string;
+  namespace?: string;
+  status?: string;
+  phase?: string;
+  cpu?: number;
+  cpuUsage?: number;
+  memory?: number;
+  memoryUsage?: number;
+  restarts?: number;
+  restartCount?: number;
+  errorRate?: number;
+  logs?: unknown;
+  events?: unknown;
+  dependencies?: unknown;
+};
+
+function toArray(value: unknown): unknown[] {
+  if (Array.isArray(value)) return value;
+  if (value == null) return [];
+  return [value];
+}
+
+function normalizePod(pod: PodLike) {
+  return {
+    name: String(pod.name || "unknown"),
+    namespace: String(pod.namespace || "default"),
+    status: String(pod.status || pod.phase || "unknown"),
+    cpu: Number(pod.cpu ?? pod.cpuUsage ?? 0),
+    memory: Number(pod.memory ?? pod.memoryUsage ?? 0),
+    restarts: Number(pod.restarts ?? pod.restartCount ?? 0),
+    errorRate: Number(pod.errorRate ?? 0),
+    logs: toArray(pod.logs),
+    events: toArray(pod.events),
+    dependencies: Array.isArray(pod.dependencies) ? pod.dependencies : [],
+  };
+}
+
+function normalizeClusterState(input: any) {
+  return {
+    pods: (input?.pods || []).map((p: PodLike) => normalizePod(p)),
+    services: Array.isArray(input?.services) ? input.services : [],
+    nodes: Array.isArray(input?.nodes) ? input.nodes : [],
+    metrics: input?.metrics || {},
+    timestamp: input?.timestamp || new Date().toISOString(),
+  };
+}
+
+function analysisToDetectedIssues(analysis: any) {
+  const issues = Array.isArray(analysis?.issues) ? analysis.issues : [];
+  return issues.map((issue: any) => ({
+    target: issue.target || issue.pod || issue.node,
+    problem: issue.problem,
+    severity: issue.severity,
+    metric: issue.metric,
+    details: issue.details,
+    isFlapping: issue.isFlapping,
+  }));
+}
+
+function buildLifecyclePayload(clusterState: any) {
+  const analysis = observer.analyzeClusterState(clusterState);
+  const detectedIssues = analysisToDetectedIssues(analysis);
+  const rcaOutput = rca.performRCA(clusterState, detectedIssues);
+  const activeIssue = (rcaOutput.issues || []).find((issue: any) => issue.status === "ACTIVE") || null;
+
+  return {
+    observer: {
+      triggerRCA: Boolean(analysis?.rcaDecision?.triggerRCA),
+      reason: String(analysis?.rcaDecision?.reason || "No decision available"),
+      metricsSummary: analysis?.rcaDecision?.metricsSummary || {},
+      issueCount: Array.isArray(analysis?.issues) ? analysis.issues.length : 0,
+    },
+    rca: {
+      action: rcaOutput.action || "NO_ACTION",
+      issues: Array.isArray(rcaOutput.issues) ? rcaOutput.issues : [],
+      rootCause: activeIssue?.rootCause || rcaOutput.rootCause || null,
+      failureChain: activeIssue?.failureChain || rcaOutput.failureChain || [],
+      confidence: activeIssue?.confidence ?? rcaOutput.confidenceScore ?? 0,
+      reasoning: activeIssue?.reasoning || rcaOutput.reasoning || "No RCA reasoning available",
+      chainDetails: rcaOutput.chainDetails || [],
+      reportPath: rcaOutput.reportPath || null,
+      executor: {
+        rootCause: activeIssue?.rootCause || rcaOutput.rootCause || null,
+        confidence: typeof rcaOutput.confidence === "number" ? rcaOutput.confidence : 0,
+        failureChain: activeIssue?.failureChain || rcaOutput.failureChain || [],
+        chainDetails: rcaOutput.chainDetails || [],
+      },
+    },
+    timestamp: new Date().toISOString(),
+  };
+}
+
+async function fetchMetricsState() {
+  const metricsUrl = process.env.RCA_METRICS_URL || process.env.METRICS_URL || "http://localhost:5555/api/metrics";
+  const response = await fetch(metricsUrl, { cache: "no-store" });
+  if (!response.ok) {
+    throw new Error(`Unable to fetch metrics from ${metricsUrl} (${response.status})`);
+  }
+  const body = await response.json();
+  return normalizeClusterState(body);
+}
 
 export async function GET() {
   try {
-    // Fetch real metrics from the metrics server
-    const metricsResponse = await fetch('http://localhost:5555/api/metrics', {
-      cache: 'no-store'
-    });
-    
-    if (!metricsResponse.ok) {
-      return NextResponse.json(
-        { error: 'Failed to fetch metrics' },
-        { status: 500 }
-      );
-    }
-    
-    const metricsData = await metricsResponse.json();
-    
-    // Import and run RCA analysis
-    // Since this is server-side, we'll do a basic analysis here
-    const rcaAnalysis = performRCA(metricsData);
-    
-    return NextResponse.json(rcaAnalysis);
+    const clusterState = await fetchMetricsState();
+    const payload = buildLifecyclePayload(clusterState);
+    return NextResponse.json(payload, { status: 200 });
   } catch (error) {
-    console.error('RCA Error:', error);
+    console.error("[RCA][ANALYZE][GET][ERROR]", error);
     return NextResponse.json(
-      { error: 'RCA analysis failed' },
+      {
+        observer: {
+          triggerRCA: false,
+          reason: error instanceof Error ? error.message : "RCA analyze failed",
+          metricsSummary: {},
+          issueCount: 0,
+        },
+        rca: {
+          action: "NO_ACTION",
+          issues: [],
+          rootCause: null,
+          failureChain: [],
+          confidence: 0,
+          reasoning: "RCA analyze failed",
+          chainDetails: [],
+          reportPath: null,
+          executor: {
+            rootCause: null,
+            confidence: 0,
+            failureChain: [],
+            chainDetails: [],
+          },
+        },
+      },
       { status: 500 }
     );
   }
 }
 
-/**
- * Perform RCA analysis on metrics
- */
-function performRCA(metricsData: {
-  pods?: Array<{
-    name: string;
-    namespace?: string;
-    status: string;
-    cpu?: number;
-    memory?: number;
-  }>;
-}) {
-  const pods = metricsData.pods || [];
-  
-  const POD_DEPENDENCIES: Record<string, string[]> = {
-    'api-server': ['cache-redis', 'database-primary'],
-    'database-primary': [],
-    'cache-redis': ['database-primary'],
-    'worker-1': ['cache-redis', 'database-primary'],
-    'worker-2': ['cache-redis', 'database-primary'],
-    'web-frontend': ['api-server', 'worker-1'],
-    'monitoring-agent': ['api-server'],
-    'log-aggregator': ['database-primary'],
-  };
-
-  // Find root causes - pods that failed without a failed dependency
-  const failedPods = pods.filter(p => p.status !== 'Running');
-  
-  const rootCausePods = failedPods.filter(failedPod => {
-    const dependencies = POD_DEPENDENCIES[failedPod.name] || [];
-    const hasFailedDependency = dependencies.some(depName => {
-      const depPod = pods.find(p => p.name === depName);
-      return depPod && depPod.status !== 'Running';
-    });
-    return !hasFailedDependency;
-  });
-
-  // Find affected pods (failed due to root cause)
-  const affectedPods = failedPods.filter(pod => {
-    return !rootCausePods.some(rc => rc.name === pod.name);
-  });
-
-  // Enrich pods with RCA metadata
-  const enrichedPods = pods.map(pod => {
-    const isRootCause = rootCausePods.some(r => r.name === pod.name);
-    const isAffected = affectedPods.some(a => a.name === pod.name);
-    
-    let failureType = 'healthy';
-    let failureReason = null;
-
-    if (isRootCause) {
-      failureType = 'root-cause';
-      failureReason = 'Original failure point';
-    } else if (isAffected) {
-      failureType = 'cascading';
-      const deps = POD_DEPENDENCIES[pod.name] || [];
-      const failedDep = deps.find(depName => 
-        rootCausePods.some(rc => rc.name === depName)
-      );
-      if (failedDep) {
-        failureReason = `Failed because ${failedDep} is down`;
-      }
-    }
-
-    return {
-      id: pod.name,
-      name: pod.name,
-      namespace: pod.namespace,
-      status: pod.status === 'Running' ? 'running' : pod.status.includes('Failed') || pod.status === 'CrashLoopBackOff' ? 'failed' : 'pending',
-      cpu: pod.cpu,
-      memory: pod.memory,
-      failureType,
-      failureReason,
-      dependencies: POD_DEPENDENCIES[pod.name] || [],
-      dependents: Object.entries(POD_DEPENDENCIES)
-        .filter(([_, deps]) => deps.includes(pod.name))
-        .map(([name]) => name)
-    };
-  });
-
-  // Generate remediations
-  const remediations: Array<{
-    priority: string;
-    title: string;
-    description: string;
-    command: string;
-    impact?: string;
-  }> = [];
-  rootCausePods.forEach(pod => {
-    if (pod.name.includes('database')) {
-      remediations.push({
-        priority: 'critical',
-        title: `Restart ${pod.name}`,
-        description: 'Database pod is the root cause of cascading failures',
-        command: `kubectl rollout restart deployment/$(kubectl get pod ${pod.name} -o jsonpath='{.metadata.ownerReferences[0].name}')`,
-        impact: `Will recover ${affectedPods.length} affected pods`
-      });
-    } else if (pod.name.includes('cache')) {
-      remediations.push({
-        priority: 'critical',
-        title: `Restart ${pod.name}`,
-        description: 'Cache pod is the root cause - will cascade to dependent services',
-        command: `kubectl rollout restart deployment/$(kubectl get pod ${pod.name} -o jsonpath='{.metadata.ownerReferences[0].name}')`,
-        impact: `Will recover ${affectedPods.length} affected pods`
-      });
-    } else {
-      remediations.push({
-        priority: 'high',
-        title: `Investigate ${pod.name}`,
-        description: 'Pod failed - gather logs and metrics',
-        command: `kubectl logs ${pod.name} -n default --tail=100 && kubectl describe pod ${pod.name}`,
-      });
-    }
-  });
-
-  const totalPods = pods.length;
-  const healthyCount = pods.filter(p => p.status === 'Running').length;
-  const healthPercent = Math.round((healthyCount / totalPods) * 100);
-
-  return {
-    timestamp: new Date().toISOString(),
-    status: rootCausePods.length === 0 ? 'healthy' : rootCausePods.length > 1 ? 'critical' : 'degraded',
-    healthPercent,
-    totalPods,
-    healthyPods: healthyCount,
-    failedPods: failedPods.length,
-    rootCausesCount: rootCausePods.length,
-    affectedPodsCount: affectedPods.length,
-    rootCauses: rootCausePods.map(p => ({
-      name: p.name,
-      status: p.status,
-      message: `${p.name} is in ${p.status} state`
-    })),
-    pods: enrichedPods,
-    remediations: remediations,
-    summary: rootCausePods.length === 0 
-      ? 'All systems operational'
-      : `${rootCausePods.length} root cause(s) causing ${affectedPods.length} cascading failure(s) - ${healthPercent}% cluster health`
-  };
+export async function POST(request: NextRequest) {
+  try {
+    const body = await request.json();
+    const clusterState = normalizeClusterState(body);
+    const payload = buildLifecyclePayload(clusterState);
+    return NextResponse.json(payload, { status: 200 });
+  } catch (error) {
+    console.error("[RCA][ANALYZE][POST][ERROR]", error);
+    return NextResponse.json(
+      {
+        observer: {
+          triggerRCA: false,
+          reason: error instanceof Error ? error.message : "RCA analyze failed",
+          metricsSummary: {},
+          issueCount: 0,
+        },
+        rca: {
+          action: "NO_ACTION",
+          issues: [],
+          rootCause: null,
+          failureChain: [],
+          confidence: 0,
+          reasoning: "RCA analyze failed",
+          chainDetails: [],
+          reportPath: null,
+          executor: {
+            rootCause: null,
+            confidence: 0,
+            failureChain: [],
+            chainDetails: [],
+          },
+        },
+      },
+      { status: 500 }
+    );
+  }
 }

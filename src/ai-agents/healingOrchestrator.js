@@ -14,6 +14,7 @@ export async function runHealingOrchestrator(input) {
   const targetName = (input.targetName || "").trim();
   const targetNamespace = (input.targetNamespace || "default").trim() || "default";
   const targetKind = input.targetKind || "pod";
+  const remediationId = (input.remediationId || "").trim();
   const remediationPreference = input.remediationPreference;
   const customCommand = (input.customCommand || "").trim();
 
@@ -44,6 +45,7 @@ export async function runHealingOrchestrator(input) {
     targetName: targetName || undefined,
     targetNamespace: targetName ? targetNamespace : undefined,
     targetKind: targetName ? targetKind : undefined,
+    remediationId: remediationId || undefined,
     remediationPreference,
     customCommand: customCommand || undefined,
   });
@@ -55,7 +57,11 @@ export async function runHealingOrchestrator(input) {
       agent_name: "Orchestrator",
       event_type: "ANALYZING",
       description: `Self-heal trigger accepted (scenario=${scenario}, dryRun=${dryRun ? "true" : "false"}, target=${targetLabel}).`,
-      action_taken: targetName ? `Prioritizing ${targetLabel}` : "Trigger received",
+      action_taken: remediationId
+        ? `Prioritizing ${targetLabel}; selected remediation=${remediationId}`
+        : targetName
+          ? `Prioritizing ${targetLabel}`
+          : "Trigger received",
       status: "IN_PROGRESS",
     });
 

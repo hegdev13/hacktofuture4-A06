@@ -11,6 +11,8 @@ export async function GET(request: NextRequest) {
       timestamp: new Date().toISOString(),
       endpoints: {
         metrics: "/api/metrics/context",
+        observerDecision: "/api/observer/decision",
+        rcaAnalyze: "/api/rca/analyze",
         health: "/api/debug",
       },
       ngrok_hint: "Make sure this endpoint is accessed via ngrok public URL, not localhost",
