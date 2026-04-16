@@ -3,8 +3,8 @@ import { createClient } from "@supabase/supabase-js";
 
 export const runtime = "nodejs";
 
-const supabaseUrl = process.env.SUPABASE_URL || "";
-const supabaseKey = process.env.SUPABASE_ANON_KEY || "";
+const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL || process.env.SUPABASE_URL || "";
+const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY || process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || "";
 
 async function getSupabase() {
   if (!supabaseUrl || !supabaseKey) {
@@ -102,6 +102,7 @@ export async function GET(request: Request) {
 
     const supabase = await getSupabase();
     let records = DEMO_COSTS;
+    let dataSource = "demo";
 
     if (supabase) {
       const cutoffDate = new Date();
@@ -114,9 +115,13 @@ export async function GET(request: Request) {
 
       if (!error && data) {
         records = data;
+        dataSource = "supabase";
+        console.log(`[CostSummary] Loaded ${data.length} records from Supabase`);
       } else if (error) {
         console.warn("[CostSummary] Query error, using demo data:", error);
       }
+    } else {
+      console.warn("[CostSummary] Supabase not configured, using demo data");
     }
 
     // Fetch live exchange rate
@@ -168,6 +173,7 @@ export async function GET(request: Request) {
       monthly_estimate_inr: parseFloat(monthlyEstimateINR.toFixed(2)),
       exchange_rate: exchangeRate,
       record_count: records.length,
+      data_source: dataSource,
     });
   } catch (error) {
     console.error("[CostSummary] Error:", error);
