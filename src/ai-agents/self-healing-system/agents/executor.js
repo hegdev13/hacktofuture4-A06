@@ -8,6 +8,304 @@ const logger = require('../utils/logger');
 const memory = require('./memory');
 const { execFileSync } = require('child_process');
 
+/**
+ * Checkpoint Manager - stores state before execution for rollback capability
+ */
+class CheckpointManager {
+  constructor() {
+    this.checkpoints = new Map(); // issueId -> checkpoint data
+    this.maxAgeMs = 30 * 60 * 1000; // 30 minutes max checkpoint age
+  }
+
+  /**
+   * Capture checkpoint before executing fix
+   */
+  async captureCheckpoint(issueId, target, namespace, strategy) {
+    try {
+      const timestamp = new Date().toISOString();
+      const checkpoint = {
+        issueId,
+        target,
+        namespace,
+        strategy,
+        timestamp,
+        state: {},
+      };
+
+      // Get deployment state if applicable
+      if (strategy.type === 'restart_deployment' ||
+          strategy.type === 'scale_up' ||
+          strategy.type === 'scale_down' ||
+          strategy.type === 'rollback') {
+        const depState = await this.captureDeploymentState(target, namespace);
+        checkpoint.state.deployment = depState;
+      }
+
+      // Get pod state for pod restarts
+      if (strategy.type === 'restart_pod') {
+        const podState = await this.capturePodState(target, namespace);
+        checkpoint.state.pod = podState;
+      }
+
+      // Store checkpoint
+      this.checkpoints.set(issueId, checkpoint);
+
+      // Cleanup old checkpoints
+      this.cleanupOldCheckpoints();
+
+      logger.info(`[CHECKPOINT] ✅ Captured checkpoint for ${issueId}`);
+      return { ok: true, checkpoint };
+    } catch (error) {
+      logger.error(`[CHECKPOINT] ❌ Failed to capture checkpoint: ${error.message}`);
+      return { ok: false, error: error.message };
+    }
+  }
+
+  /**
+   * Capture deployment state
+   */
+  captureDeploymentState(deploymentName, namespace) {
+    try {
+      const args = ['get', 'deployment', deploymentName, '-n', namespace, '-o', 'json'];
+      const output = execFileSync('kubectl', args, {
+        encoding: 'utf8',
+        timeout: 15000,
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+      const deployment = JSON.parse(output);
+
+      return {
+        name: deployment.metadata?.name,
+        namespace: deployment.metadata?.namespace,
+        replicas: deployment.spec?.replicas,
+        strategy: deployment.spec?.strategy,
+        selector: deployment.spec?.selector,
+        template: deployment.spec?.template,
+        revision: deployment.metadata?.annotations?.['deployment.kubernetes.io/revision'],
+        resourceVersion: deployment.metadata?.resourceVersion,
+        raw: deployment,
+      };
+    } catch (error) {
+      logger.warn(`[CHECKPOINT] Could not capture deployment state: ${error.message}`);
+      return null;
+    }
+  }
+
+  /**
+   * Capture pod state
+   */
+  capturePodState(podName, namespace) {
+    try {
+      const args = ['get', 'pod', podName, '-n', namespace, '-o', 'json'];
+      const output = execFileSync('kubectl', args, {
+        encoding: 'utf8',
+        timeout: 15000,
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+      const pod = JSON.parse(output);
+
+      return {
+        name: pod.metadata?.name,
+        namespace: pod.metadata?.namespace,
+        labels: pod.metadata?.labels,
+        ownerReferences: pod.metadata?.ownerReferences,
+        spec: {
+          containers: pod.spec?.containers?.map(c => ({
+            name: c.name,
+            image: c.image,
+            resources: c.resources,
+            env: c.env,
+          })),
+          restartPolicy: pod.spec?.restartPolicy,
+        },
+        resourceVersion: pod.metadata?.resourceVersion,
+        raw: pod,
+      };
+    } catch (error) {
+      logger.warn(`[CHECKPOINT] Could not capture pod state: ${error.message}`);
+      return null;
+    }
+  }
+
+  /**
+   * Get checkpoint for issue
+   */
+  getCheckpoint(issueId) {
+    return this.checkpoints.get(issueId);
+  }
+
+  /**
+   * Rollback to checkpoint
+   */
+  async rollbackToCheckpoint(issueId) {
+    const checkpoint = this.checkpoints.get(issueId);
+    if (!checkpoint) {
+      return {
+        ok: false,
+        error: 'No checkpoint found for issue',
+      };
+    }
+
+    const results = [];
+
+    try {
+      logger.info(`[ROLLBACK] 🔄 Starting rollback for ${issueId}`);
+
+      // Rollback deployment if we have state
+      if (checkpoint.state?.deployment) {
+        const depResult = await this.rollbackDeployment(
+          checkpoint.state.deployment,
+          checkpoint.strategy
+        );
+        results.push({ type: 'deployment', ...depResult });
+      }
+
+      // For pod restarts, checkpoint is informational - pods self-heal
+      // But we can verify owner reference still exists
+      if (checkpoint.state?.pod) {
+        results.push({
+          type: 'pod',
+          ok: true,
+          message: 'Pod checkpoint recorded for reference only',
+        });
+      }
+
+      const allOk = results.every(r => r.ok);
+
+      logger.info(`[ROLLBACK] ✅ Rollback ${allOk ? 'completed' : 'partial'} for ${issueId}`);
+
+      return {
+        ok: allOk,
+        results,
+        message: allOk ? 'Rollback successful' : 'Rollback completed with issues',
+      };
+    } catch (error) {
+      logger.error(`[ROLLBACK] ❌ Rollback failed: ${error.message}`);
+      return {
+        ok: false,
+        error: error.message,
+        results,
+      };
+    }
+  }
+
+  /**
+   * Rollback deployment to previous state
+   */
+  rollbackDeployment(deploymentState, strategy) {
+    try {
+      const { name, namespace, replicas, revision } = deploymentState;
+
+      // If we have a revision, use rollout undo
+      if (revision && strategy.type !== 'scale_up') {
+        logger.info(`[ROLLBACK] Using rollout undo for ${namespace}/${name}`);
+        const args = ['rollout', 'undo', 'deployment', name, '-n', namespace];
+        const output = execFileSync('kubectl', args, {
+          encoding: 'utf8',
+          timeout: 60000,
+          stdio: ['pipe', 'pipe', 'pipe'],
+        });
+
+        // Wait for rollback to complete
+        this.waitForRollout(name, namespace);
+
+        return {
+          ok: true,
+          method: 'rollout_undo',
+          output: output.trim(),
+        };
+      }
+
+      // For scale operations, restore original replica count
+      if (strategy.type === 'scale_up' && replicas !== undefined) {
+        logger.info(`[ROLLBACK] Restoring replica count ${replicas} for ${namespace}/${name}`);
+        const args = ['scale', 'deployment', name, '-n', namespace, `--replicas=${replicas}`];
+        const output = execFileSync('kubectl', args, {
+          encoding: 'utf8',
+          timeout: 30000,
+          stdio: ['pipe', 'pipe', 'pipe'],
+        });
+
+        return {
+          ok: true,
+          method: 'scale_restore',
+          replicas,
+          output: output.trim(),
+        };
+      }
+
+      return {
+        ok: true,
+        method: 'none',
+        message: 'No rollback action needed',
+      };
+    } catch (error) {
+      logger.error(`[ROLLBACK] Deployment rollback failed: ${error.message}`);
+      return {
+        ok: false,
+        error: error.message,
+      };
+    }
+  }
+
+  /**
+   * Wait for rollout to complete
+   */
+  waitForRollout(deploymentName, namespace) {
+    try {
+      const args = ['rollout', 'status', 'deployment', deploymentName, '-n', namespace, '--timeout=60s'];
+      execFileSync('kubectl', args, {
+        encoding: 'utf8',
+        timeout: 65000,
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+      return { ok: true };
+    } catch (error) {
+      logger.warn(`[ROLLBACK] Rollout status check: ${error.message}`);
+      return { ok: false, error: error.message };
+    }
+  }
+
+  /**
+   * Clear checkpoint
+   */
+  clearCheckpoint(issueId) {
+    const existed = this.checkpoints.has(issueId);
+    this.checkpoints.delete(issueId);
+    if (existed) {
+      logger.info(`[CHECKPOINT] Cleared checkpoint for ${issueId}`);
+    }
+    return existed;
+  }
+
+  /**
+   * Cleanup old checkpoints
+   */
+  cleanupOldCheckpoints() {
+    const now = Date.now();
+    for (const [issueId, checkpoint] of this.checkpoints.entries()) {
+      const checkpointTime = new Date(checkpoint.timestamp).getTime();
+      if (now - checkpointTime > this.maxAgeMs) {
+        this.checkpoints.delete(issueId);
+        logger.info(`[CHECKPOINT] Cleaned up old checkpoint for ${issueId}`);
+      }
+    }
+  }
+
+  /**
+   * Get all checkpoints
+   */
+  getAllCheckpoints() {
+    return Array.from(this.checkpoints.entries()).map(([issueId, data]) => ({
+      issueId,
+      ...data,
+    }));
+  }
+}
+
+// Create singleton checkpoint manager
+const checkpointManager = new CheckpointManager();
+
 class ExecutionerAgent {
   constructor() {
     this.strategies = config.execution.strategies;
@@ -96,19 +394,50 @@ class ExecutionerAgent {
       };
     }
 
-    // Execute the strategy
+    // 🔹 Step 1: Pre-checkpoint - Capture current state before execution
+    logger.info(`[CHECKPOINT] Capturing state before executing ${strategy.type}`);
+    const checkpoint = await checkpointManager.captureCheckpoint(
+      rcaOutput.issueId || 'unknown',
+      strategy.target,
+      strategy.namespace,
+      strategy
+    );
+
+    if (!checkpoint.ok) {
+      logger.warn(`[CHECKPOINT] Failed to capture checkpoint: ${checkpoint.error}`);
+      // Continue execution but note the checkpoint failure
+    }
+
+    // 🔹 Step 2: Execute the strategy
     let result = await this.executeStrategy(strategy, rcaOutput, clusterState);
 
-    // Verify the fix if it succeeded and we're not in dry run
+    // Attach checkpoint info to result for SRE review
+    result.checkpoint = {
+      captured: checkpoint.ok,
+      issueId: rcaOutput.issueId,
+      canRollback: checkpoint.ok,
+    };
+
+    // 🔹 Step 3: Monitor/Verify the fix if it succeeded and we're not in dry run
     if (result.status === 'success' && result.action && !this.dryRun && this.verifyFixes) {
+      logger.info(`[VERIFY] Starting verification after execution`);
       const verification = await this.verifyFix(result.action, clusterState);
       result.verification = verification;
 
       if (!verification.verified) {
         result.status = 'partial';
         result.message += ` (Verification failed: ${verification.reason})`;
+        logger.error(`[VERIFY] ❌ Verification failed: ${verification.reason}`);
+
+        // If verification failed, auto-rollback if configured
+        if (config.execution.autoRollbackOnVerificationFailure && checkpoint.ok) {
+          logger.info(`[ROLLBACK] Auto-rolling back due to verification failure`);
+          const rollbackResult = await checkpointManager.rollbackToCheckpoint(rcaOutput.issueId);
+          result.rollback = rollbackResult;
+        }
       } else {
         result.message += ` (Verified: ${verification.reason})`;
+        logger.info(`[VERIFY] ✅ Fix verified: ${verification.reason}`);
       }
     }
 
@@ -126,10 +455,36 @@ class ExecutionerAgent {
     logger.timelineEvent(
       result.status === 'success' || result.status === 'simulated' ? 'success' : 'error',
       `Fix execution ${result.status}`,
-      { fixType: result.fixType, target: result.target }
+      { fixType: result.fixType, target: result.target, checkpoint: checkpoint.ok }
     );
 
     return result;
+  }
+
+  /**
+   * Get checkpoint manager for external access
+   */
+  getCheckpointManager() {
+    return checkpointManager;
+  }
+
+  /**
+   * Rollback a fix by issueId
+   */
+  async rollbackFix(issueId) {
+    logger.info(`[ROLLBACK] Initiating rollback for ${issueId}`);
+    const result = await checkpointManager.rollbackToCheckpoint(issueId);
+    if (result.ok) {
+      checkpointManager.clearCheckpoint(issueId);
+    }
+    return result;
+  }
+
+  /**
+   * Check if checkpoint exists for issue
+   */
+  hasCheckpoint(issueId) {
+    return checkpointManager.getCheckpoint(issueId) !== undefined;
   }
 
   /**
@@ -752,6 +1107,7 @@ class ExecutionerAgent {
    */
   async verifyFix(action, clusterState) {
     if (!this.verifyFixes) {
+      logger.info('[VERIFICATION] Verification disabled, skipping');
       return { verified: true, reason: 'Verification disabled' };
     }
 
@@ -760,7 +1116,7 @@ class ExecutionerAgent {
     const checkInterval = 2000; // Check every 2 seconds
     const maxWaitTime = this.verifyTimeoutMs;
 
-    logger.info(`Verifying fix for ${resource}/${name}...`);
+    logger.info(`[VERIFY] Verifying fix for ${resource}/${name}...`);
 
     while (Date.now() - startTime < maxWaitTime) {
       try {
@@ -777,17 +1133,29 @@ class ExecutionerAgent {
           );
 
           if (phase === 'running' && ready) {
+            logger.info(`[VERIFICATION] ✅ Fix verified: ${resource}/${name} is running and ready`);
             return { verified: true, reason: 'Pod is running and ready' };
           }
 
           if (phase === 'failed' || phase === 'crashloopbackoff') {
-            return { verified: false, reason: `Pod is in ${phase} state` };
+            logger.error(`[VERIFICATION] ❌ Verification failed: ${resource}/${name} is in ${phase} state`);
+            return {
+              verified: false,
+              reason: `Pod is in ${phase} state`,
+              retryRecommended: true,
+              alternativeOptions: [
+                { id: 'retry', name: 'Retry same fix', description: 'Attempt the remediation again' },
+                { id: 'escalate', name: 'Escalate to manual', description: 'Requires manual SRE intervention' },
+                { id: 'rollback', name: 'Rollback deployment', description: 'Roll back to previous version' },
+              ],
+            };
           }
         } else if (resource === 'deployment') {
           const available = resourceData.status?.availableReplicas || 0;
           const desired = resourceData.status?.replicas || 0;
 
           if (available >= desired && desired > 0) {
+            logger.info(`[VERIFICATION] ✅ Fix verified: Deployment ${name} has ${available}/${desired} replicas available`);
             return { verified: true, reason: `Deployment has ${available}/${desired} replicas available` };
           }
         }
@@ -800,17 +1168,37 @@ class ExecutionerAgent {
           if (resource === 'pod' && type === 'DELETE') {
             const replacement = this.findReplacementPod(name, namespace);
             if (replacement.verified) {
+              logger.info(`[VERIFICATION] ✅ Fix verified: Replacement pod ready for ${name}`);
               return replacement;
             }
           }
           await this.sleep(checkInterval);
           continue;
         }
-        return { verified: false, reason: `Verification error: ${error.message}` };
+        logger.error(`[VERIFICATION] ❌ Verification error: ${error.message}`);
+        return {
+          verified: false,
+          reason: `Verification error: ${error.message}`,
+          retryRecommended: true,
+          alternativeOptions: [
+            { id: 'retry', name: 'Retry same fix', description: 'Attempt the remediation again' },
+            { id: 'escalate', name: 'Escalate to manual', description: 'Requires manual SRE intervention' },
+          ],
+        };
       }
     }
 
-    return { verified: false, reason: 'Verification timeout - resource did not become ready in time' };
+    logger.error(`[VERIFICATION] ❌ Verification timeout: ${resource}/${name} did not become ready within ${maxWaitTime}ms`);
+    return {
+      verified: false,
+      reason: 'Verification timeout - resource did not become ready in time',
+      retryRecommended: true,
+      alternativeOptions: [
+        { id: 'retry', name: 'Retry same fix', description: 'Attempt the remediation again' },
+        { id: 'escalate', name: 'Escalate to manual', description: 'Requires manual SRE intervention' },
+        { id: 'scale_up', name: 'Scale up deployment', description: 'Increase replica count to force new pods' },
+      ],
+    };
   }
 
   /**

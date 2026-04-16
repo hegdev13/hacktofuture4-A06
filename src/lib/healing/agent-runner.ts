@@ -31,6 +31,30 @@ type StartOptions = {
   llmStrategyReplicas?: number;
   llmStrategyReason?: string;
   llmOptionSteps?: string[];
+  sreSelectedOption?: string;
+  sreSelectionReason?: string;
+};
+
+type VerificationResult = {
+  verified: boolean;
+  reason: string;
+  retryRecommended?: boolean;
+  alternativeOptions?: Array<{
+    id: string;
+    name: string;
+    description: string;
+  }>;
+};
+
+type ExecutionResult = {
+  success: boolean;
+  fixType?: string;
+  target?: string;
+  message?: string;
+  verification?: {
+    verified: boolean;
+    reason?: string;
+  };
 };
 
 class HealingAgentRunnerService {
@@ -42,6 +66,220 @@ class HealingAgentRunnerService {
     totalLogs: 0,
   };
   private runPromise: Promise<void> | null = null;
+  private verificationCallbacks = new Set<(result: VerificationResult) => void>();
+  private sreDecisionCallbacks = new Set<(issueId: string, options: Array<{ id: string; name: string; description: string }>) => void>();
+
+  /**
+   * Register callback for verification results
+   */
+  onVerificationResult(callback: (result: VerificationResult) => void) {
+    this.verificationCallbacks.add(callback);
+    return () => this.verificationCallbacks.delete(callback);
+  }
+
+  /**
+   * Register callback for SRE decision requests
+   */
+  onSREDecisionRequired(callback: (issueId: string, options: Array<{ id: string; name: string; description: string }>) => void) {
+    this.sreDecisionCallbacks.add(callback);
+    return () => this.sreDecisionCallbacks.delete(callback);
+  }
+
+  /**
+   * Handle verification failure - notify callbacks and update state
+   */
+  handleVerificationFailure(issueId: string, result: VerificationResult) {
+    this.appendLog({
+      agent_name: "VerificationAgent",
+      event_type: "VERIFICATION",
+      issue_id: issueId,
+      description: `Verification failed: ${result.reason}`,
+      action_taken: result.retryRecommended ? "Recommending retry with alternative options" : "Manual intervention required",
+      status: "VERIFICATION_FAILED",
+      raw: { result },
+    });
+
+    this.status = {
+      ...this.status,
+      state: "verification_failed",
+      verificationFailed: true,
+      verificationReason: result.reason,
+      retryOptions: result.alternativeOptions,
+      activeAgent: "SRE",
+      activeAction: result.retryRecommended
+        ? "Verification failed - awaiting SRE decision on retry"
+        : "Verification failed - manual intervention required",
+    };
+
+    this.emit({ type: "status", payload: this.status });
+
+    // Notify verification callbacks
+    for (const cb of this.verificationCallbacks) {
+      try {
+        cb(result);
+      } catch {
+        // Ignore callback errors
+      }
+    }
+  }
+
+  /**
+   * Set state to awaiting SRE decision
+   */
+  setAwaitingSREDecision(issueId: string, options: Array<{ id: string; name: string; description: string }>, rootCause?: string) {
+    this.status = {
+      ...this.status,
+      state: "awaiting_sre_decision",
+      sreDecisionRequired: true,
+      remediationOptions: options,
+      rootCause,
+      activeAgent: "SRE",
+      activeAction: "Awaiting SRE decision on remediation options",
+      activeIssueId: issueId,
+    };
+
+    this.appendLog({
+      agent_name: "Orchestrator",
+      event_type: "DECISION",
+      issue_id: issueId,
+      description: `Awaiting SRE decision on ${options.length} remediation options`,
+      action_taken: "Presenting options to SRE",
+      status: "AWAITING_SRE_DECISION",
+      raw: { options, rootCause },
+    });
+
+    this.emit({ type: "status", payload: this.status });
+    this.emit({ type: "lifecycle", payload: this.getIssueLifecycle() });
+
+    // Notify SRE decision callbacks
+    for (const cb of this.sreDecisionCallbacks) {
+      try {
+        cb(issueId, options);
+      } catch {
+        // Ignore callback errors
+      }
+    }
+  }
+
+  /**
+   * Resume after SRE decision
+   */
+  resumeAfterSREDecision(issueId: string, selectedOptionId: string, reason?: string) {
+    this.appendLog({
+      agent_name: "SRE",
+      event_type: "DECISION",
+      issue_id: issueId,
+      description: `SRE selected option: ${selectedOptionId}`,
+      action_taken: reason || "SRE decision received",
+      status: "IN_PROGRESS",
+    });
+
+    this.status = {
+      ...this.status,
+      state: "running",
+      sreDecisionRequired: false,
+      activeAgent: "ExecutionerAgent",
+      activeAction: `Executing SRE-selected option: ${selectedOptionId}`,
+    };
+
+    this.emit({ type: "status", payload: this.status });
+  }
+
+  /**
+   * 🔹 Step 4: Set state to awaiting SRE validation (after execution + verification)
+   */
+  setAwaitingSREValidation(
+    issueId: string,
+    executionResult: ExecutionResult,
+    checkpointAvailable: boolean = false
+  ) {
+    this.status = {
+      ...this.status,
+      state: "awaiting_sre_validation",
+      sreValidationRequired: true,
+      executionResult,
+      checkpointAvailable,
+      activeAgent: "SRE",
+      activeAction: "Awaiting SRE validation of execution results",
+      activeIssueId: issueId,
+    };
+
+    this.appendLog({
+      agent_name: "Orchestrator",
+      event_type: "DECISION",
+      issue_id: issueId,
+      description: `Execution completed. Awaiting SRE validation. Fix: ${executionResult.fixType}, Success: ${executionResult.success}`,
+      action_taken: checkpointAvailable
+        ? "SRE can ACCEPT (keep changes) or REJECT (rollback to checkpoint)"
+        : "SRE review required - no checkpoint available for rollback",
+      status: "AWAITING_SRE_VALIDATION",
+      raw: { executionResult, checkpointAvailable },
+    });
+
+    this.emit({ type: "status", payload: this.status });
+    this.emit({ type: "lifecycle", payload: this.getIssueLifecycle() });
+  }
+
+  /**
+   * 🔹 Step 5a: SRE accepts the execution
+   */
+  sreAcceptExecution(issueId: string, reason?: string) {
+    this.appendLog({
+      agent_name: "SRE",
+      event_type: "DECISION",
+      issue_id: issueId,
+      description: `SRE ACCEPTED the execution results`,
+      action_taken: reason || "Fix accepted by SRE",
+      status: "SUCCESS",
+    });
+
+    this.status = {
+      ...this.status,
+      state: "completed",
+      sreValidationRequired: false,
+      outcome: "fixed",
+      activeAgent: "Orchestrator",
+      activeAction: "SRE accepted execution - fix finalized",
+      finishedAt: new Date().toISOString(),
+    };
+
+    this.emit({ type: "status", payload: this.status });
+    this.emit({ type: "lifecycle", payload: this.getIssueLifecycle() });
+
+    return { ok: true, action: "accepted" };
+  }
+
+  /**
+   * 🔹 Step 5b: SRE rejects the execution - rollback required
+   */
+  async sreRejectExecution(issueId: string, rollbackResult: { ok: boolean; message?: string }, reason?: string) {
+    this.appendLog({
+      agent_name: "SRE",
+      event_type: "DECISION",
+      issue_id: issueId,
+      description: `SRE REJECTED the execution. Rollback ${rollbackResult.ok ? "successful" : "failed"}.`,
+      action_taken: reason || `Fix rejected by SRE. ${rollbackResult.message || ""}`,
+      status: "SRE_REJECTED",
+      raw: { rollbackResult },
+    });
+
+    this.status = {
+      ...this.status,
+      state: rollbackResult.ok ? "completed" : "failed",
+      sreValidationRequired: false,
+      outcome: rollbackResult.ok ? "no-op" : "failed",
+      activeAgent: "Orchestrator",
+      activeAction: rollbackResult.ok
+        ? "SRE rejected - rollback completed"
+        : "SRE rejected - rollback failed, manual intervention required",
+      finishedAt: new Date().toISOString(),
+    };
+
+    this.emit({ type: "status", payload: this.status });
+    this.emit({ type: "lifecycle", payload: this.getIssueLifecycle() });
+
+    return { ok: rollbackResult.ok, action: "rejected", rollback: rollbackResult };
+  }
 
   startHealing(options: StartOptions = {}) {
     if (this.status.state === "running") {
@@ -512,6 +750,74 @@ class HealingAgentRunnerService {
         description: line,
         action_taken: "Run completed successfully",
         status: "SUCCESS",
+      };
+    }
+
+    if (line.includes("[VERIFICATION]")) {
+      const failed = line.toLowerCase().includes("failed") || line.toLowerCase().includes("not ready");
+      return {
+        agent_name: "VerificationAgent",
+        event_type: "VERIFICATION",
+        issue_id: issueId,
+        description: line,
+        action_taken: failed ? "Verification failed - awaiting SRE decision" : "Fix verified successfully",
+        status: failed ? "VERIFICATION_FAILED" : "SUCCESS",
+      };
+    }
+
+    if (line.includes("[SRE_DECISION]") || line.includes("[DECISION]")) {
+      return {
+        agent_name: "SRE",
+        event_type: "DECISION",
+        issue_id: issueId,
+        description: line,
+        action_taken: "SRE decision point",
+        status: "AWAITING_SRE_DECISION",
+      };
+    }
+
+    if (line.includes("[VERIFY]") || line.toLowerCase().includes("verifying fix")) {
+      return {
+        agent_name: "VerificationAgent",
+        event_type: "VERIFICATION",
+        issue_id: issueId,
+        description: line,
+        action_taken: "Verifying remediation",
+        status: "IN_PROGRESS",
+      };
+    }
+
+    if (line.includes("[CHECKPOINT]")) {
+      return {
+        agent_name: "ExecutionerAgent",
+        event_type: "FIXING",
+        issue_id: issueId,
+        description: line,
+        action_taken: "Captured pre-execution checkpoint",
+        status: "IN_PROGRESS",
+      };
+    }
+
+    if (line.includes("[ROLLBACK]")) {
+      const success = !line.toLowerCase().includes("failed");
+      return {
+        agent_name: "ExecutionerAgent",
+        event_type: "FIXING",
+        issue_id: issueId,
+        description: line,
+        action_taken: success ? "Rollback executed" : "Rollback failed",
+        status: success ? "IN_PROGRESS" : "FAILED",
+      };
+    }
+
+    if (line.includes("[SRE_VALIDATION]") || line.includes("awaiting SRE validation")) {
+      return {
+        agent_name: "Orchestrator",
+        event_type: "DECISION",
+        issue_id: issueId,
+        description: line,
+        action_taken: "Awaiting SRE validation of execution",
+        status: "AWAITING_SRE_VALIDATION",
       };
     }
 
