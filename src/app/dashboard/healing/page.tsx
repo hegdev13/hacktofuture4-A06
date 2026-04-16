@@ -81,6 +81,14 @@ type RemediationOption = {
   estimatedCost: string;
 };
 
+type PrefilledTarget = {
+  namespace: string;
+  kind: HealingTargetKind;
+  name: string;
+};
+
+const LAST_FAILED_TARGET_KEY = "kubepulse:last_failed_target";
+
 function formatTs(ts?: string) {
   if (!ts) return "-";
   const d = new Date(ts);
@@ -141,12 +149,44 @@ export default function HealingDashboardPage() {
   const [targetLoading, setTargetLoading] = useState(false);
   const [targetError, setTargetError] = useState<string>("");
   const [selectedRemediationId, setSelectedRemediationId] = useState<string>("");
+  const [prefilledTarget, setPrefilledTarget] = useState<PrefilledTarget | null>(null);
   const eventSourceRef = useRef<EventSource | null>(null);
 
   useEffect(() => {
     const envUrl = process.env.NEXT_PUBLIC_METRICS_URL || "";
     if (envUrl) {
       setMetricsUrl(envUrl);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+
+    const params = new URLSearchParams(window.location.search);
+    const namespace = (params.get("targetNamespace") || "").trim();
+    const kind = params.get("targetKind");
+    const name = (params.get("targetName") || "").trim();
+
+    if (namespace && name && (kind === "pod" || kind === "deployment")) {
+      setPrefilledTarget({ namespace, kind, name });
+      return;
+    }
+
+    const stored = window.sessionStorage.getItem(LAST_FAILED_TARGET_KEY);
+    if (!stored) {
+      return;
+    }
+
+    try {
+      const parsed = JSON.parse(stored) as Partial<PrefilledTarget>;
+      if (parsed.namespace && parsed.name && (parsed.kind === "pod" || parsed.kind === "deployment")) {
+        setPrefilledTarget({ namespace: parsed.namespace, kind: parsed.kind, name: parsed.name });
+        window.sessionStorage.removeItem(LAST_FAILED_TARGET_KEY);
+      }
+    } catch {
+      window.sessionStorage.removeItem(LAST_FAILED_TARGET_KEY);
     }
   }, []);
 
@@ -215,6 +255,9 @@ export default function HealingDashboardPage() {
         if (prev && normalized.some((item) => `${item.namespace}/${item.kind}/${item.pod_name}` === prev)) {
           return prev;
         }
+        if (prefilledTarget) {
+          return "";
+        }
         return normalized.length > 0 ? `${normalized[0].namespace}/${normalized[0].kind}/${normalized[0].pod_name}` : "";
       });
     } catch (error) {
@@ -224,7 +267,7 @@ export default function HealingDashboardPage() {
     } finally {
       setTargetLoading(false);
     }
-  }, [metricsUrl]);
+  }, [metricsUrl, prefilledTarget]);
 
   const fetchInitial = useCallback(async () => {
     try {
@@ -336,26 +379,37 @@ export default function HealingDashboardPage() {
       return;
     }
 
-    if (!selectedTargetId) {
-      setStartError("Select a pod from the live /pods list before starting healing.");
-      return;
-    }
-
+    const explicitTarget = prefilledTarget;
     const selectedTarget = targets.find((t) => `${t.namespace}/${t.kind}/${t.pod_name}` === selectedTargetId);
-    if (!selectedTarget) {
-      setStartError("Selected target is no longer available. Refresh the live pod list.");
+    const selectedTargetMatchesExplicit = Boolean(
+      explicitTarget &&
+        selectedTarget &&
+        selectedTarget.namespace === explicitTarget.namespace &&
+        selectedTarget.kind === explicitTarget.kind &&
+        selectedTarget.pod_name === explicitTarget.name,
+    );
+
+    if (!selectedTarget && !explicitTarget) {
+      setStartError("Select a pod from the live /pods list or fail a target first.");
       return;
     }
 
-    // Always use the live item's kind to avoid pod/deployment mismatch failures.
-    const effectiveTargetKind: HealingTargetKind = selectedTarget.kind;
+    const preferredTarget = selectedTarget || explicitTarget;
+    const effectiveTargetKind: HealingTargetKind = selectedTargetMatchesExplicit
+      ? (selectedTarget as HealingTarget).kind
+      : (preferredTarget?.kind as HealingTargetKind | undefined) || targetKind;
+    const effectiveTargetNamespace = selectedTargetMatchesExplicit
+      ? (selectedTarget as HealingTarget).namespace
+      : preferredTarget?.namespace || "default";
+    const targetName = selectedTarget
+      ? effectiveTargetKind === "deployment"
+        ? deploymentNameFromPodName(selectedTarget.pod_name)
+        : selectedTarget.pod_name
+      : explicitTarget?.name || "";
+
     if (targetKind !== effectiveTargetKind) {
       setTargetKind(effectiveTargetKind);
     }
-    const targetName =
-      effectiveTargetKind === "deployment"
-        ? deploymentNameFromPodName(selectedTarget.pod_name)
-        : selectedTarget.pod_name;
 
     setLoadingStart(true);
     try {
@@ -371,7 +425,7 @@ export default function HealingDashboardPage() {
           metricsUrl: metricsSourceUrl,
           strictLive: true,
           targetName,
-          targetNamespace: selectedTarget.namespace,
+          targetNamespace: effectiveTargetNamespace,
           targetKind: effectiveTargetKind,
           remediationPreference: selectedRemediation?.id || null,
         }),
@@ -417,6 +471,28 @@ export default function HealingDashboardPage() {
   const selectedTarget = useMemo(() => {
     return targets.find((t) => `${t.namespace}/${t.kind}/${t.pod_name}` === selectedTargetId) || null;
   }, [targets, selectedTargetId]);
+
+  useEffect(() => {
+    if (!prefilledTarget) {
+      return;
+    }
+
+    const match = targets.find(
+      (target) =>
+        target.namespace === prefilledTarget.namespace &&
+        target.kind === prefilledTarget.kind &&
+        target.pod_name === prefilledTarget.name,
+    );
+
+    if (match) {
+      setSelectedTargetId(`${match.namespace}/${match.kind}/${match.pod_name}`);
+      setTargetKind(match.kind);
+      return;
+    }
+
+    setSelectedTargetId("");
+    setTargetKind(prefilledTarget.kind);
+  }, [prefilledTarget, targets]);
 
   const hasFailureTargets = useMemo(() => {
     return targets.some((t) => /crash|fail|pending|error|unhealthy|oom|backoff/i.test(t.status));

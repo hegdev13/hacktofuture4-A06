@@ -5,6 +5,7 @@ import { z } from "zod";
 export const runtime = "nodejs";
 
 const FailureTypeSchema = z.enum([
+  "scaled_to_zero",
   "crash_app",
   "image_pull_error",
   "oom_kill",
@@ -122,6 +123,15 @@ function resolveDeploymentName(namespace: string, targetName: string): string | 
     }
   }
 
+  // Fallback for common Deployment pod names: <deployment>-<rs-hash>-<pod-suffix>
+  const parts = targetName.split("-");
+  if (parts.length >= 3) {
+    const inferred = parts.slice(0, -2).join("-");
+    if (inferred && kubectlExists("deployment", inferred, namespace)) {
+      return inferred;
+    }
+  }
+
   return null;
 }
 
@@ -203,24 +213,64 @@ export async function POST(request: Request) {
   let targetResource = targetName;
   let affectedPod = "";
   let failureType = requestedFailureType as z.infer<typeof FailureTypeSchema> | undefined;
+  const isPodTarget = kubectlExists("pod", targetName, namespace);
+  const deploymentNameForTarget = resolveDeploymentName(namespace, targetName);
 
   if (!failureType) {
-    const options: Array<z.infer<typeof FailureTypeSchema>> = [
-      "crash_app",
-      "image_pull_error",
-      "oom_kill",
-      "probe_failure",
-    ];
+    if (deploymentNameForTarget) {
+      failureType = "scaled_to_zero";
+    } else {
+      const options: Array<z.infer<typeof FailureTypeSchema>> = [
+        "crash_app",
+        "image_pull_error",
+        "oom_kill",
+        "probe_failure",
+      ];
 
-    if (kubectlExists("svc", targetName, namespace)) {
-      options.push("dependency_break");
+      if (kubectlExists("svc", targetName, namespace)) {
+        options.push("dependency_break");
+      }
+
+      failureType = options[Math.floor(Math.random() * options.length)] || "crash_app";
     }
-
-    failureType = options[Math.floor(Math.random() * options.length)] || "crash_app";
   }
 
   // STEP 2: apply actual failure based on type
-  if (failureType === "dependency_break") {
+  if (failureType === "scaled_to_zero") {
+    const deploymentName = deploymentNameForTarget;
+    if (!deploymentName) {
+      return NextResponse.json(
+        {
+          ok: false,
+          "Failure Type Applied": failureType,
+          "Target Resource": `${namespace}/${targetName}`,
+          "Commands Executed": commandsExecuted,
+          "Observed Pod State (REAL)": prePods.stdout,
+          Errors: [
+            `target ${targetName} is not mapped to a deployment in namespace ${namespace}`,
+          ],
+          Confidence: "FAILED",
+        },
+        { status: 404 },
+      );
+    }
+
+    applyResult = runKubectl(["scale", "deployment", deploymentName, "-n", namespace, "--replicas=0"]);
+    commandsExecuted.push(applyResult);
+    targetResource = `deployment/${deploymentName}`;
+    affectedPod = firstPodForWorkload(namespace, deploymentName) || targetName;
+  } else if (isPodTarget) {
+    applyResult = runKubectl(["delete", "pod", targetName, "-n", namespace]);
+    commandsExecuted.push(applyResult);
+    targetResource = `pod/${targetName}`;
+
+    const workloadTarget = resolveWorkloadTarget(namespace, targetName);
+    if (workloadTarget) {
+      affectedPod = firstPodForWorkload(namespace, workloadTarget.resourceName) || targetName;
+    } else {
+      affectedPod = targetName;
+    }
+  } else if (failureType === "dependency_break") {
     if (!kubectlExists("svc", targetName, namespace)) {
       return NextResponse.json(
         {

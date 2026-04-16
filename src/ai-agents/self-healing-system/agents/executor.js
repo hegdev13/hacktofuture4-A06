@@ -315,16 +315,39 @@ class ExecutionerAgent {
    * Restart a pod
    */
   restartPod(podName, namespace) {
+    const ns = namespace || 'default';
     const action = {
       type: 'DELETE',
       resource: 'pod',
       name: podName,
-      namespace,
-      message: `Restarting pod ${namespace}/${podName}`,
+      namespace: ns,
+      message: `Restarting pod ${ns}/${podName}`,
     };
 
-    const result = this.executeK8sAction(action);
-    return { ...result, action };
+    let result = this.executeK8sAction(action);
+
+    // If target isn't a pod but is a deployment name, heal by restarting deployment
+    // (restartDeployment will auto-scale from 0 replicas to 1 before rollout restart).
+    if (
+      result.status === 'failed' &&
+      /notfound|not found/i.test(String(result.message || result.error || '')) &&
+      this.resourceExists('deployment', podName, ns)
+    ) {
+      logger.warn(`Pod ${ns}/${podName} not found; falling back to deployment restart`);
+      result = this.restartDeployment(podName, ns);
+    }
+
+    return { ...result, action: result.action || action };
+  }
+
+  resourceExists(resource, name, namespace) {
+    try {
+      const nsArgs = namespace ? ['-n', namespace] : [];
+      this.runKubectl(['get', resource, name, ...nsArgs], 15000);
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   /**

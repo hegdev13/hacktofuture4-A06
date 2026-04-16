@@ -298,8 +298,26 @@ export default function DashboardOverviewPage() {
       throw new Error(data.error || `Failed to fail pod (${res.status})`);
     }
 
-    const action = data.action === "scaled_to_zero" ? "scaled to 0" : "skipped";
+    const action =
+      data.action === "scaled_to_zero"
+        ? "scaled to 0"
+        : data.action
+          ? data.action.replaceAll("_", " ")
+          : "skipped";
     const resource = data.targetKind && data.targetName ? `${data.targetKind}/${data.targetName}` : podName;
+
+    if (typeof window !== "undefined") {
+      window.sessionStorage.setItem(
+        "kubepulse:last_failed_target",
+        JSON.stringify({
+          namespace,
+          targetKind: data.targetKind || "pod",
+          targetName: data.targetName || podName,
+          action: data.action || "",
+        }),
+      );
+    }
+
     return { action, resource };
   }, []);
 

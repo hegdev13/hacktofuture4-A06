@@ -376,6 +376,21 @@ class SelfHealingSystem {
         logger.info(`Message: ${fixResult.message}`);
       }
 
+      if (manualTarget) {
+        const manualSuccess = fixResult.status === 'success' || fixResult.status === 'simulated' || fixResult.status === 'partial';
+        finalResult = {
+          success: manualSuccess,
+          attempts,
+          finalHealth: manualSuccess ? 'healthy' : 'unhealthy',
+          issuesFound: analysis.issues.length,
+          fixesApplied: manualSuccess ? 1 : 0,
+          target: manualTarget,
+          timeline: logger.getTimeline(),
+          error: manualSuccess ? undefined : (fixResult.error || fixResult.message || 'Manual target remediation failed'),
+        };
+        break;
+      }
+
       if (fixResult.status !== 'success') {
         logger.warn(`Fix failed: ${fixResult.error || fixResult.message}`);
 
