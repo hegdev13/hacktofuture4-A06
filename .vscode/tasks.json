@@ -1,0 +1,60 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "mcp: topology",
+      "type": "shell",
+      "command": "zsh",
+      "args": [".vscode/start-mcp-server.sh", "topology"],
+      "isBackground": true,
+      "group": "build"
+    },
+    {
+      "label": "mcp: prometheus",
+      "type": "shell",
+      "command": "zsh",
+      "args": [".vscode/start-mcp-server.sh", "prometheus"],
+      "isBackground": true,
+      "group": "build"
+    },
+    {
+      "label": "mcp: git",
+      "type": "shell",
+      "command": "zsh",
+      "args": [".vscode/start-mcp-server.sh", "git"],
+      "isBackground": true,
+      "group": "build"
+    },
+    {
+      "label": "mcp: memory",
+      "type": "shell",
+      "command": "zsh",
+      "args": [".vscode/start-mcp-server.sh", "memory"],
+      "isBackground": true,
+      "group": "build"
+    },
+    {
+      "label": "mcp: policy",
+      "type": "shell",
+      "command": "zsh",
+      "args": [".vscode/start-mcp-server.sh", "policy"],
+      "isBackground": true,
+      "group": "build"
+    },
+    {
+      "label": "mcp: filesystem",
+      "type": "shell",
+      "command": "zsh",
+      "args": [".vscode/start-mcp-server.sh", "filesystem"],
+      "isBackground": true,
+      "group": "build"
+    },
+    {
+      "label": "mcp: start all",
+      "command": "zsh",
+      "args": [".vscode/start-mcp-server.sh", "all"],
+      "isBackground": true,
+      "group": "build"
+    }
+  ]
+}

@@ -1,0 +1,63 @@
+{
+	"folders": [
+		{
+			"path": "."
+		},
+		{
+			"path": "src/mcp-servers"
+		}
+	],
+	"settings": {
+		"files.exclude": {
+			"**/node_modules": true,
+			"**/.next": true,
+			"**/dist": true
+		},
+		"search.exclude": {
+			"**/node_modules": true,
+			"**/.next": true,
+			"**/dist": true
+		},
+		"mcp": {
+    "servers": {
+      "topology-mcp": {
+        "type": "stdio",
+        "command": "node",
+        "args": ["topology.js"],
+        "cwd": "/Users/vishruth/Projects/HTF4.0/src/mcp-servers"
+      },
+      "prometheus-mcp": {
+        "type": "stdio",
+        "command": "node",
+        "args": ["prometheus.js"],
+        "cwd": "/Users/vishruth/Projects/HTF4.0/src/mcp-servers"
+      },
+      "git-mcp": {
+        "type": "stdio",
+        "command": "node",
+        "args": ["git.js"],
+        "cwd": "/Users/vishruth/Projects/HTF4.0/src/mcp-servers"
+      },
+      "memory-mcp": {
+        "type": "stdio",
+        "command": "node",
+        "args": ["memory.js"],
+        "cwd": "/Users/vishruth/Projects/HTF4.0/src/mcp-servers"
+      },
+      "policy-mcp": {
+        "type": "stdio",
+        "command": "node",
+        "args": ["policy.js"],
+        "cwd": "/Users/vishruth/Projects/HTF4.0/src/mcp-servers"
+      },
+      "filesystem-mcp": {
+        "type": "stdio",
+        "command": "node",
+        "args": ["filesystem.js"],
+        "cwd": "/Users/vishruth/Projects/HTF4.0/src/mcp-servers"
+      }
+    },
+    "inputs": []
+  }
+  }
+}

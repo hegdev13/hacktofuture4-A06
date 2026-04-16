@@ -1,0 +1,58 @@
+[
+  {
+    "symptom": "checkout latency spike",
+    "service": "payments",
+    "action": "rollback",
+    "outcome": "success",
+    "notes": "payments deployed 8min before spike",
+    "timestamp": "2024-01-10T10:00:00Z"
+  },
+  {
+    "symptom": "checkout latency spike",
+    "service": "payments",
+    "action": "scale_replicas",
+    "outcome": "failure",
+    "notes": "scaling did not fix regression-caused latency",
+    "timestamp": "2024-01-08T14:00:00Z"
+  },
+  {
+    "symptom": "api-gateway high error rate",
+    "service": "auth",
+    "action": "rollback",
+    "outcome": "success",
+    "notes": "bad config deploy",
+    "timestamp": "2024-01-05T09:00:00Z"
+  },
+  {
+    "symptom": "pod crash loop restart",
+    "service": "catalog",
+    "action": "restart_pod",
+    "outcome": "partial",
+    "notes": "pod recovered but root cause not found",
+    "timestamp": "2024-01-03T16:00:00Z"
+  },
+  {
+    "symptom": "pod crash loop restart",
+    "service": "catalog",
+    "action": "rollback",
+    "outcome": "success",
+    "notes": "followed up restart with rollback",
+    "timestamp": "2024-01-03T16:15:00Z"
+  },
+  {
+    "symptom": "database connection exhaustion",
+    "service": "postgres",
+    "action": "restart_connection_pool",
+    "outcome": "success",
+    "notes": "connection leak in payments v2.1.4",
+    "timestamp": "2024-01-01T08:00:00Z"
+  },
+  {
+    "symptom": "queue backlog consumer lag",
+    "service": "inventory",
+    "action": "scale_consumers",
+    "outcome": "success",
+    "notes": "traffic spike during sale event",
+    "timestamp": "2023-12-28T12:00:00Z"
+  }
+]

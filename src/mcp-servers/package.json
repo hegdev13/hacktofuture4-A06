@@ -1,0 +1,20 @@
+{
+  "name": "mcp-servers",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Model Context Protocol servers for topology, metrics, git, memory, policy, and filesystem access.",
+  "scripts": {
+    "start:topology": "node topology.js",
+    "start:prometheus": "node prometheus.js",
+    "start:git": "node git.js",
+    "start:memory": "node memory.js",
+    "start:policy": "node policy.js",
+    "start:filesystem": "node filesystem.js",
+    "seed:memory": "node seed-memory.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.17.4",
+    "zod": "^4.3.6"
+  }
+}
