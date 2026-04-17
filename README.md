@@ -1,148 +1,239 @@
-#Codeclan
+# Minikube -> ngrok -> h24 App Runbook
 
-## KubePulse (Supabase-powered Kubernetes monitoring dashboard)
+This guide covers the full local flow:
 
-Production-grade, realtime observability UI for a Kubernetes cluster exposed via an **ngrok URL**.  
-Frontend + API are Next.js, backend services are Supabase (**Auth + Postgres + Realtime**).
-
-### Features
-
-- **Supabase Auth**: signup/login/logout + protected `/dashboard` routes
-- **Endpoints**: save multiple ngrok URLs per user (RLS protected)
-- **Metrics**: realtime dashboards powered by `metrics_snapshots` + Supabase Realtime
-- **Logs viewer**: fetch pod logs via backend bridge (`/api/logs`)
-- **Alerts**: stored + streamed via Realtime, toast notifications in UI
-- **Self-healing**: external agent can POST healing actions to `/api/healing-actions`
-- **Security**: ngrok URL validation + basic API rate limiting + secret-protected poll/heal APIs
+1. Start Minikube
+2. Verify Kubernetes pods are running
+3. Start the local Kubernetes observability API (`app.py`)
+4. Get the ngrok public link
+5. Run the h24 Next.js app
+6. Connect the ngrok URL inside the h24 UI
 
 ---
 
-## Setup
+## Prerequisites
 
-### 1) Create Supabase project + run SQL
+- Windows PowerShell
+- Minikube installed
+- kubectl installed and connected to Minikube
+- Python 3 installed
+- Node.js and npm installed
+- ngrok installed and authenticated (`ngrok config add-authtoken ...`)
 
-In Supabase SQL Editor, run:
+---
 
-- `supabase/sql/001_init.sql`
+## 1) Start Minikube
 
-This creates:
+From the repo root:
 
-- `endpoints`
-- `metrics_snapshots`
-- `alerts`
-- `healing_actions`
+```powershell
+cd d:\k8s-self-healing
+minikube start
+```
 
-with **Row-Level Security** (users can only see their own endpoints + related rows).
+Optional (same action via VS Code task):
 
-### 2) Configure env
+- Run task: `start-minikube`
 
-Create `.env.local` (copy from `.env.example`) and fill:
+Verify cluster status:
 
-- `NEXT_PUBLIC_SUPABASE_URL`
-- `NEXT_PUBLIC_SUPABASE_ANON_KEY`
-- `SUPABASE_SERVICE_ROLE_KEY` (server only)
-- `METRICS_POLL_SECRET` (protects poll/heal ingestion routes)
+```powershell
+kubectl cluster-info
+kubectl get nodes
+```
 
-### 3) Install + run
+---
 
-From `d:\\h24App\\h24app`:
+## 2) Verify Running Pods
 
-```bash
+```powershell
+kubectl get pods -A
+```
+
+Optional task:
+
+- Run task: `list-running-pods`
+
+You should see pods in `Running` or `Completed` states.
+
+---
+
+## 3) Start Local Observability API + ngrok Tunnel
+
+From repo root:
+
+```powershell
+cd d:\k8s-self-healing
+.\start-all.ps1
+```
+
+What this script does:
+
+- Starts Flask app (`app.py`) on port `5000` if not already running
+- Starts ngrok tunnel to port `5000`
+- Prints local and ngrok endpoints
+
+Expected local endpoints:
+
+- `http://127.0.0.1:5000/health`
+- `http://127.0.0.1:5000/pods`
+
+---
+
+## 4) Get the ngrok Public URL
+
+### Option A: From script output
+
+After running `start-all.ps1`, check for lines like:
+
+- `Ngrok health: https://<your-subdomain>.ngrok-free.app/health`
+- `Ngrok data:   https://<your-subdomain>.ngrok-free.app/pods`
+
+Use the base URL (`https://<your-subdomain>.ngrok-free.app`) or direct pods URL.
+
+### Option B: From ngrok local API
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:4040/api/tunnels | Select-Object -ExpandProperty tunnels | Select-Object -ExpandProperty public_url
+```
+
+### Option C: From ngrok dashboard
+
+Open:
+
+- `http://127.0.0.1:4040`
+
+---
+
+## 5) Run h24 App
+
+Open a new PowerShell terminal:
+
+```powershell
+cd d:\k8s-self-healing\h24-app
 npm install
 npm run dev
 ```
 
-Open `http://localhost:3000`.
+App URL:
+
+- `http://localhost:3000`
+
+Alternative launcher from repo root:
+
+```powershell
+cd d:\k8s-self-healing
+.\start-healing-site.ps1
+```
 
 ---
 
-## Upstream ngrok API (what KubePulse expects)
+## 6) Configure ngrok URL in h24
 
-KubePulse will try these paths on your ngrok base URL until one matches:
+The h24 app expects a valid HTTPS ngrok URL.
 
-- `/kubepulse/metrics`
-- `/api/kubepulse/metrics`
-- `/api/metrics`
-- `/metrics`
-- `/kube/metrics`
-- `/api/kube/metrics`
+Use one of these approaches:
 
-Expected JSON shape:
+### Approach A: Dashboard Setup page (recommended)
 
-```json
-{
-  "pods": [
-    {
-      "pod_name": "frontend-6c4b...",
-      "namespace": "default",
-      "status": "Running",
-      "cpu_usage": 0.12,
-      "memory_usage": 73400320,
-      "restart_count": 0
-    }
-  ],
-  "fetched_at": "2026-04-10T12:00:00Z"
-}
-```
+1. Open `http://localhost:3000/dashboard/setup`
+2. Add endpoint name (example: `local-minikube`)
+3. Paste ngrok URL (example: `https://<subdomain>.ngrok-free.app/pods`)
+4. Save and open dashboard
 
-For logs, KubePulse calls (with query params `pod` + `namespace`):
+### Approach B: Healing page field
 
-- `/kubepulse/logs`
-- `/api/kubepulse/logs`
-- `/api/logs`
-- `/logs`
-- `/kube/logs`
-- `/api/kube/logs`
-
-Return text/plain or JSON.
+1. Open `http://localhost:3000/dashboard/healing`
+2. In "Ngrok metrics URL", paste:
+   - `https://<subdomain>.ngrok-free.app/pods`
+3. Start analysis/healing flow
 
 ---
 
-## Trigger polling (ingest metrics → Supabase)
+## 7) Quick End-to-End Validation
 
-KubePulse includes a secure polling endpoint that writes into Supabase using the **service role** key:
+1. Check local API:
 
-```bash
-curl -X POST "http://localhost:3000/api/poll" ^
-  -H "content-type: application/json" ^
-  -H "x-kubepulse-secret: YOUR_SECRET" ^
-  -d "{\"endpoint_id\":\"YOUR_ENDPOINT_UUID\"}"
+```powershell
+curl http://127.0.0.1:5000/health
 ```
 
-- Omit `endpoint_id` to poll all endpoints.
-- For true “always-on polling”, run this curl in a loop or schedule it (Task Scheduler / cron), every 5–10 seconds.
+2. Check ngrok `/pods`:
+
+```powershell
+curl https://<subdomain>.ngrok-free.app/pods
+```
+
+3. Open h24 dashboard and confirm pods load from the configured endpoint.
 
 ---
 
-## External self-healing agent integration
+## Common Commands (Copy/Paste)
 
-Your healing agent can write actions into Supabase by calling:
+```powershell
+# Terminal 1: cluster
+cd d:\k8s-self-healing
+minikube start
+kubectl get pods -A
 
-```bash
-curl -X POST "http://localhost:3000/api/healing-actions" ^
-  -H "content-type: application/json" ^
-  -H "x-kubepulse-secret: YOUR_SECRET" ^
-  -d "{\"endpoint_id\":\"YOUR_ENDPOINT_UUID\",\"action_taken\":\"Restarted cartservice pod\",\"status\":\"success\"}"
+# Terminal 2: flask + ngrok
+cd d:\k8s-self-healing
+.\start-all.ps1
+
+# Terminal 3: h24 app
+cd d:\k8s-self-healing\h24-app
+npm install
+npm run dev
 ```
 
-These events show up in `/dashboard/alerts` in real time.
+---
 
+## Troubleshooting
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+### Minikube not starting
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+```powershell
+minikube status
+minikube delete
+minikube start
+```
 
-## Learn More
+### kubectl cannot connect
 
-To learn more about Next.js, take a look at the following resources:
+```powershell
+kubectl config current-context
+minikube update-context
+kubectl get nodes
+```
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+### ngrok URL not showing
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+- Confirm ngrok is installed and authenticated
+- Open `http://127.0.0.1:4040`
+- Restart script: `.\start-all.ps1`
 
-## Deploy on Vercel
+### h24 app fails to start
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+```powershell
+cd d:\k8s-self-healing\h24-app
+npm install
+npm run dev
+```
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+### h24 says endpoint invalid
+
+- Use an HTTPS ngrok URL
+- Use ngrok domains like `.ngrok-free.app`, `.ngrok-free.dev`, `.ngrok.app`, or `.ngrok.io`
+- Try URL with `/pods` suffix for pod list endpoints
+
+---
+
+## Stop Everything
+
+In each running terminal press `Ctrl+C`.
+
+Then optionally:
+
+```powershell
+minikube stop
+```
