@@ -39,6 +39,9 @@ export async function POST(request: Request) {
       rootCause: body.rootCause || body.targetName || "unknown-workload",
       failureChain: Array.isArray(body.failureChain) ? body.failureChain : [],
       affectedCount: Number(body.affectedCount || 0),
+      targetName: body.targetName,
+      targetNamespace: body.targetNamespace || "default",
+      targetKind: body.targetKind || "pod",
     });
 
     return NextResponse.json({ ok: true, decision: options });

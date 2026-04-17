@@ -5,6 +5,34 @@ const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-1.5-flash";
 const INPUT_COST_PER_1K = Number(process.env.GEMINI_INPUT_COST_PER_1K || 0.000075);
 const OUTPUT_COST_PER_1K = Number(process.env.GEMINI_OUTPUT_COST_PER_1K || 0.0003);
 const DEFAULT_GEMINI_BASE_URL = "https://generativelanguage.googleapis.com";
+const DEFAULT_MODEL_FALLBACKS = ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-pro"];
+
+function getCandidateModels() {
+  const envList = String(process.env.GEMINI_FALLBACK_MODELS || "")
+    .split(",")
+    .map((m) => m.trim())
+    .filter(Boolean);
+  const combined = [GEMINI_MODEL, ...envList, ...DEFAULT_MODEL_FALLBACKS];
+  return Array.from(new Set(combined));
+}
+
+function getCandidateApiKeys() {
+  const csv = String(process.env.GEMINI_API_KEYS || "")
+    .split(",")
+    .map((k) => k.trim())
+    .filter(Boolean);
+
+  const direct = [
+    process.env.GEMINI_API_KEY,
+    process.env.GEMINI_API_KEY_ALT,
+    process.env.GOOGLE_GENERATIVE_AI_API_KEY,
+    process.env.GOOGLE_API_KEY,
+  ]
+    .map((k) => String(k || "").trim())
+    .filter(Boolean);
+
+  return Array.from(new Set([...direct, ...csv]));
+}
 
 function getGeminiBaseUrl() {
   return (
@@ -16,9 +44,9 @@ function getGeminiBaseUrl() {
   ).replace(/\/+$/, "");
 }
 
-function buildGeminiRequestConfig(apiKey) {
+function buildGeminiRequestConfig(apiKey, modelName = GEMINI_MODEL) {
   const baseUrl = getGeminiBaseUrl();
-  const endpoint = `/v1beta/models/${encodeURIComponent(GEMINI_MODEL)}:generateContent`;
+  const endpoint = `/v1beta/models/${encodeURIComponent(modelName)}:generateContent`;
   const isDirectGoogleApi = /(^https?:\/\/)?([^/]+\.)?generativelanguage\.googleapis\.com/i.test(baseUrl);
 
   if (isDirectGoogleApi) {
@@ -177,28 +205,54 @@ function promptForTask(task, context) {
   ].join("\n");
 }
 
-async function runSingleTask(task, context, apiKey) {
+async function runSingleTask(task, context, apiKeys) {
   const prompt = promptForTask(task, context);
-  const requestConfig = buildGeminiRequestConfig(apiKey);
-  const response = await fetch(requestConfig.url, {
-    method: "POST",
-    headers: requestConfig.headers,
-    body: JSON.stringify({
-      contents: [{ role: "user", parts: [{ text: prompt }] }],
-      generationConfig: {
-        temperature: 0.2,
-        topP: 0.9,
-        maxOutputTokens: 600,
-      },
-    }),
-    cache: "no-store",
-  });
+  const candidateModels = getCandidateModels();
+  let raw = null;
+  let requestConfig = null;
+  let selectedModel = GEMINI_MODEL;
+  let lastStatus = 0;
+  const keys = Array.isArray(apiKeys) ? apiKeys : [apiKeys];
 
-  if (!response.ok) {
-    throw new Error(`Gemini API ${response.status}`);
+  for (const apiKey of keys) {
+    for (const modelName of candidateModels) {
+      const config = buildGeminiRequestConfig(apiKey, modelName);
+      const response = await fetch(config.url, {
+        method: "POST",
+        headers: config.headers,
+        body: JSON.stringify({
+          contents: [{ role: "user", parts: [{ text: prompt }] }],
+          generationConfig: {
+            temperature: 0.2,
+            topP: 0.9,
+            maxOutputTokens: 600,
+          },
+        }),
+        cache: "no-store",
+      });
+
+      if (response.ok) {
+        raw = await response.json();
+        requestConfig = config;
+        selectedModel = modelName;
+        break;
+      }
+
+      lastStatus = response.status;
+      if (response.status === 404 || response.status === 429) {
+        continue;
+      }
+
+      throw new Error(`Gemini API ${response.status}`);
+    }
+
+    if (raw) break;
   }
 
-  const raw = await response.json();
+  if (!raw || !requestConfig) {
+    throw new Error(`Gemini API ${lastStatus || 404}`);
+  }
+
   const text =
     raw?.candidates?.[0]?.content?.parts
       ?.map((p) => p?.text || "")
@@ -216,7 +270,7 @@ async function runSingleTask(task, context, apiKey) {
 
   const cost = computeCost(inputTokens, outputTokens);
   normalized.metadata.cost_usd = Number(cost.toFixed(6));
-  normalized.metadata.model = GEMINI_MODEL;
+  normalized.metadata.model = selectedModel;
   normalized.metadata.via_tokentap_proxy = requestConfig.viaTokentapProxy;
   printLLMLogTable(normalized, cost);
 
@@ -224,14 +278,14 @@ async function runSingleTask(task, context, apiKey) {
     ...normalized,
     metadata: {
       ...normalized.metadata,
-      model: GEMINI_MODEL,
+      model: selectedModel,
       cost_usd: Number(cost.toFixed(6)),
       via_tokentap_proxy: requestConfig.viaTokentapProxy,
       timestamp: new Date().toISOString(),
     },
   });
 
-  return { data: normalized, cost };
+  return { data: normalized, cost, model: selectedModel };
 }
 
 function fallbackRecommendation(context) {
@@ -290,6 +344,7 @@ function fallbackMultiOptions({ scenario, rootCause, affectedPods }) {
           resource_impact: "Minimal",
           risk_level: "low",
           execution_time: "45 seconds",
+          llm_analysis_usd: 0,
         },
         pros: ["Fastest approach", "Minimal resource overhead"],
         cons: ["Brief service disruption", "May not fix root cause"],
@@ -310,6 +365,7 @@ function fallbackMultiOptions({ scenario, rootCause, affectedPods }) {
           resource_impact: "Moderate (temp 2x pod count)",
           risk_level: "medium",
           execution_time: "2-3 minutes",
+          llm_analysis_usd: 0,
         },
         pros: ["Zero-downtime rolling update", "Controlled pod replacement"],
         cons: ["Longer execution time", "Temporary resource increase"],
@@ -331,6 +387,7 @@ function fallbackMultiOptions({ scenario, rootCause, affectedPods }) {
           resource_impact: "Moderate",
           risk_level: "medium",
           execution_time: "3-4 minutes",
+          llm_analysis_usd: 0,
         },
         pros: ["Addresses upstream issues", "Higher success rate"],
         cons: ["Longer total downtime", "More complex recovery"],
@@ -340,12 +397,55 @@ function fallbackMultiOptions({ scenario, rootCause, affectedPods }) {
     selected_option: "option_b",
     selection_reason: "Rolling restart provides best balance of speed, reliability, and zero-downtime deployment.",
     source: "fallback",
+    reason: "gemini_unavailable",
+    usageMetadata: {
+      inputTokens: 0,
+      outputTokens: 0,
+      cost: 0,
+    },
   };
 }
 
+function distributeOptionCost(options, totalCostUsd, totalOutputTokens) {
+  const safeTotalCost = Number(totalCostUsd || 0);
+  if (!Array.isArray(options) || options.length === 0 || safeTotalCost <= 0) {
+    return options || [];
+  }
+
+  const rawWeights = options.map((opt) => {
+    const text = `${opt?.name || ""} ${opt?.description || ""} ${(opt?.steps || []).join(" ")}`;
+    return Math.max(1, estimateTokens(text));
+  });
+
+  const weightSum = rawWeights.reduce((sum, w) => sum + w, 0);
+  if (!weightSum) {
+    const even = safeTotalCost / options.length;
+    return options.map((opt) => ({
+      ...opt,
+      cost: { ...(opt.cost || {}), llm_analysis_usd: Number(even.toFixed(6)) },
+    }));
+  }
+
+  const outputCostUsd = (Number(totalOutputTokens || 0) / 1000) * OUTPUT_COST_PER_1K;
+  const inputCostUsd = Math.max(0, safeTotalCost - outputCostUsd);
+  const evenInputShare = inputCostUsd / options.length;
+
+  return options.map((opt, idx) => {
+    const outputShare = outputCostUsd * (rawWeights[idx] / weightSum);
+    const optionCost = Math.max(0, evenInputShare + outputShare);
+    return {
+      ...opt,
+      cost: {
+        ...(opt.cost || {}),
+        llm_analysis_usd: Number(optionCost.toFixed(6)),
+      },
+    };
+  });
+}
+
 export async function getGeminiHealingPlan(context) {
-  const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey) {
+  const apiKeys = getCandidateApiKeys();
+  if (!apiKeys.length) {
     return fallbackRecommendation(context);
   }
 
@@ -354,7 +454,7 @@ export async function getGeminiHealingPlan(context) {
     const assessments = [];
 
     for (const task of tasks) {
-      const res = await runSingleTask(task, context, apiKey);
+      const res = await runSingleTask(task, context, apiKeys);
       assessments.push(res.data);
     }
 
@@ -417,25 +517,32 @@ export async function getGeminiHealingPlan(context) {
  * Returns 3 options with pros/cons and selected best option
  */
 export async function getRemediationOptions(context) {
-  const apiKey = process.env.GEMINI_API_KEY;
-  const { rootCause, failureChain, affectedCount = 0 } = context;
+  const apiKeys = getCandidateApiKeys();
+  const {
+    rootCause,
+    failureChain,
+    affectedCount = 0,
+    scenario,
+    targetNamespace = "default",
+    targetKind = "pod",
+  } = context;
 
-  if (!apiKey) {
-    return fallbackMultiOptions({
-      scenario: context.scenario,
-      rootCause: rootCause || "unknown-pod",
-      affectedPods: affectedCount,
-    });
+  if (!apiKeys.length) {
+    return {
+      ...fallbackMultiOptions({ scenario: context.scenario, rootCause: rootCause || "unknown-pod", affectedPods: affectedCount }),
+      reason: "no_api_key",
+    };
   }
 
   const prompt = [
     "You are a Kubernetes SRE expert. Generate exactly 3 remediation strategies as JSON.",
+    "Tailor options to the target service and current incident.",
     "Return ONLY valid JSON with this structure:",
     "{",
     '  "options": [',
     '    {',
     '      "id": "option_a", "name": "...", "description": "...",',
-    '      "steps": ["...", "..."],',
+    '      "steps": ["kubectl ...", "..."],',
     '      "cost": {',
     '        "downtime": "description", "downtime_seconds": number,',
     '        "resource_impact": "Minimal|Moderate|High",',
@@ -447,37 +554,75 @@ export async function getRemediationOptions(context) {
     "    ... (option_b, option_c)",
     "  ],",
     '  "selected_option": "option_a",',
-    '  "selection_reason": "Why this option is best..."',
+    '  "selection_reason": "Why this option is best for this service..."',
     "}",
     "",
-    `Root cause: ${rootCause || "unknown pod failure"}`,
+    `Scenario: ${scenario || "pod-crash"}`,
+    `Target service/workload: ${rootCause || "unknown pod failure"}`,
+    `Target kind: ${targetKind}`,
+    `Target namespace: ${targetNamespace}`,
     `Failure chain: ${(failureChain || []).join(" -> ") || "untraced"}`,
     `Affected resources count: ${affectedCount}`,
     "Generate practical Kubernetes recovery strategies ONLY.",
   ].join("\n");
 
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(GEMINI_MODEL)}:generateContent?key=${encodeURIComponent(apiKey)}`;
+  const candidateModels = getCandidateModels();
 
   try {
-    const response = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        contents: [{ role: "user", parts: [{ text: prompt }] }],
-        generationConfig: {
-          temperature: 0.3,
-          topP: 0.9,
-          maxOutputTokens: 1500,
-        },
-      }),
-      cache: "no-store",
-    });
+    let data = null;
+    let selectedModel = GEMINI_MODEL;
+    let lastStatus = 0;
+    let sawQuota = false;
 
-    if (!response.ok) {
-      return fallbackMultiOptions({ scenario: context.scenario, rootCause, affectedPods: affectedCount });
+    for (const apiKey of apiKeys) {
+      for (const modelName of candidateModels) {
+        const requestConfig = buildGeminiRequestConfig(apiKey, modelName);
+        const response = await fetch(requestConfig.url, {
+          method: "POST",
+          headers: requestConfig.headers,
+          body: JSON.stringify({
+            contents: [{ role: "user", parts: [{ text: prompt }] }],
+            generationConfig: {
+              temperature: 0.3,
+              topP: 0.9,
+              maxOutputTokens: 1500,
+            },
+          }),
+          cache: "no-store",
+        });
+
+        if (response.ok) {
+          data = await response.json();
+          selectedModel = modelName;
+          break;
+        }
+
+        lastStatus = response.status;
+        if (response.status === 429) {
+          sawQuota = true;
+          continue;
+        }
+        if (response.status === 404) {
+          continue;
+        }
+
+        return {
+          ...fallbackMultiOptions({ scenario: context.scenario, rootCause, affectedPods: affectedCount }),
+          reason: "request_failed",
+        };
+      }
+
+      if (data) break;
     }
 
-    const data = await response.json();
+    if (!data) {
+      const reason = sawQuota ? "quota_exceeded" : lastStatus === 404 ? "model_unavailable" : "request_failed";
+      return {
+        ...fallbackMultiOptions({ scenario: context.scenario, rootCause, affectedPods: affectedCount }),
+        reason,
+      };
+    }
+
     const text =
       data?.candidates?.[0]?.content?.parts
         ?.map((p) => p?.text || "")
@@ -485,66 +630,84 @@ export async function getRemediationOptions(context) {
         .trim() || "";
 
     if (!text) {
-      return fallbackMultiOptions({ scenario: context.scenario, rootCause, affectedPods: affectedCount });
-    }
-
-    const cleaned = text.replace(/^```json\s*/i, "").replace(/```$/i, "").trim();
-    const parsed = JSON.parse(cleaned);
-
-    // Validate structure
-    if (!Array.isArray(parsed.options) || parsed.options.length < 3) {
-      return fallbackMultiOptions({ scenario: context.scenario, rootCause, affectedPods: affectedCount });
-    }
-
-      // Capture token usage metadata
-      const usageMetadata = data?.usageMetadata || {};
-      const inputTokens = usageMetadata.promptTokenCount || 0;
-      const outputTokens = usageMetadata.candidatesTokenCount || 0;
-
-      // Record cost asynchronously (non-blocking)
-      if (inputTokens > 0 || outputTokens > 0) {
-        fetch("/api/cost-tracking/record", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            stage: "options",
-            input_tokens: inputTokens,
-            output_tokens: outputTokens,
-            total_tokens: inputTokens + outputTokens,
-            cost_usd: (inputTokens / 1000000) * 0.075 + (outputTokens / 1000000) * 0.30,
-            model: GEMINI_MODEL,
-            scenario: context.scenario,
-          }),
-        }).catch((e) => console.error("[CostTracking] Failed to record options costs:", e));
-      }
-
       return {
-      options: parsed.options.map((opt) => ({
-        id: String(opt.id || "option_unknown"),
-        name: String(opt.name || "Option"),
-        description: String(opt.description || ""),
-        steps: Array.isArray(opt.steps) ? opt.steps.map((s) => String(s)) : [],
-        cost: {
-          downtime: String(opt.cost?.downtime || "unknown"),
-          downtime_seconds: Number(opt.cost?.downtime_seconds || 0),
-          resource_impact: String(opt.cost?.resource_impact || "Unknown"),
-          risk_level: String(opt.cost?.risk_level || "medium"),
-          execution_time: String(opt.cost?.execution_time || "unknown"),
-        },
-        pros: Array.isArray(opt.pros) ? opt.pros.map((p) => String(p)) : [],
-        cons: Array.isArray(opt.cons) ? opt.cons.map((c) => String(c)) : [],
-        confidence: Number(opt.confidence || 0.5),
-      })),
+        ...fallbackMultiOptions({ scenario: context.scenario, rootCause, affectedPods: affectedCount }),
+        reason: "empty_response",
+      };
+    }
+
+    const parsed = extractJson(text);
+    if (!parsed || typeof parsed !== "object") {
+      return {
+        ...fallbackMultiOptions({ scenario: context.scenario, rootCause, affectedPods: affectedCount }),
+        reason: "invalid_json",
+      };
+    }
+
+    if (!Array.isArray(parsed.options) || parsed.options.length < 3) {
+      return {
+        ...fallbackMultiOptions({ scenario: context.scenario, rootCause, affectedPods: affectedCount }),
+        reason: "invalid_structure",
+      };
+    }
+
+    const usageMetadata = data?.usageMetadata || {};
+    const inputTokens = Number(usageMetadata.promptTokenCount || usageMetadata.inputTokenCount || estimateTokens(prompt));
+    const outputTokens = Number(usageMetadata.candidatesTokenCount || usageMetadata.outputTokenCount || estimateTokens(text));
+    const totalCost = computeCost(inputTokens, outputTokens);
+
+    if (inputTokens > 0 || outputTokens > 0) {
+      fetch("/api/cost-tracking/record", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          stage: "options",
+          input_tokens: inputTokens,
+          output_tokens: outputTokens,
+          total_tokens: inputTokens + outputTokens,
+          cost_usd: totalCost,
+          model: selectedModel,
+          scenario: context.scenario,
+        }),
+      }).catch((e) => console.error("[CostTracking] Failed to record options costs:", e));
+    }
+
+    const normalized = parsed.options.map((opt) => ({
+      id: String(opt.id || "option_unknown"),
+      name: String(opt.name || "Option"),
+      description: String(opt.description || ""),
+      steps: Array.isArray(opt.steps) ? opt.steps.map((s) => String(s)) : [],
+      cost: {
+        downtime: String(opt.cost?.downtime || "unknown"),
+        downtime_seconds: Number(opt.cost?.downtime_seconds || 0),
+        resource_impact: String(opt.cost?.resource_impact || "Unknown"),
+        risk_level: String(opt.cost?.risk_level || "medium"),
+        execution_time: String(opt.cost?.execution_time || "unknown"),
+      },
+      pros: Array.isArray(opt.pros) ? opt.pros.map((p) => String(p)) : [],
+      cons: Array.isArray(opt.cons) ? opt.cons.map((c) => String(c)) : [],
+      confidence: Number(opt.confidence || 0.5),
+    }));
+
+    const options = distributeOptionCost(normalized, totalCost, outputTokens);
+
+    return {
+      options,
       selected_option: String(parsed.selected_option || "option_a"),
       selection_reason: String(parsed.selection_reason || "Best balance of risk and effectiveness."),
       source: "gemini",
       usageMetadata: {
         inputTokens,
         outputTokens,
-        cost: (inputTokens / 1000000) * 0.075 + (outputTokens / 1000000) * 0.30,
+        cost: totalCost,
       },
+      model: selectedModel,
+      reason: "ok",
     };
   } catch {
-    return fallbackMultiOptions({ scenario: context.scenario, rootCause, affectedPods: affectedCount });
+    return {
+      ...fallbackMultiOptions({ scenario: context.scenario, rootCause, affectedPods: affectedCount }),
+      reason: "request_error",
+    };
   }
 }

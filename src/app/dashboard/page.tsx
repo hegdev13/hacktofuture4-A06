@@ -91,6 +91,8 @@ type TimelineResponse = {
   events?: TimelineEventRow[];
 };
 
+const STICKY_FAILED_ROWS_KEY = "kubepulse:sticky_failed_rows";
+
 const PROTECTED_NAMESPACES = new Set([
   "kube-system",
   "kube-public",
@@ -101,8 +103,40 @@ const PROTECTED_NAMESPACES = new Set([
   "monitoring",
 ]);
 
+const LOAD_SPIKE_NAMESPACES = new Set([
+  "ad",
+  "cart",
+  "checkout",
+  "currency",
+  "email",
+  "frontend",
+  "payment",
+  "product-catalog",
+  "recommendation",
+  "shipping",
+]);
+
 function canFailNamespace(namespace: string) {
   return !PROTECTED_NAMESPACES.has(namespace);
+}
+
+function hashString(value: string) {
+  let hash = 0;
+  for (let index = 0; index < value.length; index += 1) {
+    hash = (hash * 31 + value.charCodeAt(index)) | 0;
+  }
+  return Math.abs(hash);
+}
+
+function inferAutoFailStrategyLabel(namespace: string, podName: string) {
+  const serviceName = deploymentNameFromPodName(podName);
+  const pool: Array<"crash" | "outage" | "load+crash"> = ["crash", "outage"];
+  if (LOAD_SPIKE_NAMESPACES.has(namespace)) {
+    pool.push("load+crash");
+  }
+
+  const pick = pool[hashString(`${namespace}/${serviceName}`) % pool.length];
+  return pick;
 }
 
 type RemediationOption = {
@@ -116,6 +150,7 @@ type RemediationOption = {
     resource_impact: string;
     risk_level: string;
     execution_time: string;
+    llm_analysis_usd?: number;
   };
   pros: string[];
   cons: string[];
@@ -196,6 +231,31 @@ export default function DashboardOverviewPage() {
   const [showOptionsModal, setShowOptionsModal] = useState(false);
   const [isHealingInProgress, setIsHealingInProgress] = useState(false);
   const [healingTarget, setHealingTarget] = useState<{ podName: string; namespace: string } | null>(null);
+  const [loadUsers, setLoadUsers] = useState<number>(80);
+  const [loadApplying, setLoadApplying] = useState(false);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    try {
+      const raw = window.localStorage.getItem(STICKY_FAILED_ROWS_KEY);
+      if (!raw) return;
+      const parsed = JSON.parse(raw) as Record<string, SnapshotRow>;
+      if (parsed && typeof parsed === "object") {
+        setStickyFailedRows(parsed);
+      }
+    } catch {
+      // Ignore malformed persisted state and continue with empty defaults.
+    }
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    try {
+      window.localStorage.setItem(STICKY_FAILED_ROWS_KEY, JSON.stringify(stickyFailedRows));
+    } catch {
+      // Best effort persistence only.
+    }
+  }, [stickyFailedRows]);
 
   const poll = useCallback(async () => {
     try {
@@ -234,23 +294,7 @@ export default function DashboardOverviewPage() {
         memory_usage: p.memory_usage ?? null,
         restart_count: p.restart_count ?? 0,
       }));
-        setRows(podsToRows(sel.id, normalized, fetchedAt));
-        setStickyFailedRows((prev) => {
-          const recoveredWorkloads = new Set(
-            normalized
-              .filter((p) => String(p.status || "").toLowerCase().includes("running"))
-              .map((p) => `${p.namespace ?? "default"}/${deploymentNameFromPodName(p.pod_name)}`),
-          );
-          const next = { ...prev };
-          for (const key of Object.keys(next)) {
-            const [ns, podName] = key.split("/");
-            const workloadKey = `${ns}/${deploymentNameFromPodName(podName || "")}`;
-            if (recoveredWorkloads.has(workloadKey)) {
-              delete next[key];
-            }
-          }
-          return next;
-        });
+      setRows(podsToRows(sel.id, normalized, fetchedAt));
 
       const [summaryRes, alertsRes, eventsRes] = await Promise.all([
         fetch(`/api/metrics/summary?endpoint=${encodeURIComponent(sel.id)}`, { cache: "no-store" }),
@@ -334,6 +378,8 @@ export default function DashboardOverviewPage() {
       ok?: boolean;
       error?: string;
       action?: string;
+      strategy?: string;
+      users?: number;
       targetKind?: string;
       targetName?: string;
         podName?: string;
@@ -344,6 +390,9 @@ export default function DashboardOverviewPage() {
     }
 
       const action =
+        data.action === "load_spike_and_crash"
+          ? `load spike + crash${typeof data.users === "number" ? ` (USERS=${data.users})` : ""}`
+          :
         data.action === "scaled_to_zero"
           ? "scaled to 0"
           : data.action === "deleted_pod"
@@ -434,6 +483,37 @@ export default function DashboardOverviewPage() {
       void poll();
     }
   }, [failablePods, markPodAsFailed, poll, requestFailPod]);
+
+  const applyLoadGenerator = useCallback(async (users: number) => {
+    setFailError(null);
+    setFailMessage(null);
+    setLoadApplying(true);
+    try {
+      const res = await fetch("/api/dashboard/load-generator", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ users }),
+      });
+
+      const data = (await res.json().catch(() => ({}))) as {
+        ok?: boolean;
+        error?: string;
+        message?: string;
+      };
+
+      if (!res.ok || !data.ok) {
+        throw new Error(data.error || `Failed to apply load generator (${res.status})`);
+      }
+
+      setLoadUsers(users);
+      setFailMessage(data.message || `Load generator updated to USERS=${users}.`);
+      void poll();
+    } catch (e) {
+      setFailError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setLoadApplying(false);
+    }
+  }, [poll]);
 
   const startHealing = useCallback(async () => {
     const failedCount = latestByPod.filter((p) => {
@@ -777,15 +857,29 @@ export default function DashboardOverviewPage() {
             </div>
             <div className="flex gap-2">
               <button
+                onClick={() => void applyLoadGenerator(loadUsers)}
+                disabled={loadApplying || isHealingInProgress || Boolean(failingPodKey) || failingAllPods}
+                className="rounded-md border border-[#c7d7e3] bg-[#e8f1f8] px-3 py-2 text-xs font-semibold text-[#2c5aa0] hover:bg-[#dce7f2] disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                {loadApplying ? "Applying Load..." : `Start Load (USERS=${loadUsers})`}
+              </button>
+              <button
+                onClick={() => void applyLoadGenerator(0)}
+                disabled={loadApplying || isHealingInProgress || Boolean(failingPodKey) || failingAllPods}
+                className="rounded-md border border-[#d8d8d8] bg-white px-3 py-2 text-xs font-semibold text-[#4f5d68] hover:bg-[#f5f5f5] disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                {loadApplying ? "Stopping..." : "Stop Load"}
+              </button>
+              <button
                 onClick={() => void startHealing()}
-                disabled={isHealingInProgress || Boolean(failingPodKey) || failingAllPods}
+                disabled={isHealingInProgress || loadApplying || Boolean(failingPodKey) || failingAllPods}
                 className="rounded-md border border-[#c7d7e3] bg-[#e8f1f8] px-3 py-2 text-xs font-semibold text-[#2c5aa0] hover:bg-[#dce7f2] disabled:cursor-not-allowed disabled:opacity-60"
               >
                 {isHealingInProgress ? "Healing..." : "Start Healing"}
               </button>
               <button
                 onClick={() => void failAllPods()}
-                disabled={failingAllPods || Boolean(failingPodKey) || !failablePods.length}
+                disabled={loadApplying || failingAllPods || Boolean(failingPodKey) || !failablePods.length}
                 className="rounded-md border border-[#e3c7c7] bg-[#fff1f1] px-3 py-2 text-xs font-semibold text-[#9f3232] hover:bg-[#ffe6e6] disabled:cursor-not-allowed disabled:opacity-60"
               >
                 {failingAllPods ? "Failing All..." : `Fail Supported Pods (${failablePods.length})`}
@@ -815,18 +909,23 @@ export default function DashboardOverviewPage() {
                     <td className={cn("py-2 font-medium", statusColor(r.status))}>{r.status}</td>
                     <td className="py-2 text-[#4f5d68]">{r.restart_count}</td>
                     <td className="py-2">
-                      <button
-                        onClick={() => void failPod(r.pod_name, r.namespace)}
-                        disabled={
-                          Boolean(failingPodKey) ||
-                          failingAllPods ||
-                          !canFailNamespace(r.namespace) ||
-                          r.status.toLowerCase().includes("failed")
-                        }
-                        className="rounded-md border border-[#e3c7c7] bg-[#fff6f6] px-2 py-1 text-xs font-semibold text-[#9f3232] hover:bg-[#ffe9e9] disabled:cursor-not-allowed disabled:opacity-60"
-                      >
-                        {failingPodKey === `${r.namespace}/${r.pod_name}` ? "Failing..." : "Fail Pod"}
-                      </button>
+                      <div className="flex flex-col items-start gap-1">
+                        <span className="rounded-full bg-[#f2efe9] px-2 py-0.5 text-[10px] font-semibold text-[#6b5a46]">
+                          Chaos: {inferAutoFailStrategyLabel(r.namespace, r.pod_name)}
+                        </span>
+                        <button
+                          onClick={() => void failPod(r.pod_name, r.namespace)}
+                          disabled={
+                            Boolean(failingPodKey) ||
+                            failingAllPods ||
+                            !canFailNamespace(r.namespace) ||
+                            r.status.toLowerCase().includes("failed")
+                          }
+                          className="rounded-md border border-[#e3c7c7] bg-[#fff6f6] px-2 py-1 text-xs font-semibold text-[#9f3232] hover:bg-[#ffe9e9] disabled:cursor-not-allowed disabled:opacity-60"
+                        >
+                          {failingPodKey === `${r.namespace}/${r.pod_name}` ? "Failing..." : "Fail Pod"}
+                        </button>
+                      </div>
                     </td>
                   </tr>
                 ))}

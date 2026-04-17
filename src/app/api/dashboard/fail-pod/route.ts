@@ -17,7 +17,21 @@ const PROTECTED_NAMESPACES = new Set([
 const BodySchema = z.object({
   podName: z.string().min(1),
   namespace: z.string().min(1).default("default"),
+  mode: z.enum(["auto", "delete", "scale_to_zero"]).optional(),
 });
+
+const LOAD_SPIKE_NAMESPACES = new Set([
+  "ad",
+  "cart",
+  "checkout",
+  "currency",
+  "email",
+  "frontend",
+  "payment",
+  "product-catalog",
+  "recommendation",
+  "shipping",
+]);
 
 type KubectlResult = {
   ok: boolean;
@@ -106,6 +120,80 @@ function resolveScaleTarget(namespace: string, podName: string): { resourceType:
   return null;
 }
 
+function hashString(value: string) {
+  let hash = 0;
+  for (let index = 0; index < value.length; index += 1) {
+    hash = (hash * 31 + value.charCodeAt(index)) | 0;
+  }
+  return Math.abs(hash);
+}
+
+function chooseAutoStrategy(namespace: string, serviceName: string, hasScaleTarget: boolean) {
+  const pool: Array<"delete" | "scale_to_zero" | "load_spike_and_crash"> = ["delete"];
+  if (hasScaleTarget) {
+    pool.push("scale_to_zero");
+  }
+  if (LOAD_SPIKE_NAMESPACES.has(namespace)) {
+    pool.push("load_spike_and_crash");
+  }
+
+  const seed = `${namespace}/${serviceName}`;
+  const pick = pool[hashString(seed) % pool.length];
+  return pick;
+}
+
+function applyLoadSpike(users: number) {
+  const exists = runKubectl(["get", "deployment", "loadgenerator", "-n", "loadgenerator", "-o", "name"]);
+  if (!exists.ok) {
+    return { ok: false, reason: "loadgenerator_missing" };
+  }
+
+  const setEnv = runKubectl([
+    "set",
+    "env",
+    "deployment/loadgenerator",
+    "-n",
+    "loadgenerator",
+    `USERS=${String(users)}`,
+  ]);
+  if (!setEnv.ok) {
+    return { ok: false, reason: setEnv.stderr || "loadgenerator_env_update_failed" };
+  }
+
+  const restart = runKubectl(["rollout", "restart", "deployment/loadgenerator", "-n", "loadgenerator"]);
+  if (!restart.ok) {
+    return { ok: false, reason: restart.stderr || "loadgenerator_restart_failed" };
+  }
+
+  const rollout = runKubectl(["rollout", "status", "deployment/loadgenerator", "-n", "loadgenerator", "--timeout=45s"]);
+  return {
+    ok: rollout.ok,
+    reason: rollout.ok ? "load_spike_applied" : rollout.stderr || "loadgenerator_rollout_timeout",
+  };
+}
+
+function scaleTargetToZero(target: { resourceType: string; resourceName: string }, namespace: string) {
+  return runKubectl([
+    "scale",
+    `${target.resourceType}/${target.resourceName}`,
+    "-n",
+    namespace,
+    "--replicas=0",
+  ]);
+}
+
+function deletePodNow(podName: string, namespace: string) {
+  return runKubectl([
+    "delete",
+    "pod",
+    podName,
+    "-n",
+    namespace,
+    "--grace-period=0",
+    "--force",
+  ]);
+}
+
 export async function POST(request: Request) {
   const body = await request.json().catch(() => null);
   const parsed = BodySchema.safeParse(body);
@@ -113,7 +201,7 @@ export async function POST(request: Request) {
     return NextResponse.json({ ok: false, error: "invalid_request" }, { status: 400 });
   }
 
-  const { podName, namespace } = parsed.data;
+  const { podName, namespace, mode = "auto" } = parsed.data;
   if (PROTECTED_NAMESPACES.has(namespace)) {
     return NextResponse.json(
       {
@@ -146,15 +234,15 @@ export async function POST(request: Request) {
   }
 
   const target = resolveScaleTarget(namespace, podName);
+  const serviceName = target?.resourceName || podName;
 
-  if (target) {
-    const scaleRes = runKubectl([
-      "scale",
-      `${target.resourceType}/${target.resourceName}`,
-      "-n",
-      namespace,
-      "--replicas=0",
-    ]);
+  const effectiveMode =
+    mode === "auto"
+      ? chooseAutoStrategy(namespace, serviceName, Boolean(target))
+      : mode;
+
+  if (target && effectiveMode === "scale_to_zero") {
+    const scaleRes = scaleTargetToZero(target, namespace);
 
     if (!scaleRes.ok) {
       return NextResponse.json(
@@ -169,6 +257,7 @@ export async function POST(request: Request) {
     return NextResponse.json({
       ok: true,
       action: "scaled_to_zero",
+      strategy: effectiveMode,
       targetKind: target.resourceType,
       targetName: target.resourceName,
       namespace,
@@ -177,20 +266,40 @@ export async function POST(request: Request) {
     });
   }
 
-  const deleteRes = runKubectl([
-    "delete",
-    "pod",
-    podName,
-    "-n",
-    namespace,
-    "--grace-period=0",
-    "--force",
-  ]);
+  if (effectiveMode === "load_spike_and_crash") {
+    const users = 120 + (hashString(`${namespace}/${podName}`) % 60);
+    const loadSpike = applyLoadSpike(users);
+
+    const deleteRes = deletePodNow(podName, namespace);
+    if (deleteRes.ok || isNotFound(deleteRes.stderr)) {
+      return NextResponse.json({
+        ok: true,
+        action: "load_spike_and_crash",
+        strategy: effectiveMode,
+        namespace,
+        podName,
+        users,
+        message: `Injected load spike (USERS=${users}) and crashed ${namespace}/${podName}.`,
+        details: loadSpike,
+      });
+    }
+
+    return NextResponse.json(
+      {
+        ok: false,
+        error: deleteRes.stderr || "failed_after_load_spike",
+      },
+      { status: 409 },
+    );
+  }
+
+  const deleteRes = deletePodNow(podName, namespace);
 
   if (deleteRes.ok || isNotFound(deleteRes.stderr)) {
     return NextResponse.json({
       ok: true,
       action: deleteRes.ok ? "deleted_pod" : "already_missing",
+      strategy: effectiveMode,
       namespace,
       podName,
       message: deleteRes.ok

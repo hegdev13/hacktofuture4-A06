@@ -13,6 +13,7 @@ type RemediationOption = {
     resource_impact: string;
     risk_level: string;
     execution_time: string;
+    llm_analysis_usd?: number;
   };
   pros: string[];
   cons: string[];
@@ -42,6 +43,11 @@ export function DecisionAnalysisCard({
     if (level.toLowerCase() === "medium") return "text-accent";
     if (level.toLowerCase() === "high") return "text-danger";
     return "text-[#4f5d68]";
+  };
+
+  const formatUsd = (value?: number) => {
+    if (typeof value !== "number" || Number.isNaN(value) || value <= 0) return "N/A";
+    return `$${value.toFixed(6)}`;
   };
 
   return (
@@ -119,6 +125,9 @@ export function DecisionAnalysisCard({
                               </li>
                               <li>
                                 <strong>Time:</strong> {option.cost.execution_time}
+                              </li>
+                              <li>
+                                <strong>LLM Cost:</strong> {formatUsd(option.cost.llm_analysis_usd)}
                               </li>
                               <li>
                                 <strong>Risk:</strong>{" "}

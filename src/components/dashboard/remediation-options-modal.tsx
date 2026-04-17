@@ -12,6 +12,7 @@ type RemediationOption = {
     resource_impact: string;
     risk_level: string;
     execution_time: string;
+    llm_analysis_usd?: number;
   };
   pros: string[];
   cons: string[];
@@ -41,6 +42,13 @@ export function RemediationOptionsModal({
 }: OptionsModalProps) {
   const [displayedOption, setDisplayedOption] = useState(0);
 
+  const formatUsd = (value?: number) => {
+    if (typeof value !== "number" || Number.isNaN(value) || value <= 0) {
+      return "N/A";
+    }
+    return `$${value.toFixed(6)}`;
+  };
+
   useEffect(() => {
     if (!isOpen) {
       setDisplayedOption(0);
@@ -50,7 +58,6 @@ export function RemediationOptionsModal({
   if (!isOpen) return null;
 
   const selectedIdx = options.findIndex((opt) => opt.id === selectedOption);
-  const selected = selectedIdx >= 0 ? options[selectedIdx] : null;
 
   const getRiskBadge = (level: string) => {
     if (level.toLowerCase() === "low")
@@ -119,6 +126,12 @@ export function RemediationOptionsModal({
                     <div className="text-xs text-muted">Resource Impact</div>
                     <div className="text-sm font-semibold text-[#1f2b33]">
                       {options[displayedOption]?.cost.resource_impact}
+                    </div>
+                  </div>
+                  <div>
+                    <div className="text-xs text-muted">LLM analysis cost</div>
+                    <div className="text-sm font-semibold text-[#1f2b33]">
+                      {formatUsd(options[displayedOption]?.cost.llm_analysis_usd)}
                     </div>
                   </div>
                   <div className="pt-2">
