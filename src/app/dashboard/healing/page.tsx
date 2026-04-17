@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Activity, BrainCircuit, PlayCircle, RefreshCw, ShieldAlert, Wrench } from "lucide-react";
+import { Activity, BrainCircuit, PlayCircle, RefreshCw, RotateCcw, ShieldAlert, Wrench } from "lucide-react";
 import { Card, CardBody, CardHeader } from "@/components/ui/card";
 import { readSelectedEndpoint as readSelectedEndpointFromApi } from "@/lib/endpoints-client";
 
@@ -103,7 +103,61 @@ type RemediationOption = {
   tradeoff: string[];
   score: number;
   estimatedCost: string;
+  executionStrategy: "restart-workload" | "scale-replicas" | "dependency-first" | "custom-command";
+  source?: "gemini" | "fallback" | "custom";
+  cost?: {
+    resolution: string;
+    downtime: string;
+    resourceImpact: string;
+    analysisUsd: number;
+  };
 };
+
+type RCAIssue = {
+  id: string;
+  status: "ACTIVE" | "RESOLVED";
+  rootCause: string;
+  failureChain: string[];
+  confidence: number;
+  reasoning: string;
+};
+
+type RCAMetricsSummary = {
+  severityScore: number;
+  sustainedSignalCount: number;
+  affectedPods?: string[];
+  timeInAnomalyMs?: number;
+};
+
+type RCAAnalysisResult = {
+  observer: {
+    triggerRCA: boolean;
+    reason: string;
+    metricsSummary: RCAMetricsSummary;
+  };
+  rca: {
+    action: "APPEND" | "UPDATE" | "RESOLVE" | "NO_ACTION";
+    issues: RCAIssue[];
+    rootCause: string;
+    failureChain: string[];
+    confidence: number;
+    reasoning: string;
+    executor: {
+      rootCause: string;
+      confidence: number;
+      failureChain: string[];
+      chainDetails: Array<{ pod: string; reason: string }>;
+    };
+  };
+};
+
+type PrefilledTarget = {
+  namespace: string;
+  kind: HealingTargetKind;
+  name: string;
+};
+
+const LAST_FAILED_TARGET_KEY = "kubepulse:last_failed_target";
 
 function formatTs(ts?: string) {
   if (!ts) return "-";
@@ -145,6 +199,26 @@ function deploymentNameFromPodName(podName: string) {
   return podName;
 }
 
+function parseEventData<T>(evt: Event): T | null {
+  const raw = (evt as MessageEvent).data;
+  if (typeof raw !== "string" || !raw.trim() || raw === "undefined") {
+    return null;
+  }
+
+  try {
+    return JSON.parse(raw) as T;
+  } catch {
+    return null;
+  }
+}
+
+function formatUsd(value?: number) {
+  if (typeof value !== "number" || Number.isNaN(value) || value <= 0) {
+    return "N/A";
+  }
+  return `$${value.toFixed(6)}`;
+}
+
 export default function HealingDashboardPage() {
   const [status, setStatus] = useState<AgentRunnerStatus>({ state: "idle", totalLogs: 0 });
   const [logs, setLogs] = useState<StructuredHealingLog[]>([]);
@@ -164,13 +238,56 @@ export default function HealingDashboardPage() {
   const [targetKind, setTargetKind] = useState<HealingTargetKind>("pod");
   const [targetLoading, setTargetLoading] = useState(false);
   const [targetError, setTargetError] = useState<string>("");
+  const [rollbackLoading, setRollbackLoading] = useState(false);
+  const [rollbackMessage, setRollbackMessage] = useState<string>("");
   const [selectedRemediationId, setSelectedRemediationId] = useState<string>("");
+  const [llmRemediationOptions, setLlmRemediationOptions] = useState<RemediationOption[]>([]);
+  const [llmOptionsLoading, setLlmOptionsLoading] = useState(false);
+  const [llmOptionsError, setLlmOptionsError] = useState<string>("");
+  const [latestOptionsAnalysisUsd, setLatestOptionsAnalysisUsd] = useState<number | undefined>(undefined);
+  const [geminiAvailable, setGeminiAvailable] = useState<boolean | null>(null);
+  const [rcaAnalysis, setRcaAnalysis] = useState<RCAAnalysisResult | null>(null);
+  const [rcaLoading, setRcaLoading] = useState(false);
+  const [rcaError, setRcaError] = useState<string>("");
+  const [customCommand, setCustomCommand] = useState<string>("");
+  const [prefilledTarget, setPrefilledTarget] = useState<PrefilledTarget | null>(null);
   const eventSourceRef = useRef<EventSource | null>(null);
 
   useEffect(() => {
     const envUrl = process.env.NEXT_PUBLIC_METRICS_URL || "";
     if (envUrl) {
       setMetricsUrl(envUrl);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+
+    const params = new URLSearchParams(window.location.search);
+    const namespace = (params.get("targetNamespace") || "").trim();
+    const kind = params.get("targetKind");
+    const name = (params.get("targetName") || "").trim();
+
+    if (namespace && name && (kind === "pod" || kind === "deployment")) {
+      setPrefilledTarget({ namespace, kind, name });
+      return;
+    }
+
+    const stored = window.sessionStorage.getItem(LAST_FAILED_TARGET_KEY);
+    if (!stored) {
+      return;
+    }
+
+    try {
+      const parsed = JSON.parse(stored) as Partial<PrefilledTarget>;
+      if (parsed.namespace && parsed.name && (parsed.kind === "pod" || parsed.kind === "deployment")) {
+        setPrefilledTarget({ namespace: parsed.namespace, kind: parsed.kind, name: parsed.name });
+        window.sessionStorage.removeItem(LAST_FAILED_TARGET_KEY);
+      }
+    } catch {
+      window.sessionStorage.removeItem(LAST_FAILED_TARGET_KEY);
     }
   }, []);
 
@@ -189,6 +306,70 @@ export default function HealingDashboardPage() {
       setLoadingSummary(false);
     }
   }, []);
+
+  const fetchLatestOptionsAnalysisCost = useCallback(async () => {
+    try {
+      const res = await fetch("/api/cost-tracking/summary?days=30&model=all", { cache: "no-store" });
+      if (!res.ok) {
+        setLatestOptionsAnalysisUsd(undefined);
+        return;
+      }
+
+      const data = (await res.json()) as {
+        recent_records?: Array<{ stage?: string; cost_usd?: number }>;
+        stages?: Record<string, { cost?: number }>;
+      };
+
+      const recentOptionsCost = (data.recent_records || []).find(
+        (record) => record.stage === "options" && Number(record.cost_usd || 0) > 0,
+      )?.cost_usd;
+
+      if (typeof recentOptionsCost === "number" && recentOptionsCost > 0) {
+        setLatestOptionsAnalysisUsd(recentOptionsCost);
+        return;
+      }
+
+      const stageCost = Number(data.stages?.options?.cost || 0);
+      setLatestOptionsAnalysisUsd(stageCost > 0 ? stageCost : undefined);
+    } catch {
+      setLatestOptionsAnalysisUsd(undefined);
+    }
+  }, []);
+
+  const fetchRCAAnalysis = useCallback(async (clusterState?: Record<string, unknown>) => {
+    setRcaLoading(true);
+    setRcaError("");
+    try {
+      const res = await fetch("/api/rca/analyze", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(clusterState || {}),
+      });
+
+      const data = (await res.json()) as { ok?: boolean; error?: string } & Partial<RCAAnalysisResult>;
+      if (!res.ok || !data.observer || !data.rca) {
+        throw new Error(data.error || `Failed to analyze with RCA (${res.status})`);
+      }
+
+      setRcaAnalysis(data as RCAAnalysisResult);
+
+      // Auto-select RCA recommendation if it has high confidence
+      if (data.rca?.confidence > 0.7 && data.rca?.rootCause) {
+        // Map RCA findings to auto-selection strategy will happen in remediation mapping
+      }
+
+      return data as RCAAnalysisResult;
+    } catch (error) {
+      const errorMsg = error instanceof Error ? error.message : String(error);
+      setRcaError(errorMsg);
+      return null;
+    } finally {
+      setRcaLoading(false);
+    }
+  }, []);
+
 
   const fetchTargets = useCallback(async () => {
     const sourceUrl = metricsUrl.trim() || (await readSelectedEndpointFromApi().then((ep) => ep?.ngrok_url || "").catch(() => ""));
@@ -255,6 +436,9 @@ export default function HealingDashboardPage() {
         if (prev && normalized.some((item) => `${item.namespace}/${item.kind}/${item.pod_name}` === prev)) {
           return prev;
         }
+        if (prefilledTarget) {
+          return "";
+        }
         return normalized.length > 0 ? `${normalized[0].namespace}/${normalized[0].kind}/${normalized[0].pod_name}` : "";
       });
     } catch (error) {
@@ -264,7 +448,7 @@ export default function HealingDashboardPage() {
     } finally {
       setTargetLoading(false);
     }
-  }, [metricsUrl]);
+  }, [metricsUrl, prefilledTarget]);
 
   const fetchInitial = useCallback(async () => {
     try {
@@ -314,33 +498,38 @@ export default function HealingDashboardPage() {
     void fetchInitial();
     void fetchSummary();
     void fetchTargets();
+    void fetchLatestOptionsAnalysisCost();
 
     const es = new EventSource("/api/ai-agents/healing/stream");
     eventSourceRef.current = es;
 
     es.addEventListener("init", (evt) => {
-      const data = JSON.parse((evt as MessageEvent).data) as {
+      const data = parseEventData<{
         status: AgentRunnerStatus;
         logs: StructuredHealingLog[];
         lifecycle: IssueLifecycle[];
-      };
+      }>(evt);
+      if (!data) return;
       setStatus(data.status);
       setLogs(data.logs || []);
       setLifecycle(data.lifecycle || []);
     });
 
     es.addEventListener("log", (evt) => {
-      const log = JSON.parse((evt as MessageEvent).data) as StructuredHealingLog;
+      const log = parseEventData<StructuredHealingLog>(evt);
+      if (!log) return;
       setLogs((prev) => [...prev, log].slice(-1200));
     });
 
     es.addEventListener("status", (evt) => {
-      const s = JSON.parse((evt as MessageEvent).data) as AgentRunnerStatus;
+      const s = parseEventData<AgentRunnerStatus>(evt);
+      if (!s) return;
       setStatus(s);
     });
 
     es.addEventListener("lifecycle", (evt) => {
-      const lc = JSON.parse((evt as MessageEvent).data) as IssueLifecycle[];
+      const lc = parseEventData<IssueLifecycle[]>(evt);
+      if (!lc) return;
       setLifecycle(lc);
     });
 
@@ -348,7 +537,7 @@ export default function HealingDashboardPage() {
       es.close();
       eventSourceRef.current = null;
     };
-  }, [fetchInitial, fetchSummary, fetchTargets]);
+  }, [fetchInitial, fetchSummary, fetchTargets, fetchLatestOptionsAnalysisCost]);
 
   useEffect(() => {
     const onEndpointChange = () => {
@@ -376,41 +565,91 @@ export default function HealingDashboardPage() {
       return;
     }
 
-    if (!selectedTargetId) {
-      setStartError("Select a pod from the live /pods list before starting healing.");
-      return;
-    }
-
+    const explicitTarget = prefilledTarget;
     const selectedTarget = targets.find((t) => `${t.namespace}/${t.kind}/${t.pod_name}` === selectedTargetId);
-    if (!selectedTarget) {
-      setStartError("Selected target is no longer available. Refresh the live pod list.");
+    const selectedTargetMatchesExplicit = Boolean(
+      explicitTarget &&
+        selectedTarget &&
+        selectedTarget.namespace === explicitTarget.namespace &&
+        selectedTarget.kind === explicitTarget.kind &&
+        selectedTarget.pod_name === explicitTarget.name,
+    );
+
+    if (!selectedTarget && !explicitTarget) {
+      setStartError("Select a pod from the live /pods list or fail a target first.");
       return;
     }
 
-    // Always use the live item's kind to avoid pod/deployment mismatch failures.
-    const effectiveTargetKind: HealingTargetKind = selectedTarget.kind;
+    if (selectedRemediation?.executionStrategy === "custom-command" && !customCommand.trim()) {
+      setStartError("Enter a custom kubectl command for Option 4 before starting healing.");
+      return;
+    }
+
+    // Require explicit remediation option selection before healing
+    if (!selectedRemediationId) {
+      setStartError("Select a remediation option before starting healing.");
+      return;
+    }
+
+    const preferredTarget = selectedTarget || explicitTarget;
+    const effectiveTargetKind: HealingTargetKind = selectedTargetMatchesExplicit
+      ? (selectedTarget as HealingTarget).kind
+      : (preferredTarget?.kind as HealingTargetKind | undefined) || targetKind;
+    const effectiveTargetNamespace = selectedTargetMatchesExplicit
+      ? (selectedTarget as HealingTarget).namespace
+      : preferredTarget?.namespace || "default";
+    const targetName = selectedTarget
+      ? effectiveTargetKind === "deployment"
+        ? deploymentNameFromPodName(selectedTarget.pod_name)
+        : selectedTarget.pod_name
+      : explicitTarget?.name || "";
+
     if (targetKind !== effectiveTargetKind) {
       setTargetKind(effectiveTargetKind);
     }
-    const targetName =
-      effectiveTargetKind === "deployment"
-        ? deploymentNameFromPodName(selectedTarget.pod_name)
-        : selectedTarget.pod_name;
 
     setLoadingStart(true);
+    setRollbackMessage("");
     try {
+      // Fetch RCA analysis first
+      const clusterStatePayload = {
+        pods: targets.map(t => ({
+          name: t.pod_name,
+          namespace: t.namespace,
+          status: t.status,
+          cpu: t.cpu_usage,
+          memory: t.memory_usage,
+          restarts: t.restart_count,
+        })),
+      };
+
+      const rcaResult = await fetchRCAAnalysis(clusterStatePayload);
+
       const res = await fetch("/api/ai-agents/healing/start", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          "x-healing-source": "dashboard-healing-page",
+        },
         body: JSON.stringify({
           scenario,
           dryRun,
           metricsUrl: metricsSourceUrl,
           strictLive: true,
           targetName,
-          targetNamespace: selectedTarget.namespace,
+          targetNamespace: effectiveTargetNamespace,
           targetKind: effectiveTargetKind,
-          remediationPreference: selectedRemediation?.id || null,
+          remediationId: selectedRemediationId,
+          remediationPreference: selectedRemediation?.executionStrategy || null,
+          customCommand: selectedRemediation?.executionStrategy === "custom-command" ? customCommand.trim() : null,
+          rcaAnalysis: rcaResult ? {
+            triggerRCA: rcaResult.observer.triggerRCA,
+            rootCause: rcaResult.rca.rootCause,
+            failureChain: rcaResult.rca.failureChain,
+            confidence: rcaResult.rca.confidence,
+            reasoning: rcaResult.rca.reasoning,
+            action: rcaResult.rca.action,
+          } : null,
         }),
       });
 
@@ -420,6 +659,73 @@ export default function HealingDashboardPage() {
       }
     } finally {
       setLoadingStart(false);
+    }
+  };
+
+  const triggerRollback = async () => {
+    setRollbackMessage("");
+    setStartError("");
+
+    const explicitTarget = prefilledTarget;
+    const selected = targets.find((t) => `${t.namespace}/${t.kind}/${t.pod_name}` === selectedTargetId) || null;
+    const fallbackTargetName = status.targetName || "";
+    const fallbackTargetNamespace = status.targetNamespace || "default";
+    const fallbackTargetKind = (status.targetKind || "deployment") as HealingTargetKind;
+
+    const targetName = selected?.pod_name || explicitTarget?.name || fallbackTargetName;
+    const targetNamespace = selected?.namespace || explicitTarget?.namespace || fallbackTargetNamespace;
+    const targetKind = selected?.kind || explicitTarget?.kind || fallbackTargetKind;
+
+    if (!targetName) {
+      setStartError("Select a target (or run healing once) before rollback.");
+      return;
+    }
+
+    setRollbackLoading(true);
+    try {
+      const res = await fetch("/api/ai-agents/healing/rollback", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-healing-source": "dashboard-healing-page",
+        },
+        body: JSON.stringify({
+          targetName,
+          targetNamespace,
+          targetKind,
+          dryRun,
+        }),
+      });
+
+      const data = (await res.json().catch(() => ({}))) as {
+        ok?: boolean;
+        error?: string;
+        details?: string;
+        changed?: boolean;
+        message?: string;
+        target?: { namespace?: string; name?: string };
+      };
+
+      if (!res.ok || !data.ok) {
+        setStartError(data.details || data.error || `Rollback failed (HTTP ${res.status})`);
+        return;
+      }
+
+      const targetLabel = data.target?.namespace && data.target?.name
+        ? `${data.target.namespace}/${data.target.name}`
+        : `${targetNamespace}/${targetName}`;
+
+      if (dryRun) {
+        setRollbackMessage(`Rollback dry-run ready: ${targetLabel} (no cluster changes applied)`);
+      } else if (data.changed === false) {
+        setRollbackMessage(data.message || `Rollback executed for ${targetLabel}, but workload spec did not change.`);
+      } else {
+        setRollbackMessage(data.message || `Rollback complete: ${targetLabel}`);
+      }
+
+      await Promise.all([fetchInitial(), fetchSummary(), fetchTargets()]);
+    } finally {
+      setRollbackLoading(false);
     }
   };
 
@@ -523,6 +829,28 @@ export default function HealingDashboardPage() {
     return targets.find((t) => `${t.namespace}/${t.kind}/${t.pod_name}` === selectedTargetId) || null;
   }, [targets, selectedTargetId]);
 
+  useEffect(() => {
+    if (!prefilledTarget) {
+      return;
+    }
+
+    const match = targets.find(
+      (target) =>
+        target.namespace === prefilledTarget.namespace &&
+        target.kind === prefilledTarget.kind &&
+        target.pod_name === prefilledTarget.name,
+    );
+
+    if (match) {
+      setSelectedTargetId(`${match.namespace}/${match.kind}/${match.pod_name}`);
+      setTargetKind(match.kind);
+      return;
+    }
+
+    setSelectedTargetId("");
+    setTargetKind(prefilledTarget.kind);
+  }, [prefilledTarget, targets]);
+
   const hasFailureTargets = useMemo(() => {
     return targets.some((t) => /crash|fail|pending|error|unhealthy|oom|backoff/i.test(t.status));
   }, [targets]);
@@ -536,6 +864,10 @@ export default function HealingDashboardPage() {
     selectedTargetHasFailure || hasFailureTargets || status.state === "running";
 
   const remediationOptions = useMemo<RemediationOption[]>(() => {
+    if (llmRemediationOptions.length) {
+      return llmRemediationOptions;
+    }
+
     const baseName = selectedTarget?.kind === "deployment" ? "deployment" : "pod";
     const scaleUpScore = scenario === "high-cpu" ? 92 : 84;
     const restartScore = scenario === "pod-crash" ? 89 : 77;
@@ -550,6 +882,16 @@ export default function HealingDashboardPage() {
         tradeoff: ["Costs extra CPU/memory", "Does not fix the original crash cause directly"],
         score: scaleUpScore,
         estimatedCost: "Moderate resource cost, low disruption",
+        executionStrategy: "scale-replicas" as const,
+        source: "fallback" as const,
+        cost: latestOptionsAnalysisUsd
+          ? {
+              resolution: "Moderate",
+              downtime: "Context dependent",
+              resourceImpact: "Increased replicas",
+              analysisUsd: latestOptionsAnalysisUsd,
+            }
+          : undefined,
       },
       {
         id: "restart-workload",
@@ -559,6 +901,16 @@ export default function HealingDashboardPage() {
         tradeoff: ["Brief downtime possible", "May just mask a deeper dependency problem"],
         score: restartScore,
         estimatedCost: "Low cost, short disruption window",
+        executionStrategy: "restart-workload" as const,
+        source: "fallback" as const,
+        cost: latestOptionsAnalysisUsd
+          ? {
+              resolution: "Low",
+              downtime: "Context dependent",
+              resourceImpact: "Minimal",
+              analysisUsd: latestOptionsAnalysisUsd,
+            }
+          : undefined,
       },
       {
         id: "dependency-first",
@@ -568,11 +920,48 @@ export default function HealingDashboardPage() {
         tradeoff: ["Slower than a direct restart", "Needs more investigation time"],
         score: dependencyScore,
         estimatedCost: "Higher analysis cost, lower repeat-failure risk",
+        executionStrategy: "dependency-first" as const,
+        source: "fallback" as const,
+        cost: latestOptionsAnalysisUsd
+          ? {
+              resolution: "High",
+              downtime: "Context dependent",
+              resourceImpact: "Moderate",
+              analysisUsd: latestOptionsAnalysisUsd,
+            }
+          : undefined,
       },
     ].sort((a, b) => b.score - a.score);
-  }, [scenario, selectedTarget?.kind]);
+  }, [latestOptionsAnalysisUsd, llmRemediationOptions, scenario, selectedTarget?.kind]);
 
-  const bestRemediation = remediationOptions[0] || null;
+  const optionsWithCustom = useMemo<RemediationOption[]>(() => {
+    return [
+      ...remediationOptions,
+      {
+        id: "custom-command",
+        title: "Custom command (SRE override)",
+        summary: "Run your own healing command exactly as entered. This overrides agent strategy selection.",
+        advantage: ["Full manual control", "Useful for incident-specific one-off actions"],
+        tradeoff: ["Higher operator risk", "May execute successfully but still not heal the workload"],
+        score: 60,
+        estimatedCost: "Operator-defined",
+        executionStrategy: "custom-command",
+        source: "custom",
+        cost: latestOptionsAnalysisUsd
+          ? {
+              resolution: "Operator-defined",
+              downtime: "Operator-defined",
+              resourceImpact: "Operator-defined",
+              analysisUsd: latestOptionsAnalysisUsd,
+            }
+          : undefined,
+      },
+    ];
+  }, [latestOptionsAnalysisUsd, remediationOptions]);
+
+  const highestRankedRemediation = useMemo(() => {
+    return [...optionsWithCustom].sort((a, b) => b.score - a.score)[0] || null;
+  }, [optionsWithCustom]);
 
   useEffect(() => {
     if (selectedTarget && targetKind !== selectedTarget.kind) {
@@ -580,13 +969,65 @@ export default function HealingDashboardPage() {
     }
   }, [selectedTarget, targetKind]);
 
-  useEffect(() => {
-    if (!selectedRemediationId && bestRemediation) {
-      setSelectedRemediationId(bestRemediation.id);
-    }
-  }, [bestRemediation, selectedRemediationId]);
+  const selectedRemediation = optionsWithCustom.find((option) => option.id === selectedRemediationId) || null;
 
-  const selectedRemediation = remediationOptions.find((option) => option.id === selectedRemediationId) || bestRemediation;
+  useEffect(() => {
+    const loadOptions = async () => {
+      const explicitTarget = prefilledTarget;
+      const selected = targets.find((t) => `${t.namespace}/${t.kind}/${t.pod_name}` === selectedTargetId);
+      const targetName = selected?.pod_name || explicitTarget?.name || "";
+      const targetNamespace = selected?.namespace || explicitTarget?.namespace || "default";
+      const effectiveTargetKind = selected?.kind || explicitTarget?.kind || targetKind;
+
+      if (!targetName) {
+        setLlmRemediationOptions([]);
+        setLlmOptionsError("");
+        setGeminiAvailable(null);
+        return;
+      }
+
+      setLlmOptionsLoading(true);
+      setLlmOptionsError("");
+      try {
+        const url = new URL("/api/ai-agents/healing/options", window.location.origin);
+        url.searchParams.set("scenario", scenario);
+        url.searchParams.set("targetName", targetName);
+        url.searchParams.set("targetNamespace", targetNamespace);
+        url.searchParams.set("targetKind", effectiveTargetKind);
+
+        const res = await fetch(url.toString(), { cache: "no-store" });
+        const data = (await res.json()) as {
+          ok?: boolean;
+          error?: string;
+          options?: RemediationOption[];
+          source?: string;
+          message?: string;
+        };
+        if (!res.ok || !data.ok) {
+          throw new Error(data.error || `Failed to load options (${res.status})`);
+        }
+
+        // Only treat source=none as truly missing API key.
+        if (data.source === "none") {
+          setGeminiAvailable(false);
+          setLlmRemediationOptions([]);
+          setLlmOptionsError(data.message || "Gemini API key is not configured. Remediation options are not available.");
+        } else {
+          setGeminiAvailable(true);
+          setLlmRemediationOptions(Array.isArray(data.options) ? data.options.slice(0, 3) : []);
+          setLlmOptionsError(data.message || "");
+        }
+      } catch (error) {
+        setLlmOptionsError(error instanceof Error ? error.message : String(error));
+        setLlmRemediationOptions([]);
+        setGeminiAvailable(null);
+      } finally {
+        setLlmOptionsLoading(false);
+      }
+    };
+
+    void loadOptions();
+  }, [prefilledTarget, scenario, selectedTargetId, targetKind, targets]);
 
   return (
     <div className="space-y-4">
@@ -598,6 +1039,7 @@ export default function HealingDashboardPage() {
               Live stream of detection, analysis, remediation, and outcome with Gemini-powered summaries.
             </div>
             {startError ? <div className="mt-2 text-sm font-medium text-red-600">{startError}</div> : null}
+            {rollbackMessage ? <div className="mt-2 text-sm font-medium text-emerald-700">{rollbackMessage}</div> : null}
             {targetError ? <div className="mt-2 text-sm font-medium text-red-600">{targetError}</div> : null}
           </div>
           <div className="flex flex-wrap items-center gap-2">
@@ -653,15 +1095,23 @@ export default function HealingDashboardPage() {
             </label>
             <button
               onClick={startHealing}
-              disabled={loadingStart || status.state === "running"}
+              disabled={loadingStart || rollbackLoading || status.state === "running"}
               className="inline-flex items-center gap-2 rounded-lg bg-[#1f2b33] px-3 py-2 text-sm font-semibold text-white disabled:opacity-60"
             >
               <PlayCircle className="h-4 w-4" />
               {status.state === "running" ? "Healing Running..." : "Start Healing"}
             </button>
             <button
+              onClick={triggerRollback}
+              disabled={loadingStart || rollbackLoading || status.state === "running"}
+              className="inline-flex items-center gap-2 rounded-lg border border-[#dfd4c2] bg-white px-3 py-2 text-sm font-semibold text-[#1f2b33] disabled:opacity-60"
+            >
+              <RotateCcw className={`h-4 w-4 ${rollbackLoading ? "animate-spin" : ""}`} />
+              {rollbackLoading ? "Rolling Back..." : "Rollback"}
+            </button>
+            <button
               onClick={() => void fetchSummary()}
-              disabled={loadingSummary}
+              disabled={loadingSummary || rollbackLoading}
               className="inline-flex items-center gap-2 rounded-lg border border-[#dfd4c2] bg-white px-3 py-2 text-sm"
             >
               <RefreshCw className={`h-4 w-4 ${loadingSummary ? "animate-spin" : ""}`} />
@@ -671,24 +1121,112 @@ export default function HealingDashboardPage() {
         </CardHeader>
       </Card>
 
+      {rcaAnalysis?.rca ? (
+      <Card>
+        <CardHeader>
+          <div className="flex items-center gap-2 text-lg font-semibold text-[#1f2b33]">
+            <ShieldAlert className="h-5 w-5 text-blue-600" />
+            RCA Analysis Results
+          </div>
+          <div className="text-sm text-muted">Root cause analysis powered by dependency graph and signal correlation.</div>
+        </CardHeader>
+        <CardBody className="space-y-3">
+          <div className="grid gap-3 md:grid-cols-2">
+            <div className="rounded-xl border border-blue-200 bg-blue-50 p-4">
+              <div className="text-xs font-semibold uppercase text-blue-700">Root Cause</div>
+              <div className="mt-2 text-lg font-bold text-[#1f2b33]">{rcaAnalysis.rca.rootCause || "-"}</div>
+              <div className="mt-1 text-xs text-[#4f5d68]">
+                {rcaAnalysis.rca.failureChain?.length ? `Affects ${rcaAnalysis.rca.failureChain.length} service(s)` : "No cascading dependencies"}
+              </div>
+            </div>
+
+            <div className="rounded-xl border border-purple-200 bg-purple-50 p-4">
+              <div className="text-xs font-semibold uppercase text-purple-700">Confidence</div>
+              <div className="mt-2">
+                <div className="text-2xl font-bold text-[#1f2b33]">{Math.round(rcaAnalysis.rca.confidence * 100)}%</div>
+              </div>
+              <div className="mt-2 w-full bg-gray-200 rounded-full h-2">
+                <div
+                  className="bg-purple-600 h-2 rounded-full transition-all"
+                  style={{ width: `${rcaAnalysis.rca.confidence * 100}%` }}
+                />
+              </div>
+            </div>
+          </div>
+
+          {rcaAnalysis.rca.failureChain && rcaAnalysis.rca.failureChain.length > 0 && (
+            <div className="rounded-xl border border-orange-200 bg-orange-50 p-4">
+              <div className="text-xs font-semibold uppercase text-orange-700">Failure Chain (Cascade)</div>
+              <div className="mt-2 space-y-2">
+                {rcaAnalysis.rca.failureChain.map((pod, idx) => (
+                  <div key={idx} className="flex items-center gap-2 text-sm text-[#1f2b33]">
+                    {idx === rcaAnalysis.rca.failureChain!.length - 1 ? (
+                      <div className="text-red-600 font-bold">ROOT:</div>
+                    ) : (
+                      <div className="text-orange-600">→</div>
+                    )}
+                    <span>{pod}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          <div className="rounded-xl border border-[#e9dece] bg-[#fff8ee] p-4">
+            <div className="text-xs font-semibold uppercase text-[#5b6872]">Analysis Reasoning</div>
+            <div className="mt-2 text-sm text-[#1f2b33] leading-relaxed">{rcaAnalysis.rca.reasoning || "-"}</div>
+          </div>
+
+          {rcaLoading && (
+            <div className="rounded-xl border border-blue-200 bg-blue-50 p-3 text-sm text-blue-700">
+              Analyzing cluster state with RCA engine...
+            </div>
+          )}
+          {rcaError && (
+            <div className="rounded-xl border border-red-200 bg-red-50 p-3 text-sm text-red-700">
+              RCA analysis error: {rcaError}
+            </div>
+          )}
+        </CardBody>
+      </Card>
+      ) : null}
+
       {shouldShowDecisionOptions ? (
+      geminiAvailable === false ? (
+        <Card>
+          <CardBody>
+            <div className="rounded-xl border border-yellow-200 bg-yellow-50 p-4">
+              <div className="text-lg font-semibold text-yellow-900">Gemini API Key Required</div>
+              <div className="mt-2 text-sm text-yellow-800">
+                Remediation options require a configured Gemini API key. Please add <code className="bg-yellow-100 px-2 py-1 rounded">GOOGLE_GENERATIVE_AI_API_KEY</code> to your environment variables.
+              </div>
+              <div className="mt-3 text-sm text-yellow-700">
+                <strong>Note:</strong> The healing system can still run with RCA analysis and manual command execution, but Gemini-powered remediation suggestions are not available.
+              </div>
+            </div>
+          </CardBody>
+        </Card>
+      ) : (
       <Card>
         <CardHeader className="flex flex-col gap-2 md:flex-row md:items-end md:justify-between">
           <div>
             <div className="text-xl font-bold tracking-tight text-[#1f2b33]">Healing decision options</div>
             <div className="text-sm text-muted">
-              Three practical choices are scored here. Pick the one you want, then click Start Healing.
+              Top three choices are fetched dynamically via Gemini. Option 4 lets you run a custom command.
             </div>
+            {llmOptionsLoading ? <div className="mt-1 text-xs text-muted">Fetching Gemini remediation options...</div> : null}
+            {llmOptionsError ? <div className="mt-1 text-xs text-red-600">Gemini options fallback: {llmOptionsError}</div> : null}
           </div>
           <div className="rounded-full bg-[#eef5ea] px-3 py-1 text-xs font-semibold text-[#4f6b3d]">
-            Recommended: {bestRemediation?.title || "-"} ({bestRemediation?.score ?? 0}/100)
+            Recommended: {highestRankedRemediation?.title || "-"} (LLM cost {formatUsd(highestRankedRemediation?.cost?.analysisUsd || latestOptionsAnalysisUsd)})
           </div>
         </CardHeader>
         <CardBody>
-          <div className="grid gap-3 lg:grid-cols-3">
-            {remediationOptions.map((option, index) => {
+          <div className="grid gap-3 lg:grid-cols-4">
+            {optionsWithCustom.map((option, index) => {
               const isSelected = option.id === selectedRemediationId;
-              const isBest = option.id === bestRemediation?.id;
+              const isBest = option.id === highestRankedRemediation?.id;
+              const optionAnalysisUsd = option.cost?.analysisUsd || latestOptionsAnalysisUsd;
               return (
                 <button
                   key={option.id}
@@ -706,8 +1244,8 @@ export default function HealingDashboardPage() {
                       <div className="mt-1 text-lg font-bold text-[#1f2b33]">{option.title}</div>
                     </div>
                     <div className="text-right">
-                      <div className="text-xs text-muted">Score</div>
-                      <div className="text-2xl font-bold text-[#2f5f45]">{option.score}</div>
+                      <div className="text-xs text-muted">LLM Cost</div>
+                      <div className="text-lg font-bold text-[#2f5f45]">{formatUsd(optionAnalysisUsd)}</div>
                     </div>
                   </div>
                   <div className="mt-3 text-sm text-[#4f5d68]">{option.summary}</div>
@@ -719,6 +1257,15 @@ export default function HealingDashboardPage() {
                       ))}
                     </ul>
                   </div>
+                  <div className="mt-3 rounded-xl border border-[#eadfce] bg-[#fffaf2] p-3 text-xs text-[#4f5d68]">
+                    <div className="font-semibold text-[#1f2b33]">Cost</div>
+                    <div className="mt-1 space-y-1">
+                      <div><span className="font-medium text-[#1f2b33]">Resolution cost:</span> {option.cost?.resolution || "Model-derived"}</div>
+                      <div><span className="font-medium text-[#1f2b33]">Downtime:</span> {option.cost?.downtime || "Dynamic"}</div>
+                      <div><span className="font-medium text-[#1f2b33]">Resource impact:</span> {option.cost?.resourceImpact || "Context-dependent"}</div>
+                      <div><span className="font-medium text-[#1f2b33]">LLM analysis cost:</span> {formatUsd(optionAnalysisUsd)}</div>
+                    </div>
+                  </div>
                   <div className="mt-3 text-xs text-[#4f5d68]">
                     <span className="font-semibold text-[#1f2b33]">Tradeoff:</span> {option.tradeoff.join(" ")}
                   </div>
@@ -729,13 +1276,33 @@ export default function HealingDashboardPage() {
                         isBest ? "bg-[#e8f5e8] text-[#3f6a3f]" : "bg-[#f3ece2] text-[#6d5a43]"
                       }`}
                     >
-                      {isBest ? "Best score" : isSelected ? "Chosen by SRE" : "Available"}
+                      {option.source === "custom"
+                        ? (isSelected ? "Chosen by SRE" : "Manual override")
+                        : isBest
+                          ? "Recommended"
+                          : isSelected
+                            ? "Chosen by SRE"
+                            : "Available"}
                     </span>
                   </div>
                 </button>
               );
             })}
           </div>
+
+          {selectedRemediation?.executionStrategy === "custom-command" ? (
+            <div className="mt-3 rounded-2xl border border-[#e6dbc9] bg-[#fffaf2] p-4">
+              <div className="text-sm font-semibold text-[#1f2b33]">Option 4 command input</div>
+              <div className="mt-1 text-xs text-[#5b6872]">This command will be executed as-is when you click Start Healing.</div>
+              <textarea
+                value={customCommand}
+                onChange={(e) => setCustomCommand(e.target.value)}
+                rows={3}
+                placeholder="kubectl rollout restart deployment/paymentservice -n default"
+                className="mt-2 w-full rounded-lg border border-[#dfd4c2] bg-white px-3 py-2 text-sm"
+              />
+            </div>
+          ) : null}
 
           {selectedRemediation ? (
             <div className="mt-4 rounded-2xl border border-[#d9e7d0] bg-[#f7fbf3] p-4">
@@ -744,12 +1311,13 @@ export default function HealingDashboardPage() {
                 {selectedRemediation.title} - {selectedRemediation.summary}
               </div>
               <div className="mt-2 text-xs text-[#5b6872]">
-                The score is a guide only. You can still override it with your own judgment before pressing Start Healing.
+                This recommendation is a guide only. You can still override it with your own judgment before pressing Start Healing.
               </div>
             </div>
           ) : null}
         </CardBody>
       </Card>
+      )
       ) : (
         <Card>
           <CardBody>

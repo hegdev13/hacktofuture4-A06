@@ -39,6 +39,26 @@ const config = {
     ],
   },
 
+  // Observer-trigger policy (controls RCA trigger noise filtering)
+  observer: {
+    thresholds: {
+      cpu: 80,
+      memory: 85,
+      errorRate: 5,
+      restartCount: 3,
+    },
+    stabilityWindowMs: 30000,
+    cooldownMs: 60000,
+    severityTriggerScore: 70,
+    correlationSignalBonus: 10,
+    weights: {
+      cpu: 20,
+      memory: 20,
+      errorRate: 30,
+      restartCount: 20,
+    },
+  },
+
   // Execution Configuration
   execution: {
     dryRun: process.env.DRY_RUN !== 'false', // Set DRY_RUN=false to enable real K8s operations

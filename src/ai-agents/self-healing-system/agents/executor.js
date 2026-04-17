@@ -674,6 +674,33 @@ class ExecutionerAgent {
 
     // Apply recommendation if confidence is high enough
     const explicitDeploymentTarget = manualTargetKind === 'deployment' || rootCauseType === 'deployment';
+    const preferred = String(process.env.REMEDIATION_PREFERENCE || '').trim().toLowerCase();
+
+    if (preferred === 'restart-workload') {
+      strategy = {
+        type: explicitDeploymentTarget ? 'restart_deployment' : 'restart_pod',
+        target: explicitDeploymentTarget ? this.getDeploymentName(rootCause, clusterState) : rootCause,
+        namespace: this.getNamespace(rootCause, clusterState),
+        priority: 1,
+      };
+    } else if (preferred === 'scale-replicas') {
+      strategy = {
+        type: 'scale_up',
+        target: this.getDeploymentName(rootCause, clusterState),
+        namespace: this.getNamespace(rootCause, clusterState),
+        replicas: this.calculateReplicas(rootCause, clusterState, 1),
+        priority: 1,
+      };
+    } else if (preferred === 'dependency-first') {
+      const dep = rcaOutput.chainDetails?.find(d => d.depth > 0 && !d.health.healthy);
+      strategy = {
+        type: dep ? 'restart_dependency_first' : (explicitDeploymentTarget ? 'restart_deployment' : 'restart_pod'),
+        target: dep ? dep.name : rootCause,
+        originalTarget: rootCause,
+        namespace: this.getNamespace(dep ? dep.name : rootCause, clusterState),
+        priority: 1,
+      };
+    }
 
     if (!explicitDeploymentTarget && recommendation && recommendation.confidence >= config.memory.minConfidenceForLearning) {
       logger.info(`Using recommended fix: ${recommendation.fixType} (confidence: ${recommendation.confidence}%)`);
@@ -774,16 +801,39 @@ class ExecutionerAgent {
    * Restart a pod
    */
   restartPod(podName, namespace) {
+    const ns = namespace || 'default';
     const action = {
       type: 'DELETE',
       resource: 'pod',
       name: podName,
-      namespace,
-      message: `Restarting pod ${namespace}/${podName}`,
+      namespace: ns,
+      message: `Restarting pod ${ns}/${podName}`,
     };
 
-    const result = this.executeK8sAction(action);
-    return { ...result, action };
+    let result = this.executeK8sAction(action);
+
+    // If target isn't a pod but is a deployment name, heal by restarting deployment
+    // (restartDeployment will auto-scale from 0 replicas to 1 before rollout restart).
+    if (
+      result.status === 'failed' &&
+      /notfound|not found/i.test(String(result.message || result.error || '')) &&
+      this.resourceExists('deployment', podName, ns)
+    ) {
+      logger.warn(`Pod ${ns}/${podName} not found; falling back to deployment restart`);
+      result = this.restartDeployment(podName, ns);
+    }
+
+    return { ...result, action: result.action || action };
+  }
+
+  resourceExists(resource, name, namespace) {
+    try {
+      const nsArgs = namespace ? ['-n', namespace] : [];
+      this.runKubectl(['get', resource, name, ...nsArgs], 15000);
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   /**

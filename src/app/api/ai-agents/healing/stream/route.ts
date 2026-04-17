@@ -12,6 +12,9 @@ export async function GET(request: Request) {
       const encoder = new TextEncoder();
 
       const send = (event: string, payload: unknown) => {
+        if (typeof payload === "undefined") {
+          return;
+        }
         controller.enqueue(encoder.encode(sseMessage(event, payload)));
       };
 

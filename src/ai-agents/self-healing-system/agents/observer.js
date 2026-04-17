@@ -11,6 +11,29 @@ class ObserverAgent {
   constructor() {
     this.thresholds = config.severity.thresholds;
     this.anomalyHistory = new Map();
+    this.metricBreaches = new Map();
+    this.lastRCATriggerAt = 0;
+
+    // Observer-side RCA trigger policy (deterministic, no LLM calls).
+    this.rcaPolicy = {
+      thresholds: {
+        cpu: config.observer?.thresholds?.cpu ?? 80,
+        memory: config.observer?.thresholds?.memory ?? 85,
+        errorRate: config.observer?.thresholds?.errorRate ?? 5,
+        restartCount: config.observer?.thresholds?.restartCount ?? 3,
+      },
+      stabilityWindowMs: config.observer?.stabilityWindowMs ?? 30_000,
+      cooldownMs: config.observer?.cooldownMs ?? 60_000,
+      severityTriggerScore: config.observer?.severityTriggerScore ?? 70,
+      correlationSignalBonus: config.observer?.correlationSignalBonus ?? 10,
+      weights: {
+        cpu: config.observer?.weights?.cpu ?? 20,
+        memory: config.observer?.weights?.memory ?? 20,
+        errorRate: config.observer?.weights?.errorRate ?? 30,
+        restartCount: config.observer?.weights?.restartCount ?? 20,
+      },
+    };
+
     this.ignoredNamespaces = new Set([
       'kube-system',
       'kube-public',
@@ -61,17 +84,241 @@ class ObserverAgent {
     // Prioritize issues
     const sortedIssues = this.prioritizeIssues(issues);
 
+    // Observer decides whether RCA should run now.
+    const rcaDecision = this.evaluateRCATrigger(clusterState, sortedIssues);
+
     logger.timelineEvent(
       healthy ? 'success' : 'issue',
       `Analysis complete: ${sortedIssues.length} issue(s) detected`,
-      { healthy, issueCount: sortedIssues.length }
+      {
+        healthy,
+        issueCount: sortedIssues.length,
+        triggerRCA: rcaDecision.triggerRCA,
+        rcaReason: rcaDecision.reason,
+      }
     );
 
     return {
       healthy,
       issues: sortedIssues,
       summary: this.generateSummary(sortedIssues),
+      rcaDecision,
       timestamp: new Date().toISOString(),
+    };
+  }
+
+  /**
+   * Observer RCA trigger logic:
+   * - sustained threshold breaches only (stability window)
+   * - short spikes are ignored
+   * - severity score from multi-metric signals
+   * - cooldown gate to avoid repeated RCA calls
+   */
+  evaluateRCATrigger(clusterState, issues = []) {
+    const now = Date.now();
+    const snapshots = this.collectMetricSnapshots(clusterState);
+    const sustainedSignals = [];
+    const perResource = [];
+
+    for (const snap of snapshots) {
+      const resourceSignals = this.evaluateResourceSignals(snap, now);
+      perResource.push(resourceSignals.summary);
+      sustainedSignals.push(...resourceSignals.sustainedSignals);
+    }
+
+    const hasSustainedAnomaly = sustainedSignals.length > 0;
+    const highestResourceScore = perResource.reduce(
+      (m, r) => Math.max(m, r.severityScore || 0),
+      0
+    );
+
+    const correlatedResources = perResource.filter((r) => r.sustainedSignalCount >= 2).length;
+    const correlationBonus = correlatedResources > 0
+      ? Math.min(20, correlatedResources * this.rcaPolicy.correlationSignalBonus)
+      : 0;
+
+    const issueSeverityBoost = issues.reduce((acc, issue) => {
+      if (issue.severity === 'high') return acc + 6;
+      if (issue.severity === 'medium') return acc + 3;
+      return acc + 1;
+    }, 0);
+
+    const severityScore = Math.min(
+      100,
+      Math.round(highestResourceScore + correlationBonus + Math.min(20, issueSeverityBoost))
+    );
+
+    const inCooldown = now - this.lastRCATriggerAt < this.rcaPolicy.cooldownMs;
+    const cooldownRemainingMs = inCooldown
+      ? this.rcaPolicy.cooldownMs - (now - this.lastRCATriggerAt)
+      : 0;
+
+    const triggerRCA =
+      hasSustainedAnomaly &&
+      severityScore >= this.rcaPolicy.severityTriggerScore &&
+      !inCooldown;
+
+    let reason;
+    if (!hasSustainedAnomaly) {
+      reason = 'Skipped: no sustained anomaly (short spikes filtered)';
+    } else if (severityScore < this.rcaPolicy.severityTriggerScore) {
+      reason = `Skipped: severity ${severityScore} below trigger threshold ${this.rcaPolicy.severityTriggerScore}`;
+    } else if (inCooldown) {
+      reason = `Skipped: in cooldown (${Math.ceil(cooldownRemainingMs / 1000)}s remaining)`;
+    } else {
+      reason = `Triggered: sustained anomaly + severity ${severityScore} + cooldown satisfied`;
+      this.lastRCATriggerAt = now;
+    }
+
+    return {
+      triggerRCA,
+      reason,
+      metricsSummary: {
+        thresholds: this.rcaPolicy.thresholds,
+        stabilityWindowSec: Math.round(this.rcaPolicy.stabilityWindowMs / 1000),
+        cooldownSec: Math.round(this.rcaPolicy.cooldownMs / 1000),
+        severityScore,
+        severityTriggerScore: this.rcaPolicy.severityTriggerScore,
+        sustainedSignalCount: sustainedSignals.length,
+        correlatedResourceCount: correlatedResources,
+        sustainedSignals,
+        resources: perResource,
+      },
+    };
+  }
+
+  /**
+   * Build normalized per-resource metric snapshots.
+   */
+  collectMetricSnapshots(clusterState) {
+    const pods = (clusterState.pods || []).filter(
+      (pod) => !this.ignoredNamespaces.has((pod.namespace || '').toLowerCase())
+    );
+
+    return pods.map((pod) => {
+      const logs = Array.isArray(pod.logs) ? pod.logs : [];
+      const errorRateFromLogs = this.computeErrorRateFromLogs(logs);
+
+      const cpu = Number(pod.cpu ?? pod.cpuUsage ?? 0);
+      const memory = Number(pod.memory ?? pod.memoryUsage ?? 0);
+      const errorRate = Number(pod.errorRate ?? errorRateFromLogs);
+      const restartCount = Number(pod.restarts ?? pod.restartCount ?? 0);
+
+      return {
+        resource: `${pod.namespace || 'default'}/${pod.name}`,
+        cpu,
+        memory,
+        errorRate,
+        restartCount,
+      };
+    });
+  }
+
+  /**
+   * Lightweight log-error ratio as a percentage.
+   */
+  computeErrorRateFromLogs(logs) {
+    if (!Array.isArray(logs) || logs.length === 0) return 0;
+    const errorPatterns = [/error/i, /fatal/i, /panic/i, /exception/i, /timeout/i, /refused/i];
+    let errorCount = 0;
+
+    for (const entry of logs.slice(-100)) {
+      const text = typeof entry === 'string' ? entry : (entry?.message || '');
+      if (errorPatterns.some((rx) => rx.test(text))) errorCount++;
+    }
+
+    return (errorCount / Math.min(logs.length, 100)) * 100;
+  }
+
+  /**
+   * Track sustained threshold breaches per resource/metric.
+   */
+  updateBreachState(key, isBreached, value, now) {
+    const existing = this.metricBreaches.get(key);
+
+    if (!isBreached) {
+      this.metricBreaches.delete(key);
+      return {
+        sustained: false,
+        durationMs: 0,
+        maxValue: 0,
+      };
+    }
+
+    if (!existing) {
+      const next = { firstBreachAt: now, lastSeenAt: now, maxValue: value };
+      this.metricBreaches.set(key, next);
+      return {
+        sustained: false,
+        durationMs: 0,
+        maxValue: value,
+      };
+    }
+
+    existing.lastSeenAt = now;
+    existing.maxValue = Math.max(existing.maxValue, value);
+    const durationMs = now - existing.firstBreachAt;
+
+    return {
+      sustained: durationMs >= this.rcaPolicy.stabilityWindowMs,
+      durationMs,
+      maxValue: existing.maxValue,
+    };
+  }
+
+  /**
+   * Convert sustained metric breaches into resource-level severity score.
+   */
+  evaluateResourceSignals(snapshot, now) {
+    const t = this.rcaPolicy.thresholds;
+    const checks = [
+      { metric: 'cpu', value: snapshot.cpu, threshold: t.cpu },
+      { metric: 'memory', value: snapshot.memory, threshold: t.memory },
+      { metric: 'errorRate', value: snapshot.errorRate, threshold: t.errorRate },
+      { metric: 'restartCount', value: snapshot.restartCount, threshold: t.restartCount },
+    ];
+
+    const sustainedSignals = [];
+    let severityScore = 0;
+
+    for (const check of checks) {
+      const breached = check.value > check.threshold;
+      const key = `${snapshot.resource}:${check.metric}`;
+      const breachState = this.updateBreachState(key, breached, check.value, now);
+
+      if (!breachState.sustained) continue;
+
+      const overRatio = check.threshold > 0
+        ? Math.max(0, (check.value - check.threshold) / check.threshold)
+        : 0;
+      const metricWeight = this.rcaPolicy.weights[check.metric] || 10;
+      const metricScore = Math.min(metricWeight + 15, metricWeight + Math.round(overRatio * 30));
+      severityScore += metricScore;
+
+      sustainedSignals.push({
+        resource: snapshot.resource,
+        metric: check.metric,
+        value: check.value,
+        threshold: check.threshold,
+        durationSec: Math.round(breachState.durationMs / 1000),
+      });
+    }
+
+    if (sustainedSignals.length >= 2) {
+      severityScore += 10;
+    }
+
+    return {
+      sustainedSignals,
+      summary: {
+        resource: snapshot.resource,
+        cpu: snapshot.cpu,
+        memory: snapshot.memory,
+        errorRate: snapshot.errorRate,
+        restartCount: snapshot.restartCount,
+        sustainedSignalCount: sustainedSignals.length,
+        severityScore: Math.min(100, Math.round(severityScore)),
+      },
     };
   }
 
